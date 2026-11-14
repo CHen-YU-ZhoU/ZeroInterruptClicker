@@ -1,0 +1,451 @@
+package com.zerointerrupt.clicker.shizuku
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.hardware.display.DisplayManager
+import android.os.Build
+import android.os.IBinder
+import android.util.DisplayMetrics
+import android.util.Log
+import android.view.Display
+import android.view.Surface
+import android.view.WindowManager
+import com.zerointerrupt.clicker.BuildConfig
+import com.zerointerrupt.clicker.ITouchMuxService
+import com.zerointerrupt.clicker.model.ClickConfigStore
+import com.zerointerrupt.clicker.model.ClickTarget
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import org.json.JSONObject
+import rikka.shizuku.Shizuku
+
+enum class ShizukuConnectionState {
+    SHIZUKU_NOT_RUNNING,
+    NO_PERMISSION,
+    BINDING,
+    CONNECTED,
+    ERROR
+}
+
+data class EngineSnapshot(
+    val engineMode: Int = TouchMuxUserService.MODE_IDLE,
+    val uinputWritable: Boolean = false,
+    val touchDeviceReadable: Boolean = false,
+    val fallbackReady: Boolean = false,
+    val touchDeviceInfo: String = "",
+    val statusDetail: String = "未连接 Shizuku 服务",
+    val uid: Int = -1,
+    val nativeProbeError: String = ""
+)
+
+data class DisplayScreenMetrics(
+    val widthPx: Int,
+    val heightPx: Int,
+    val rotation: Int
+)
+
+/**
+ * Process-wide Shizuku UserService connection, permission, auto-rebind, and IPC controller.
+ */
+object ShizukuController {
+    private const val TAG = "ShizukuController"
+    const val REQUEST_CODE_SHIZUKU = 10042
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private var appContext: Context? = null
+    private var listenersRegistered = false
+    private var boundArgs: Shizuku.UserServiceArgs? = null
+    @Volatile
+    private var service: ITouchMuxService? = null
+
+    private val _connectionState = MutableStateFlow(ShizukuConnectionState.SHIZUKU_NOT_RUNNING)
+    val connectionState: StateFlow<ShizukuConnectionState> = _connectionState.asStateFlow()
+
+    private val _engineSnapshot = MutableStateFlow(EngineSnapshot())
+    val engineSnapshot: StateFlow<EngineSnapshot> = _engineSnapshot.asStateFlow()
+
+    private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
+        Log.i(TAG, "Shizuku binder received.")
+        evaluateShizukuState()
+    }
+
+    private val binderDeadListener = Shizuku.OnBinderDeadListener {
+        Log.w(TAG, "Shizuku binder died; resetting service reference.")
+        service = null
+        _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
+        _engineSnapshot.value = _engineSnapshot.value.copy(
+            engineMode = TouchMuxUserService.MODE_IDLE,
+            statusDetail = "Shizuku 服务已断开，等待重新连接"
+        )
+    }
+
+    private val permissionResultListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+        if (requestCode == REQUEST_CODE_SHIZUKU) {
+            if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                bindUserService()
+            } else {
+                _connectionState.value = ShizukuConnectionState.NO_PERMISSION
+                _engineSnapshot.value = _engineSnapshot.value.copy(
+                    statusDetail = "用户拒绝了 Shizuku 授权"
+                )
+            }
+        }
+    }
+
+    private val userServiceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            if (binder == null || !binder.pingBinder()) {
+                _connectionState.value = ShizukuConnectionState.ERROR
+                _engineSnapshot.value = _engineSnapshot.value.copy(
+                    statusDetail = "UserService Binder 无效"
+                )
+                return
+            }
+            service = ITouchMuxService.Stub.asInterface(binder)
+            _connectionState.value = ShizukuConnectionState.CONNECTED
+            try {
+                binder.linkToDeath({
+                    Log.w(TAG, "TouchMuxUserService remote process died.")
+                    service = null
+                    if (Shizuku.pingBinder() && hasPermission()) {
+                        _connectionState.value = ShizukuConnectionState.BINDING
+                        bindUserService()
+                    } else {
+                        _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
+                    }
+                }, 0)
+            } catch (_: Throwable) {
+            }
+            refreshCapabilitiesAsync()
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            service = null
+            if (Shizuku.pingBinder() && hasPermission()) {
+                _connectionState.value = ShizukuConnectionState.BINDING
+            } else {
+                _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
+            }
+        }
+    }
+
+    fun initialize(context: Context) {
+        if (appContext == null) {
+            appContext = context.applicationContext
+        }
+        if (!listenersRegistered) {
+            Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
+            Shizuku.addBinderDeadListener(binderDeadListener)
+            Shizuku.addRequestPermissionResultListener(permissionResultListener)
+            listenersRegistered = true
+        }
+        evaluateShizukuState()
+    }
+
+    fun evaluateShizukuState() {
+        val binderAlive = try {
+            Shizuku.pingBinder()
+        } catch (_: Throwable) {
+            false
+        }
+        if (!binderAlive) {
+            service = null
+            _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
+            _engineSnapshot.value = EngineSnapshot(statusDetail = "请先启动 Shizuku 服务")
+            return
+        }
+        if (!hasPermission()) {
+            _connectionState.value = ShizukuConnectionState.NO_PERMISSION
+            _engineSnapshot.value = EngineSnapshot(statusDetail = "Shizuku 已运行，等待授权")
+            return
+        }
+        if (service?.asBinder()?.pingBinder() == true) {
+            _connectionState.value = ShizukuConnectionState.CONNECTED
+            refreshCapabilitiesAsync()
+        } else {
+            bindUserService()
+        }
+    }
+
+    fun hasPermission(): Boolean {
+        return try {
+            if (!Shizuku.pingBinder()) return false
+            if (Shizuku.isPreV11()) return false
+            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun requestPermission() {
+        try {
+            if (!Shizuku.pingBinder()) {
+                _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
+                return
+            }
+            if (hasPermission()) {
+                bindUserService()
+                return
+            }
+            Shizuku.requestPermission(REQUEST_CODE_SHIZUKU)
+        } catch (t: Throwable) {
+            _connectionState.value = ShizukuConnectionState.ERROR
+            _engineSnapshot.value = _engineSnapshot.value.copy(
+                statusDetail = "请求 Shizuku 权限失败: ${t.message}"
+            )
+        }
+    }
+
+    fun bindUserService() {
+        val ctx = appContext ?: return
+        if (!Shizuku.pingBinder() || !hasPermission()) {
+            evaluateShizukuState()
+            return
+        }
+        if (service?.asBinder()?.pingBinder() == true) {
+            _connectionState.value = ShizukuConnectionState.CONNECTED
+            return
+        }
+        _connectionState.value = ShizukuConnectionState.BINDING
+        val args = boundArgs ?: Shizuku.UserServiceArgs(
+            ComponentName(ctx.packageName, TouchMuxUserService::class.java.name)
+        )
+            .daemon(false)
+            .processNameSuffix("touchmux")
+            .debuggable(BuildConfig.DEBUG)
+            .version(BuildConfig.VERSION_CODE)
+            .also { boundArgs = it }
+
+        try {
+            Shizuku.bindUserService(args, userServiceConnection)
+        } catch (t: Throwable) {
+            Log.e(TAG, "bindUserService error", t)
+            _connectionState.value = ShizukuConnectionState.ERROR
+            _engineSnapshot.value = _engineSnapshot.value.copy(
+                statusDetail = "绑定 UserService 失败: ${t.message}"
+            )
+        }
+    }
+
+    fun refreshCapabilitiesAsync() {
+        val ctx = appContext ?: return
+        val svc = service ?: return
+        scope.launch {
+            try {
+                val jsonStr = svc.probeCapabilities(ctx.applicationInfo.nativeLibraryDir)
+                val obj = JSONObject(jsonStr)
+                val touchPath = obj.optString("touchDevicePath", "")
+                val touchName = obj.optString("touchDeviceName", "")
+                val touchInfo = if (touchPath.isNotEmpty()) "$touchPath ($touchName)" else "未检测到可读触控节点"
+                val detail = obj.optString("statusDetail", "Ready")
+                val uinputOk = obj.optBoolean("uinputWritable", false)
+                val touchOk = obj.optBoolean("touchDeviceReadable", false)
+                val probeErr = buildString {
+                    val loadErr = obj.optString("nativeLoadError", "")
+                    if (loadErr.isNotEmpty()) append(loadErr)
+                    if (!uinputOk) {
+                        if (isNotEmpty()) append("; ")
+                        append("/dev/uinput errno=${obj.optInt("uinputErrno", -1)}")
+                    }
+                    if (!touchOk) {
+                        if (isNotEmpty()) append("; ")
+                        append("/dev/input errno=${obj.optInt("touchDeviceErrno", -1)}")
+                    }
+                }
+
+                _engineSnapshot.value = EngineSnapshot(
+                    engineMode = obj.optInt("currentMode", TouchMuxUserService.MODE_IDLE),
+                    uinputWritable = uinputOk,
+                    touchDeviceReadable = touchOk,
+                    fallbackReady = obj.optBoolean("fallbackInjectorReady", false),
+                    touchDeviceInfo = touchInfo,
+                    statusDetail = detail,
+                    uid = obj.optInt("uid", -1),
+                    nativeProbeError = probeErr
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "probeCapabilities failed", t)
+            }
+        }
+    }
+
+    fun startSelfCheckGrab(timeoutMs: Int = 5000): Int {
+        val ctx = appContext ?: return -1
+        val svc = service ?: return -2
+        val metrics = getDisplayScreenMetrics(ctx)
+        return try {
+            val rc = svc.startSelfCheckGrab(
+                ctx.applicationInfo.nativeLibraryDir,
+                metrics.widthPx,
+                metrics.heightPx,
+                metrics.rotation,
+                timeoutMs
+            )
+            refreshCapabilitiesAsync()
+            rc
+        } catch (t: Throwable) {
+            Log.e(TAG, "startSelfCheckGrab failed", t)
+            -3
+        }
+    }
+
+    fun confirmSelfCheck(): Boolean {
+        val ctx = appContext ?: return false
+        val svc = service ?: return false
+        return try {
+            val ok = svc.confirmSelfCheck()
+            ClickConfigStore.markSelfCheckPassed(ctx, ok)
+            refreshCapabilitiesAsync()
+            ok
+        } catch (t: Throwable) {
+            Log.e(TAG, "confirmSelfCheck failed", t)
+            false
+        }
+    }
+
+    fun cancelSelfCheckAndUngrab() {
+        val svc = service ?: return
+        try {
+            svc.cancelSelfCheckAndUngrab()
+            refreshCapabilitiesAsync()
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun ensureNativeIfVerified(): Boolean {
+        val ctx = appContext ?: return false
+        val svc = service ?: return false
+        val settings = ClickConfigStore.loadSettings(ctx)
+        if (!settings.selfCheckPassed) return false
+        return try {
+            if (svc.engineMode == TouchMuxUserService.MODE_NATIVE_MUX) return true
+            val metrics = getDisplayScreenMetrics(ctx)
+            val rc = svc.initNativeEngine(
+                ctx.applicationInfo.nativeLibraryDir,
+                metrics.widthPx,
+                metrics.heightPx,
+                metrics.rotation
+            )
+            rc == 0
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun startClicking(targets: List<ClickTarget>): Int {
+        val ctx = appContext ?: return -1
+        val svc = service ?: return -2
+        return try {
+            val snapshot = _engineSnapshot.value
+            val settings = ClickConfigStore.loadSettings(ctx)
+            if (settings.selfCheckPassed && snapshot.uinputWritable && snapshot.touchDeviceReadable) {
+                ensureNativeIfVerified()
+            }
+            val metrics = getDisplayScreenMetrics(ctx)
+            val parceled = targets.map { it.toParceled() }
+            val mode = svc.startClicking(
+                parceled,
+                metrics.widthPx,
+                metrics.heightPx,
+                metrics.rotation,
+                true
+            )
+            _engineSnapshot.value = _engineSnapshot.value.copy(
+                engineMode = if (mode > 0) mode else TouchMuxUserService.MODE_IDLE,
+                statusDetail = svc.statusDetail
+            )
+            mode
+        } catch (t: Throwable) {
+            Log.e(TAG, "startClicking failed", t)
+            -3
+        }
+    }
+
+    fun updateTargets(targets: List<ClickTarget>) {
+        val ctx = appContext ?: return
+        val svc = service ?: return
+        try {
+            val metrics = getDisplayScreenMetrics(ctx)
+            svc.updateTargets(
+                targets.map { it.toParceled() },
+                metrics.widthPx,
+                metrics.heightPx,
+                metrics.rotation
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "updateTargets failed", t)
+        }
+    }
+
+    fun updateDisplayMetrics() {
+        val ctx = appContext ?: return
+        val svc = service ?: return
+        try {
+            val metrics = getDisplayScreenMetrics(ctx)
+            svc.updateDisplayMetrics(metrics.widthPx, metrics.heightPx, metrics.rotation)
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun stopClicking() {
+        val svc = service ?: return
+        try {
+            svc.stopClicking()
+            _engineSnapshot.value = _engineSnapshot.value.copy(statusDetail = svc.statusDetail)
+        } catch (t: Throwable) {
+            Log.w(TAG, "stopClicking failed", t)
+        }
+    }
+
+    fun shutdownEngine() {
+        val svc = service ?: return
+        try {
+            svc.shutdownEngine()
+            _engineSnapshot.value = _engineSnapshot.value.copy(
+                engineMode = TouchMuxUserService.MODE_IDLE,
+                statusDetail = svc.statusDetail
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun unbindUserService() {
+        val args = boundArgs ?: return
+        try {
+            service?.shutdownEngine()
+        } catch (_: Throwable) {
+        }
+        try {
+            Shizuku.unbindUserService(args, userServiceConnection, true)
+        } catch (_: Throwable) {
+        }
+        service = null
+    }
+
+    fun isServiceConnected(): Boolean = service?.asBinder()?.pingBinder() == true
+
+    @Suppress("DEPRECATION")
+    fun getDisplayScreenMetrics(context: Context): DisplayScreenMetrics {
+        val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+        val display = dm.getDisplay(Display.DEFAULT_DISPLAY)
+        val rotation = display?.rotation ?: Surface.ROTATION_0
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.maximumWindowMetrics.bounds
+            DisplayScreenMetrics(bounds.width().coerceAtLeast(1), bounds.height().coerceAtLeast(1), rotation)
+        } else {
+            val metrics = DisplayMetrics()
+            display?.getRealMetrics(metrics)
+            DisplayScreenMetrics(metrics.widthPixels.coerceAtLeast(1), metrics.heightPixels.coerceAtLeast(1), rotation)
+        }
+    }
+}
