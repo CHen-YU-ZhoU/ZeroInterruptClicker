@@ -57,6 +57,7 @@ public:
     TouchMuxEngine& operator=(const TouchMuxEngine&) = delete;
 
     static ProbeResult probeDevices();
+    static int cleanupOrphanProcesses(const std::string& processName = "");
 
     int initAndGrab(int displayW, int displayH, int rotation, int selfCheckTimeoutMs);
     bool confirmSelfCheck();

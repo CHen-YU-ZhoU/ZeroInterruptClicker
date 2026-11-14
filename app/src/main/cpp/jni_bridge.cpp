@@ -64,6 +64,22 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeProbeCapabiliti
 }
 
 JNIEXPORT jint JNICALL
+Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeCleanupOrphans(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jstring processName) {
+    std::string target;
+    if (processName != nullptr) {
+        const char* chars = env->GetStringUTFChars(processName, nullptr);
+        if (chars != nullptr) {
+            target = chars;
+            env->ReleaseStringUTFChars(processName, chars);
+        }
+    }
+    return static_cast<jint>(touchmux::TouchMuxEngine::cleanupOrphanProcesses(target));
+}
+
+JNIEXPORT jint JNICALL
 Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeInitAndGrab(
     JNIEnv* /* env */,
     jobject /* thiz */,

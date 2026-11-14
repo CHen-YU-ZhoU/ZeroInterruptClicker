@@ -50,6 +50,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
 
     private val watchdogExecutor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private var selfCheckWatchdogTask: ScheduledFuture<*>? = null
+    private val nativeLifecycleLock = Any()
 
     // Fallback injector state
     private val fallbackLock = Any()
@@ -64,6 +65,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
 
     // JNI declarations matching jni_bridge.cpp
     private external fun nativeProbeCapabilities(): String
+    private external fun nativeCleanupOrphans(processName: String): Int
     private external fun nativeInitAndGrab(displayW: Int, displayH: Int, rotation: Int, selfCheckTimeoutMs: Int): Int
     private external fun nativeConfirmSelfCheck(): Boolean
     private external fun nativeSetTargetsAndRunning(
@@ -184,6 +186,10 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
 
         if (loaded) {
             try {
+                val cleanedOrphans = synchronized(nativeLifecycleLock) {
+                    nativeCleanupOrphans("")
+                }
+                obj.put("cleanedOrphans", cleanedOrphans)
                 val nativeJson = JSONObject(nativeProbeCapabilities())
                 val keys = nativeJson.keys()
                 while (keys.hasNext()) {
@@ -210,10 +216,10 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         displayWidth: Int,
         displayHeight: Int,
         rotation: Int
-    ): Int {
+    ): Int = synchronized(nativeLifecycleLock) {
         if (!ensureNativeLoaded(nativeLibDir)) {
             statusDetail = nativeLoadError ?: "Native load failed"
-            return -1001
+            return@synchronized -1001
         }
         val rc = nativeInitAndGrab(displayWidth, displayHeight, rotation, 0)
         if (rc == 0) {
@@ -223,7 +229,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         } else {
             statusDetail = nativeGetLastError().ifBlank { "Native init failed ($rc)" }
         }
-        return rc
+        rc
     }
 
     override fun startSelfCheckGrab(
@@ -232,10 +238,10 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         displayHeight: Int,
         rotation: Int,
         timeoutMs: Int
-    ): Int {
+    ): Int = synchronized(nativeLifecycleLock) {
         if (!ensureNativeLoaded(nativeLibDir)) {
             statusDetail = nativeLoadError ?: "Native load failed"
-            return -1001
+            return@synchronized -1001
         }
         stopFallbackThread()
         selfCheckConfirmed.set(false)
@@ -246,7 +252,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         if (rc != 0) {
             currentMode.set(MODE_IDLE)
             statusDetail = nativeGetLastError().ifBlank { "Native grab failed ($rc)" }
-            return rc
+            return@synchronized rc
         }
 
         currentMode.set(MODE_NATIVE_MUX)
@@ -254,25 +260,27 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
 
         // JVM backup watchdog in addition to native CLOCK_MONOTONIC timerfd
         selfCheckWatchdogTask = watchdogExecutor.schedule({
-            if (!selfCheckConfirmed.get() && nativeLoaded.get()) {
-                Log.w(TAG, "JVM watchdog enforcing self-check rollback.")
-                try {
-                    nativeShutdown()
-                } catch (_: Throwable) {
-                }
-                if (currentMode.get() == MODE_NATIVE_MUX) {
-                    currentMode.set(MODE_IDLE)
-                    statusDetail = "Self-check timed out; safely rolled back."
+            synchronized(nativeLifecycleLock) {
+                if (!selfCheckConfirmed.get() && nativeLoaded.get()) {
+                    Log.w(TAG, "JVM watchdog enforcing self-check rollback.")
+                    try {
+                        nativeShutdown()
+                    } catch (_: Throwable) {
+                    }
+                    if (currentMode.get() == MODE_NATIVE_MUX) {
+                        currentMode.set(MODE_IDLE)
+                        statusDetail = "Self-check timed out; safely rolled back."
+                    }
                 }
             }
         }, safeTimeout.toLong() + 150L, TimeUnit.MILLISECONDS)
 
-        return 0
+        0
     }
 
-    override fun confirmSelfCheck(): Boolean {
+    override fun confirmSelfCheck(): Boolean = synchronized(nativeLifecycleLock) {
         cancelWatchdogTask()
-        if (!nativeLoaded.get()) return false
+        if (!nativeLoaded.get()) return@synchronized false
         val ok = nativeConfirmSelfCheck()
         if (ok) {
             selfCheckConfirmed.set(true)
@@ -287,10 +295,10 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 nativeGetLastError().ifBlank { "Native TouchMux not active." }
             }
         }
-        return ok
+        ok
     }
 
-    override fun cancelSelfCheckAndUngrab() {
+    override fun cancelSelfCheckAndUngrab() = synchronized(nativeLifecycleLock) {
         cancelWatchdogTask()
         selfCheckConfirmed.set(false)
         if (nativeLoaded.get()) {
@@ -394,7 +402,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         }
     }
 
-    override fun shutdownEngine() {
+    override fun shutdownEngine() = synchronized(nativeLifecycleLock) {
         cancelWatchdogTask()
         clickingActive.set(false)
         selfCheckConfirmed.set(false)
@@ -402,6 +410,10 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         if (nativeLoaded.get()) {
             try {
                 nativeShutdown()
+            } catch (_: Throwable) {
+            }
+            try {
+                nativeCleanupOrphans("")
             } catch (_: Throwable) {
             }
         }

@@ -426,7 +426,12 @@ class MainActivity : AppCompatActivity() {
             val rc = ShizukuController.startSelfCheckGrab(SELF_CHECK_TIMEOUT_MS)
             withContext(Dispatchers.Main) {
                 if (rc != 0) {
-                    showSnackbar("无法开启 EVIOCGRAB 自检 (err=$rc)，请确认设备节点权限")
+                    val msg = if (rc == -16) {
+                        "触控节点仍被占用 (err=-16 EBUSY)，请点「释放触控独占」或重启设备后重试"
+                    } else {
+                        "无法开启 EVIOCGRAB 自检 (err=$rc)，请确认设备节点权限"
+                    }
+                    showSnackbar(msg)
                     return@withContext
                 }
                 startSelfCheckCountdown()

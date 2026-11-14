@@ -4,6 +4,8 @@
 #include <array>
 #include <cerrno>
 #include <cmath>
+#include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
@@ -58,6 +60,32 @@ bool testBit(const std::array<uint8_t, N>& bits, size_t bit) {
 
 std::string formatErrno(const char* prefix, int err) {
     return std::string(prefix) + ": " + std::strerror(err) + " (errno=" + std::to_string(err) + ")";
+}
+
+std::string readProcCmdline(const char* cmdlinePath) {
+    int fd = open(cmdlinePath, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return "";
+    }
+    char buf[256] = {};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) {
+        return "";
+    }
+    size_t len = 0;
+    while (len < static_cast<size_t>(n) && buf[len] != '\0') {
+        ++len;
+    }
+    while (len > 0 && (buf[len - 1] == ' ' || buf[len - 1] == '\r' || buf[len - 1] == '\n')) {
+        --len;
+    }
+    return std::string(buf, len);
+}
+
+std::mutex& cleanupMutex() {
+    static std::mutex m;
+    return m;
 }
 
 }  // namespace
@@ -232,6 +260,99 @@ ProbeResult TouchMuxEngine::probeDevices() {
         result.touchDeviceErrno = touchErr;
     }
     return result;
+}
+
+int TouchMuxEngine::cleanupOrphanProcesses(const std::string& processName) {
+    std::lock_guard<std::mutex> lock(cleanupMutex());
+
+    std::string targetName = processName;
+    if (targetName.empty()) {
+        targetName = readProcCmdline("/proc/self/cmdline");
+    }
+    if (targetName.empty()) {
+        targetName = "com.zerointerrupt.clicker:touchmux";
+    }
+    // Safety guard: never allow partial/unrelated targets to kill non-UserService processes.
+    if (targetName.find(":touchmux") == std::string::npos) {
+        LOGW("cleanupOrphanProcesses skipped unsafe target '%s'", targetName.c_str());
+        return 0;
+    }
+
+    const pid_t selfPid = getpid();
+    DIR* procDir = opendir("/proc");
+    if (!procDir) {
+        LOGW("cleanupOrphanProcesses opendir(/proc) failed: %s", std::strerror(errno));
+        return 0;
+    }
+
+    std::vector<pid_t> stalePids;
+    struct dirent* ent = nullptr;
+    while ((ent = readdir(procDir)) != nullptr) {
+        if (ent->d_name[0] < '0' || ent->d_name[0] > '9') {
+            continue;
+        }
+        char* endPtr = nullptr;
+        long parsed = std::strtol(ent->d_name, &endPtr, 10);
+        if (endPtr == ent->d_name || *endPtr != '\0' || parsed <= 1) {
+            continue;
+        }
+        pid_t pid = static_cast<pid_t>(parsed);
+        if (pid == selfPid) {
+            continue;
+        }
+        std::string cmdPath = std::string("/proc/") + ent->d_name + "/cmdline";
+        if (readProcCmdline(cmdPath.c_str()) == targetName) {
+            stalePids.push_back(pid);
+        }
+    }
+    closedir(procDir);
+
+    if (stalePids.empty()) {
+        return 0;
+    }
+
+    LOGI("Reclaiming %zu orphan '%s' process(es)...", stalePids.size(), targetName.c_str());
+    int signaled = 0;
+    for (pid_t pid : stalePids) {
+        if (kill(pid, SIGTERM) == 0) {
+            ++signaled;
+        } else if (errno != ESRCH) {
+            LOGW("kill(%d, SIGTERM) failed: %s", static_cast<int>(pid), std::strerror(errno));
+        }
+    }
+
+    auto anyStillActive = [&stalePids, &targetName]() -> bool {
+        for (pid_t pid : stalePids) {
+            if (kill(pid, 0) != 0) {
+                continue;  // ESRCH or EPERM
+            }
+            std::string cmdPath = "/proc/" + std::to_string(static_cast<int>(pid)) + "/cmdline";
+            if (readProcCmdline(cmdPath.c_str()) == targetName) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (int i = 0; i < 18 && anyStillActive(); ++i) {
+        usleep(20000);
+    }
+    if (anyStillActive()) {
+        for (pid_t pid : stalePids) {
+            if (kill(pid, 0) == 0) {
+                if (kill(pid, SIGKILL) == 0) {
+                    LOGW("Sent SIGKILL to lingering orphan pid %d", static_cast<int>(pid));
+                }
+            }
+        }
+        for (int i = 0; i < 15 && anyStillActive(); ++i) {
+            usleep(20000);
+        }
+    }
+
+    // Allow evdev & InputReader a short settle window after orphan FDs close
+    usleep(120000);
+    return signaled;
 }
 
 bool TouchMuxEngine::setupUinputDevice(const DeviceDesc& desc, int& outErrno) {
@@ -424,6 +545,9 @@ int TouchMuxEngine::initAndGrab(int displayW, int displayH, int rotation, int se
         workerThread_.join();
     }
 
+    // Reclaim any stale :touchmux UserService left over from app updates, kills, or Shizuku restarts.
+    cleanupOrphanProcesses();
+
     DeviceDesc desc;
     int findErr = 0;
     if (!findBestTouchscreen(desc, findErr)) {
@@ -449,11 +573,23 @@ int TouchMuxEngine::initAndGrab(int displayW, int displayH, int rotation, int se
 
     if (ioctl(physFd_, EVIOCGRAB, 1) < 0) {
         int err = errno;
-        lastError_ = formatErrno("ioctl(EVIOCGRAB, 1) failed", err);
-        ioctl(uinputFd_, UI_DEV_DESTROY);
-        closeAllFds();
-        engineState_.store(static_cast<int32_t>(EngineState::ERROR_STATE));
-        return -err;
+        if (err == EBUSY) {
+            LOGW("EVIOCGRAB hit EBUSY on %s; cleaning orphans and retrying once...", desc.path.c_str());
+            cleanupOrphanProcesses();
+            usleep(150000);
+            if (ioctl(physFd_, EVIOCGRAB, 1) == 0) {
+                err = 0;
+            } else {
+                err = errno;
+            }
+        }
+        if (err != 0) {
+            lastError_ = formatErrno("ioctl(EVIOCGRAB, 1) failed", err);
+            ioctl(uinputFd_, UI_DEV_DESTROY);
+            closeAllFds();
+            engineState_.store(static_cast<int32_t>(EngineState::ERROR_STATE));
+            return -err;
+        }
     }
 
     epollFd_ = epoll_create1(EPOLL_CLOEXEC);
