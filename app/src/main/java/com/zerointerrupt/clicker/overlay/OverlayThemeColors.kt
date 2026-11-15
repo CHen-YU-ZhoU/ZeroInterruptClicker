@@ -13,6 +13,8 @@ import com.google.android.material.R as MaterialR
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.MaterialColors
 import com.zerointerrupt.clicker.R
+import com.zerointerrupt.clicker.model.ClickConfigStore
+import com.zerointerrupt.clicker.model.ClickGlobalSettings
 
 /**
  * Resolves Material You (Dynamic Color on Android 12+) / MD3 DayNight color tokens
@@ -64,11 +66,25 @@ data class OverlayThemeColors(
 
     companion object {
         fun resolve(baseContext: Context): OverlayThemeColors {
+            val settings = ClickConfigStore.loadSettings(baseContext)
             val baseUiMode = baseContext.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
-            val isDark = baseUiMode == Configuration.UI_MODE_NIGHT_YES
+            val isDark = when (settings.themeMode) {
+                ClickGlobalSettings.THEME_DARK -> true
+                ClickGlobalSettings.THEME_LIGHT -> false
+                else -> baseUiMode == Configuration.UI_MODE_NIGHT_YES
+            }
 
-            val styled = ContextThemeWrapper(baseContext, R.style.Theme_ZeroInterruptClicker)
-            val dynamic = DynamicColors.wrapContextIfAvailable(styled)
+            val overrideConfig = Configuration(baseContext.resources.configuration).apply {
+                uiMode = (uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                    if (isDark) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO
+            }
+            val themedBase = baseContext.createConfigurationContext(overrideConfig)
+            val styled = ContextThemeWrapper(themedBase, R.style.Theme_ZeroInterruptClicker)
+            val dynamic = if (settings.dynamicColor) {
+                DynamicColors.wrapContextIfAvailable(styled)
+            } else {
+                styled
+            }
 
             fun attr(attrId: Int, fallbackDark: Int, fallbackLight: Int): Int {
                 val fb = if (isDark) fallbackDark else fallbackLight

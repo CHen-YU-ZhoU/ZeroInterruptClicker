@@ -6,8 +6,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Needed on some Android kernels to bind local 127.0.0.1 loopback sockets (never listens on external interfaces) -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
+        android:name=".ZeroInterruptApp"
         android:allowBackup="true"
         android:extractNativeLibs="true"
         android:icon="@mipmap/ic_launcher"
@@ -37,6 +40,27 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Game auto-clicker floating control bar and touch-passthrough anchor points." />
         </service>
+
+        <service
+            android:name=".QuickTileService"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@drawable/ic_touch_app"
+            android:label="@string/tile_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name=".automation.AutomationReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.zerointerrupt.clicker.RPC" />
+            </intent-filter>
+        </receiver>
 
         <provider
             android:name="rikka.shizuku.ShizukuProvider"

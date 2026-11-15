@@ -1,10 +1,14 @@
 package com.zerointerrupt.clicker.overlay
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -17,20 +21,29 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.service.quicksettings.TileService
 import android.util.TypedValue
 import android.view.Display
 import android.view.Gravity
 import android.view.View
+import android.view.ViewTreeObserver
 import android.view.WindowManager
+import android.view.animation.PathInterpolator
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
-import androidx.core.graphics.ColorUtils
+import androidx.dynamicanimation.animation.DynamicAnimation
+import androidx.dynamicanimation.animation.SpringAnimation
+import androidx.dynamicanimation.animation.SpringForce
 import com.google.android.material.switchmaterial.SwitchMaterial
+import com.zerointerrupt.clicker.QuickTileService
 import com.zerointerrupt.clicker.R
+import com.zerointerrupt.clicker.model.ActionType
 import com.zerointerrupt.clicker.model.ClickConfigStore
+import com.zerointerrupt.clicker.model.ClickGlobalSettings
 import com.zerointerrupt.clicker.model.ClickTarget
+import com.zerointerrupt.clicker.model.ExecutionMode
 import com.zerointerrupt.clicker.shizuku.ShizukuController
 import com.zerointerrupt.clicker.shizuku.TouchMuxUserService
 import com.zerointerrupt.clicker.ui.MainActivity
@@ -56,27 +69,35 @@ object OverlayStateHub {
     private val _configVersion = MutableStateFlow(0L)
     val configVersion: StateFlow<Long> = _configVersion.asStateFlow()
 
-    internal fun setOverlayVisible(visible: Boolean) {
+    internal fun setOverlayVisible(context: Context, visible: Boolean) {
         _overlayVisible.value = visible
+        requestQuickTileUpdate(context)
     }
 
-    internal fun setClickingRunning(running: Boolean) {
+    internal fun setClickingRunning(context: Context, running: Boolean) {
         _clickingRunning.value = running
+        requestQuickTileUpdate(context)
     }
 
     internal fun bumpConfigVersion() {
         _configVersion.value = _configVersion.value + 1L
     }
+
+    fun requestQuickTileUpdate(context: Context) {
+        try {
+            TileService.requestListeningState(
+                context.applicationContext,
+                ComponentName(context.applicationContext, QuickTileService::class.java)
+            )
+        } catch (_: Throwable) {
+        }
+    }
 }
 
 /**
- * Foreground overlay service implementing zero-relayout window orchestration.
- *
- * Key properties:
- * 1. All overlay windows use FLAG_NOT_FOCUSABLE | FLAG_SPLIT_TOUCH | FLAG_LAYOUT_IN_SCREEN | FLAG_LAYOUT_NO_LIMITS.
- * 2. When locked, anchor windows carry FLAG_NOT_TOUCHABLE. Toggling Start/Stop NEVER calls
- *    WindowManager.updateViewLayout() or triggers WMS relayout — only local View.invalidate().
- * 3. Tracks DisplayManager rotation changes in real time for landscape games.
+ * Foreground overlay service implementing zero-relayout window orchestration,
+ * multi-gesture anchors (TAP / SWIPE / HOLD), normalized aspect-safe coordinates,
+ * and SpringAnimation edge snapping/collapsing.
  */
 class OverlayService : Service(), ControlBarView.Listener {
 
@@ -92,20 +113,52 @@ class OverlayService : Service(), ControlBarView.Listener {
     private var isBarCollapsed: Boolean = false
     private var dockRight: Boolean = false
 
+    private var barPosAnimator: ValueAnimator? = null
+    private var barMorphAnimator: ValueAnimator? = null
+    private var barToolsScaleSpringY: SpringAnimation? = null
+    private var pendingPreDrawListener: ViewTreeObserver.OnPreDrawListener? = null
+    private var currentMorphProgress: Float = 1f
+    private var morphTargetProgress: Float = 1f
+    private var morphEdgeMarginPx: Int = 0
+    private var morphExpandedTopY: Int = 0
+    private var morphPillTopOffsetPx: Int = 0
+    private var morphScreenWidthPx: Int = 0
+    private var morphScreenHeightPx: Int = 0
+    private var dragScreenWidthPx: Int = 0
+    private var dragScreenHeightPx: Int = 0
+    private var handoffStaleBar: ControlBarView? = null
+    private var pendingCommitBar: ControlBarView? = null
+    private var pendingCommitRunnable: Runnable? = null
+    private var handoffGeneration: Long = 0L
+    private val morphInterpolator = PathInterpolator(0.22f, 0f, 0.12f, 1f)
+
+    private var swipeConnectorView: SwipeConnectorOverlayView? = null
+    private var swipeConnectorLp: WindowManager.LayoutParams? = null
+
     private var tunePanelView: View? = null
     private var tunePanelLp: WindowManager.LayoutParams? = null
 
     private val targets = mutableListOf<ClickTarget>()
     private val anchorViews = LinkedHashMap<Int, AnchorPointView>()
     private val anchorLps = LinkedHashMap<Int, WindowManager.LayoutParams>()
+    private val endAnchorViews = LinkedHashMap<Int, AnchorPointView>()
+    private val endAnchorLps = LinkedHashMap<Int, WindowManager.LayoutParams>()
 
     private var selectedTargetId: Int = -1
     private var nextTargetId: Int = 1
     private var activePresetId: String = ""
+    private var activeExecutionMode: ExecutionMode = ExecutionMode.CONCURRENT
+    private var activePresetLoopCount: Int = 0
+    private var activePresetDurationSec: Int = 0
+    private var lockedAlpha: Float = ClickGlobalSettings.DEFAULT_LOCKED_ALPHA
     private var isLocked: Boolean = false
     private var isClicking: Boolean = false
     private var engineMode: Int = TouchMuxUserService.MODE_IDLE
+
     private var engineCollectJob: Job? = null
+    private var volumeToggleJob: Job? = null
+    private var emergencyUngrabJob: Job? = null
+    private var clickingCompletedJob: Job? = null
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = Unit
@@ -123,20 +176,63 @@ class OverlayService : Service(), ControlBarView.Listener {
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         themeColors = OverlayThemeColors.resolve(this)
         dockRight = ClickConfigStore.loadControlBarDockRight(this)
+        lockedAlpha = ClickConfigStore.loadSettings(this).lockedAnchorAlpha
+            .coerceIn(ClickGlobalSettings.MIN_LOCKED_ALPHA, ClickGlobalSettings.MAX_LOCKED_ALPHA)
         ShizukuController.initialize(this)
         startForegroundWithNotification()
         displayManager.registerDisplayListener(displayListener, null)
 
         loadInitialTargets()
-        attachControlBar()
+        syncSwipeConnectorLayer()
         attachAllAnchors()
-        OverlayStateHub.setOverlayVisible(true)
+        attachControlBar()
+        OverlayStateHub.setOverlayVisible(this, true)
         scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
 
         engineCollectJob = serviceScope.launch {
             ShizukuController.engineSnapshot.collect { snap ->
                 engineMode = snap.engineMode
                 refreshControlBarState()
+            }
+        }
+
+        volumeToggleJob = serviceScope.launch {
+            ShizukuController.volumeKeyToggleEvents.collect {
+                if (ClickConfigStore.loadSettings(this@OverlayService).volumeKeyToggleEnabled) {
+                    onTogglePlayStop()
+                }
+            }
+        }
+
+        emergencyUngrabJob = serviceScope.launch {
+            ShizukuController.emergencyUngrabEvents.collect {
+                isClicking = false
+                OverlayStateHub.setClickingRunning(this@OverlayService, false)
+                applyLockMode(false)
+                refreshAnchorVisuals()
+                refreshControlBarState()
+                Toast.makeText(
+                    this@OverlayService,
+                    "检测到长按音量减 3 秒，已紧急释放触控独占",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+
+        clickingCompletedJob = serviceScope.launch {
+            ShizukuController.clickingCompletedEvents.collect {
+                if (isClicking) {
+                    isClicking = false
+                    OverlayStateHub.setClickingRunning(this@OverlayService, false)
+                    refreshAnchorVisuals()
+                    refreshControlBarState()
+                    scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+                    Toast.makeText(
+                        this@OverlayService,
+                        "方案执行已完成",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
             }
         }
     }
@@ -148,13 +244,45 @@ class OverlayService : Service(), ControlBarView.Listener {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_STOP_CLICKING -> {
+            ACTION_STOP_CLICKING, ACTION_RPC_STOP -> {
                 stopClickingInternal()
             }
+            ACTION_RPC_START -> {
+                if (!isClicking) {
+                    onTogglePlayStop()
+                }
+            }
+            ACTION_RPC_SWITCH_PRESET -> {
+                val targetId = intent.getStringExtra(EXTRA_PRESET_ID).orEmpty()
+                val targetName = intent.getStringExtra(EXTRA_PRESET_NAME).orEmpty()
+                val presets = ClickConfigStore.loadPresets(this)
+                val match = when {
+                    targetId.isNotBlank() -> presets.firstOrNull { it.id == targetId }
+                    targetName.isNotBlank() -> presets.firstOrNull { it.name == targetName }
+                    else -> null
+                }
+                if (match != null) {
+                    if (isClicking) stopClickingInternal()
+                    ClickConfigStore.setActivePresetId(this, match.id)
+                    replaceTargetsWithActivePreset()
+                    OverlayStateHub.bumpConfigVersion()
+                }
+            }
             ACTION_REFRESH_SETTINGS -> {
+                val settings = ClickConfigStore.loadSettings(this)
+                themeColors = OverlayThemeColors.resolve(this)
+                controlBarView?.applyThemeColors(themeColors)
+                lockedAlpha = settings.lockedAnchorAlpha.coerceIn(
+                    ClickGlobalSettings.MIN_LOCKED_ALPHA,
+                    ClickGlobalSettings.MAX_LOCKED_ALPHA
+                )
                 reloadTargetSettingsFromStore()
+                if (tunePanelView != null) {
+                    showOrUpdateTunePanel(forceShow = true)
+                }
+                refreshLockedAlphasIfNeeded()
                 refreshControlBarState()
-                if (ClickConfigStore.loadSettings(this).autoCollapseBar) {
+                if (settings.autoCollapseBar) {
                     scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
                 } else {
                     cancelAutoCollapse()
@@ -176,14 +304,19 @@ class OverlayService : Service(), ControlBarView.Listener {
 
     override fun onDestroy() {
         mainHandler.removeCallbacksAndMessages(null)
+        cancelBarSprings()
         displayManager.unregisterDisplayListener(displayListener)
         engineCollectJob?.cancel()
+        volumeToggleJob?.cancel()
+        emergencyUngrabJob?.cancel()
+        clickingCompletedJob?.cancel()
         stopClickingInternal()
         dismissTunePanel()
         removeAllAnchorWindows()
+        removeSwipeConnectorLayer()
         removeControlBar()
-        OverlayStateHub.setClickingRunning(false)
-        OverlayStateHub.setOverlayVisible(false)
+        OverlayStateHub.setClickingRunning(this, false)
+        OverlayStateHub.setOverlayVisible(this, false)
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -271,6 +404,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
+            windowAnimations = 0
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 fitInsetsTypes = 0
                 layoutInDisplayCutoutMode =
@@ -283,14 +417,21 @@ class OverlayService : Service(), ControlBarView.Listener {
     }
 
     private fun loadInitialTargets() {
-        activePresetId = ClickConfigStore.getActivePresetId(this)
-        val loaded = ClickConfigStore.loadTargets(this)
+        val metrics = ShizukuController.getDisplayScreenMetrics(this)
+        val preset = ClickConfigStore.getActivePreset(this)
+        activePresetId = preset.id
+        activeExecutionMode = preset.executionMode
+        activePresetLoopCount = preset.presetLoopCount
+        activePresetDurationSec = preset.presetDurationSec
         targets.clear()
-        targets.addAll(loaded)
+        preset.targets.forEach { t ->
+            val copy = t.copy()
+            copy.remapToScreen(metrics.widthPx, metrics.heightPx)
+            targets.add(copy)
+        }
         if (targets.isEmpty()) {
-            val metrics = ShizukuController.getDisplayScreenMetrics(this)
             val settings = ClickConfigStore.loadSettings(this)
-            targets += ClickTarget(
+            val created = ClickTarget(
                 id = 1,
                 index = 1,
                 x = metrics.widthPx * 0.5f,
@@ -300,6 +441,8 @@ class OverlayService : Service(), ControlBarView.Listener {
                 microJitter = settings.defaultMicroJitter,
                 enabled = true
             )
+            created.setStartPixel(metrics.widthPx * 0.5f, metrics.heightPx * 0.5f, metrics.widthPx, metrics.heightPx)
+            targets += created
             persistCurrentTargets()
         }
         nextTargetId = (targets.maxOfOrNull { it.id } ?: 0) + 1
@@ -313,19 +456,18 @@ class OverlayService : Service(), ControlBarView.Listener {
         bar.setToolsExpanded(false)
         val initialW = bar.getExpandedWidthPx()
         val initialH = bar.getExpandedBarHeightPx()
+        val marginPx = bar.getEdgeMarginPx()
         val defaultX = if (dockRight) {
-            (metrics.widthPx - initialW - (16f * resources.displayMetrics.density).roundToInt())
-                .coerceAtLeast(0)
+            (metrics.widthPx - initialW - marginPx).coerceAtLeast(0)
         } else {
-            (16f * resources.displayMetrics.density).roundToInt()
+            marginPx.coerceAtMost((metrics.widthPx - initialW).coerceAtLeast(0))
         }
         val lp = createBaseOverlayParams(
             initialW,
             initialH,
             touchable = true
         ).apply {
-            x = (savedPos?.first ?: defaultX)
-                .coerceIn(0, (metrics.widthPx - initialW).coerceAtLeast(0))
+            x = (savedPos?.first ?: defaultX).coerceIn(0, (metrics.widthPx - initialW).coerceAtLeast(0))
             y = (savedPos?.second ?: (metrics.heightPx * 0.25f).roundToInt())
                 .coerceIn(0, (metrics.heightPx - initialH).coerceAtLeast(0))
         }
@@ -340,11 +482,21 @@ class OverlayService : Service(), ControlBarView.Listener {
     }
 
     private fun reloadTargetSettingsFromStore() {
-        val storeActiveId = ClickConfigStore.getActivePresetId(this)
-        val stored = ClickConfigStore.loadTargets(this)
-        val currentSig = targets.map { listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled) }
-        val storedSig = stored.map { listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled) }
-        if (activePresetId != storeActiveId || currentSig != storedSig) {
+        val preset = ClickConfigStore.getActivePreset(this)
+        val metrics = ShizukuController.getDisplayScreenMetrics(this)
+        val stored = preset.targets.map { t -> t.copy().also { it.remapToScreen(metrics.widthPx, metrics.heightPx) } }
+        val currentSig = targets.map {
+            listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled, it.actionType, it.endX, it.endY, it.swipeDurationMs, it.repeatCount)
+        }
+        val storedSig = stored.map {
+            listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled, it.actionType, it.endX, it.endY, it.swipeDurationMs, it.repeatCount)
+        }
+        if (activePresetId != preset.id ||
+            activeExecutionMode != preset.executionMode ||
+            activePresetLoopCount != preset.presetLoopCount ||
+            activePresetDurationSec != preset.presetDurationSec ||
+            currentSig != storedSig
+        ) {
             if (isClicking) {
                 stopClickingInternal()
             }
@@ -353,13 +505,23 @@ class OverlayService : Service(), ControlBarView.Listener {
     }
 
     private fun replaceTargetsWithActivePreset() {
-        activePresetId = ClickConfigStore.getActivePresetId(this)
+        val metrics = ShizukuController.getDisplayScreenMetrics(this)
+        val preset = ClickConfigStore.getActivePreset(this)
+        activePresetId = preset.id
+        activeExecutionMode = preset.executionMode
+        activePresetLoopCount = preset.presetLoopCount
+        activePresetDurationSec = preset.presetDurationSec
         dismissTunePanel()
         removeAllAnchorWindows()
         targets.clear()
-        targets.addAll(ClickConfigStore.loadTargets(this))
+        preset.targets.forEach { t ->
+            val copy = t.copy()
+            copy.remapToScreen(metrics.widthPx, metrics.heightPx)
+            targets.add(copy)
+        }
         nextTargetId = (targets.maxOfOrNull { it.id } ?: 0) + 1
         selectedTargetId = targets.firstOrNull()?.id ?: -1
+        syncSwipeConnectorLayer()
         attachAllAnchors()
         refreshControlBarState()
     }
@@ -369,14 +531,364 @@ class OverlayService : Service(), ControlBarView.Listener {
         OverlayStateHub.bumpConfigVersion()
     }
 
-    private fun removeControlBar() {
-        val bar = controlBarView ?: return
+    private fun removeViewSafely(view: View?) {
+        if (view == null) return
         try {
-            windowManager.removeViewImmediate(bar)
+            windowManager.removeViewImmediate(view)
         } catch (_: Throwable) {
         }
+    }
+
+    private fun createSyncedControlBar(toolsExpanded: Boolean): ControlBarView {
+        val (presetIdx, presetCount) = ClickConfigStore.getActivePresetIndexAndTotal(this)
+        return ControlBarView(this, themeColors, this).apply {
+            setToolsExpanded(toolsExpanded)
+            updateState(
+                isRunning = isClicking,
+                isLocked = isLocked,
+                engineMode = engineMode,
+                tunePanelOpen = (tunePanelView != null),
+                presetIndex = presetIdx,
+                presetCount = presetCount
+            )
+        }
+    }
+
+    private fun clearPendingHandoffCallbacks() {
+        val listener = pendingPreDrawListener
+        val bar = pendingCommitBar ?: controlBarView
+        if (listener != null && bar != null) {
+            val vto = bar.viewTreeObserver
+            if (vto.isAlive) {
+                vto.removeOnPreDrawListener(listener)
+            }
+        }
+        pendingPreDrawListener = null
+        val commit = pendingCommitRunnable
+        if (commit != null) {
+            pendingCommitBar?.removeCallbacks(commit)
+            controlBarView?.removeCallbacks(commit)
+        }
+        pendingCommitRunnable = null
+        pendingCommitBar = null
+    }
+
+    private fun swapToNewControlBarWindow(
+        newBar: ControlBarView,
+        newLp: WindowManager.LayoutParams,
+        onCommitted: () -> Unit
+    ) {
+        clearPendingHandoffCallbacks()
+        handoffStaleBar?.let { stale ->
+            removeViewSafely(stale)
+            handoffStaleBar = null
+        }
+        handoffGeneration += 1L
+        val expectedGen = handoffGeneration
+        val oldBar = controlBarView
+        handoffStaleBar = oldBar
+        controlBarView = newBar
+        controlBarLp = newLp
+        newBar.syncWindowPosition(newLp.x, newLp.y)
+        windowManager.addView(newBar, newLp)
+
+        val cleanupStale = Runnable {
+            if (handoffStaleBar === oldBar) {
+                handoffStaleBar = null
+                removeViewSafely(oldBar)
+            }
+        }
+
+        var committed = false
+        val finalizeCommit = Runnable {
+            if (committed) return@Runnable
+            committed = true
+            if (pendingCommitBar === newBar) {
+                pendingCommitRunnable?.let { newBar.removeCallbacks(it) }
+                pendingCommitRunnable = null
+                pendingCommitBar = null
+            }
+            if (handoffGeneration != expectedGen || controlBarView !== newBar || !newBar.isAttachedToWindow) {
+                cleanupStale.run()
+                return@Runnable
+            }
+            if (handoffStaleBar === oldBar && oldBar != null && oldBar.hasActiveTouchGesture()) {
+                // Keep oldBar alive invisibly until its in-flight ACTION_DOWN -> ACTION_UP completes
+                // so a rapid tap landing during window handoff never gets dropped mid-gesture.
+                oldBar.alpha = 0f
+                oldBar.runWhenTouchIdle {
+                    oldBar.removeCallbacks(cleanupStale)
+                    cleanupStale.run()
+                }
+                oldBar.postDelayed(cleanupStale, 450L)
+            } else {
+                cleanupStale.run()
+            }
+            onCommitted()
+        }
+        pendingCommitBar = newBar
+        pendingCommitRunnable = finalizeCommit
+
+        val listener = object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                val vto = newBar.viewTreeObserver
+                if (vto.isAlive) {
+                    vto.removeOnPreDrawListener(this)
+                }
+                if (pendingPreDrawListener === this) {
+                    pendingPreDrawListener = null
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && vto.isAlive) {
+                    vto.registerFrameCommitCallback {
+                        if (handoffGeneration == expectedGen && newBar.isAttachedToWindow) {
+                            newBar.postOnAnimation(finalizeCommit)
+                        } else {
+                            finalizeCommit.run()
+                        }
+                    }
+                } else {
+                    newBar.postOnAnimation(finalizeCommit)
+                }
+                return true
+            }
+        }
+        pendingPreDrawListener = listener
+        newBar.viewTreeObserver.addOnPreDrawListener(listener)
+        // Safety net only if frame commit callback is dropped during teardown.
+        newBar.postDelayed(finalizeCommit, 900L)
+    }
+
+    private fun cancelBarSprings() {
+        handoffGeneration += 1L
+        clearPendingHandoffCallbacks()
+        handoffStaleBar?.let { stale ->
+            removeViewSafely(stale)
+            handoffStaleBar = null
+        }
+        barPosAnimator?.cancel()
+        barMorphAnimator?.cancel()
+        barToolsScaleSpringY?.cancel()
+        barPosAnimator = null
+        barMorphAnimator = null
+        barToolsScaleSpringY = null
+    }
+
+    private fun animateControlBarPosX(
+        targetX: Int,
+        onEnd: (() -> Unit)? = null
+    ) {
+        val bar = controlBarView ?: run { onEnd?.invoke(); return }
+        val lp = controlBarLp ?: run { onEnd?.invoke(); return }
+        barPosAnimator?.cancel()
+        barPosAnimator = null
+        if (lp.x == targetX) {
+            bar.syncWindowPosition(lp.x, lp.y)
+            onEnd?.invoke()
+            return
+        }
+        val anim = ValueAnimator.ofInt(lp.x, targetX).apply {
+            duration = 220L
+            interpolator = morphInterpolator
+            addUpdateListener { va ->
+                if (controlBarView === bar && bar.isAttachedToWindow) {
+                    lp.x = va.animatedValue as Int
+                    bar.syncWindowPosition(lp.x, lp.y)
+                    try {
+                        windowManager.updateViewLayout(bar, lp)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                private var canceled = false
+                override fun onAnimationCancel(animation: Animator) {
+                    canceled = true
+                }
+                override fun onAnimationEnd(animation: Animator) {
+                    if (barPosAnimator === animation) {
+                        barPosAnimator = null
+                    }
+                    if (!canceled && controlBarView === bar && bar.isAttachedToWindow) {
+                        lp.x = targetX
+                        bar.syncWindowPosition(lp.x, lp.y)
+                        try {
+                            windowManager.updateViewLayout(bar, lp)
+                        } catch (_: Throwable) {
+                        }
+                        onEnd?.invoke()
+                    }
+                }
+            })
+        }
+        barPosAnimator = anim
+        anim.start()
+    }
+
+    private fun startBarMorphAnimation(
+        targetProgress: Float,
+        screenWidthPx: Int,
+        screenHeightPx: Int
+    ) {
+        val bar = controlBarView ?: return
+        val lp = controlBarLp ?: return
+        barMorphAnimator?.cancel()
+        barMorphAnimator = null
+        val clampedTarget = targetProgress.coerceIn(0f, 1f)
+        val startProgress = currentMorphProgress.coerceIn(0f, 1f)
+        morphTargetProgress = clampedTarget
+        morphScreenWidthPx = screenWidthPx
+        morphScreenHeightPx = screenHeightPx
+
+        if (kotlin.math.abs(clampedTarget - startProgress) < 0.001f) {
+            finalizeBarMorphState(bar, lp, clampedTarget, screenWidthPx, screenHeightPx)
+            return
+        }
+
+        val anim = ValueAnimator.ofFloat(startProgress, clampedTarget).apply {
+            duration = 280L
+            interpolator = morphInterpolator
+            addUpdateListener { va ->
+                if (controlBarView !== bar || !bar.isAttachedToWindow) return@addUpdateListener
+                val progress = (va.animatedValue as Float).coerceIn(0f, 1f)
+                currentMorphProgress = progress
+                // Zero WindowManager IPC during morph: all motion stays local inside locked morphHostWidthPx.
+                bar.applyMorphProgress(progress, dockRight, morphPillTopOffsetPx)
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                private var canceled = false
+                override fun onAnimationCancel(animation: Animator) {
+                    canceled = true
+                }
+                override fun onAnimationEnd(animation: Animator) {
+                    if (barMorphAnimator === animation) {
+                        barMorphAnimator = null
+                    }
+                    if (!canceled && controlBarView === bar && bar.isAttachedToWindow) {
+                        finalizeBarMorphState(bar, lp, clampedTarget, screenWidthPx, screenHeightPx)
+                    }
+                }
+            })
+        }
+        barMorphAnimator = anim
+        anim.start()
+    }
+
+    private fun finalizeBarMorphState(
+        morphBar: ControlBarView,
+        @Suppress("UNUSED_PARAMETER") morphLp: WindowManager.LayoutParams,
+        targetProgress: Float,
+        screenWidthPx: Int,
+        screenHeightPx: Int
+    ) {
+        val toolsOpen = morphBar.isToolsExpanded()
+        if (targetProgress <= 0f) {
+            currentMorphProgress = 0f
+            isBarCollapsed = true
+            val restingBar = createSyncedControlBar(toolsOpen)
+            restingBar.setCollapsed(true, dockRight)
+            val collapsedW = restingBar.getCollapsedWidthPx()
+            val collapsedH = restingBar.getCollapsedHeightPx()
+            val restingLp = createBaseOverlayParams(collapsedW, collapsedH, touchable = true).apply {
+                x = if (dockRight) (screenWidthPx - collapsedW).coerceAtLeast(0) else 0
+                y = (morphExpandedTopY + morphPillTopOffsetPx)
+                    .coerceIn(0, (screenHeightPx - collapsedH).coerceAtLeast(0))
+            }
+            swapToNewControlBarWindow(restingBar, restingLp) {
+                ClickConfigStore.saveControlBarCollapseState(this@OverlayService, true, dockRight)
+            }
+        } else {
+            currentMorphProgress = 1f
+            isBarCollapsed = false
+            val restingBar = createSyncedControlBar(toolsOpen)
+            restingBar.setCollapsed(false, dockRight)
+            val expandedW = restingBar.getExpandedWidthPx()
+            val expandedH = restingBar.getExpandedBarHeightPx()
+            val restingLp = createBaseOverlayParams(expandedW, expandedH, touchable = true).apply {
+                x = if (dockRight) {
+                    (screenWidthPx - expandedW - morphEdgeMarginPx).coerceAtLeast(0)
+                } else {
+                    morphEdgeMarginPx.coerceAtMost((screenWidthPx - expandedW).coerceAtLeast(0))
+                }
+                y = morphExpandedTopY.coerceIn(0, (screenHeightPx - expandedH).coerceAtLeast(0))
+            }
+            swapToNewControlBarWindow(restingBar, restingLp) {
+                ClickConfigStore.saveControlBarCollapseState(this@OverlayService, false, dockRight)
+                ClickConfigStore.saveControlBarPosition(this@OverlayService, restingLp.x, restingLp.y)
+                scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+            }
+        }
+    }
+
+    private fun animateBarToolsUnfold(bar: ControlBarView) {
+        barToolsScaleSpringY?.cancel()
+        bar.pivotY = 0f
+        bar.scaleY = 0.94f
+        barToolsScaleSpringY = SpringAnimation(bar, DynamicAnimation.SCALE_Y, 1f).apply {
+            spring.dampingRatio = SpringForce.DAMPING_RATIO_NO_BOUNCY
+            spring.stiffness = 380f
+            addEndListener { _, _, _, _ -> barToolsScaleSpringY = null }
+            start()
+        }
+    }
+
+    private fun removeControlBar() {
+        cancelBarSprings()
+        removeViewSafely(handoffStaleBar)
+        handoffStaleBar = null
+        removeViewSafely(controlBarView)
         controlBarView = null
         controlBarLp = null
+    }
+
+    private fun syncSwipeConnectorLayer() {
+        val hasSwipes = targets.any { it.actionType == ActionType.SWIPE }
+        if (!hasSwipes) {
+            removeSwipeConnectorLayer()
+            return
+        }
+        var view = swipeConnectorView
+        if (view == null) {
+            view = SwipeConnectorOverlayView(this)
+            val lp = createBaseOverlayParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                touchable = false
+            ).apply {
+                alpha = if (isLocked) (lockedAlpha * 0.9f) else 0.95f
+            }
+            windowManager.addView(view, lp)
+            swipeConnectorView = view
+            swipeConnectorLp = lp
+        } else {
+            swipeConnectorLp?.let { lp ->
+                val targetAlpha = if (isLocked) (lockedAlpha * 0.9f) else 0.95f
+                if (lp.alpha != targetAlpha) {
+                    lp.alpha = targetAlpha
+                    windowManager.updateViewLayout(view, lp)
+                }
+            }
+        }
+        view.updateSwipes(targets, isClicking, isLocked)
+    }
+
+    private fun removeSwipeConnectorLayer() {
+        val v = swipeConnectorView ?: return
+        try {
+            windowManager.removeViewImmediate(v)
+        } catch (_: Throwable) {
+        }
+        swipeConnectorView = null
+        swipeConnectorLp = null
+    }
+
+    private fun bringControlBarToFrontIfNeeded() {
+        val bar = controlBarView ?: return
+        val lp = controlBarLp ?: return
+        try {
+            windowManager.removeViewImmediate(bar)
+            windowManager.addView(bar, lp)
+        } catch (_: Throwable) {
+        }
     }
 
     private fun attachAllAnchors() {
@@ -387,31 +899,67 @@ class OverlayService : Service(), ControlBarView.Listener {
     }
 
     private fun attachSingleAnchor(target: ClickTarget) {
-        if (anchorViews.containsKey(target.id)) return
         val metrics = ShizukuController.getDisplayScreenMetrics(this)
-        val view = AnchorPointView(
-            context = this,
-            targetId = target.id,
-            onDragMove = { id, nx, ny -> handleAnchorDragMove(id, nx, ny) },
-            onDragFinish = { id -> handleAnchorDragFinish(id) },
-            onTap = { id -> handleAnchorTap(id) }
-        )
-        target.x = target.x.coerceIn(0f, (metrics.widthPx - 1).coerceAtLeast(1).toFloat())
-        target.y = target.y.coerceIn(0f, (metrics.heightPx - 1).coerceAtLeast(1).toFloat())
+        target.remapToScreen(metrics.widthPx, metrics.heightPx)
 
-        val lp = createBaseOverlayParams(
-            view.viewSizePx,
-            view.viewSizePx,
-            touchable = !isLocked
-        ).apply {
-            x = (target.x - view.halfSizePx).roundToInt()
-            y = (target.y - view.halfSizePx).roundToInt()
-            alpha = if (isLocked) 0.80f else 1.0f
+        if (!anchorViews.containsKey(target.id)) {
+            val view = AnchorPointView(
+                context = this,
+                targetId = target.id,
+                isEndHandle = false,
+                onDragMove = { id, isEnd, nx, ny -> handleAnchorDragMove(id, isEnd, nx, ny) },
+                onDragFinish = { id, _ -> handleAnchorDragFinish(id) },
+                onTap = { id, _ -> handleAnchorTap(id) }
+            )
+            val lp = createBaseOverlayParams(
+                view.viewSizePx,
+                view.viewSizePx,
+                touchable = !isLocked
+            ).apply {
+                x = (target.x - view.halfSizePx).roundToInt()
+                y = (target.y - view.halfSizePx).roundToInt()
+                alpha = if (isLocked) lockedAlpha else 1.0f
+            }
+            view.syncWindowPosition(lp.x, lp.y)
+            windowManager.addView(view, lp)
+            anchorViews[target.id] = view
+            anchorLps[target.id] = lp
         }
-        view.syncWindowPosition(lp.x, lp.y)
-        windowManager.addView(view, lp)
-        anchorViews[target.id] = view
-        anchorLps[target.id] = lp
+
+        if (target.actionType == ActionType.SWIPE) {
+            target.ensureDefaultSwipeEndpoint(metrics.widthPx, metrics.heightPx)
+            if (!endAnchorViews.containsKey(target.id)) {
+                val endView = AnchorPointView(
+                    context = this,
+                    targetId = target.id,
+                    isEndHandle = true,
+                    onDragMove = { id, isEnd, nx, ny -> handleAnchorDragMove(id, isEnd, nx, ny) },
+                    onDragFinish = { id, _ -> handleAnchorDragFinish(id) },
+                    onTap = { id, _ -> handleAnchorTap(id) }
+                )
+                val endLp = createBaseOverlayParams(
+                    endView.viewSizePx,
+                    endView.viewSizePx,
+                    touchable = !isLocked
+                ).apply {
+                    x = (target.endX - endView.halfSizePx).roundToInt()
+                    y = (target.endY - endView.halfSizePx).roundToInt()
+                    alpha = if (isLocked) lockedAlpha else 1.0f
+                }
+                endView.syncWindowPosition(endLp.x, endLp.y)
+                windowManager.addView(endView, endLp)
+                endAnchorViews[target.id] = endView
+                endAnchorLps[target.id] = endLp
+            }
+        } else {
+            endAnchorViews.remove(target.id)?.let { v ->
+                try {
+                    windowManager.removeViewImmediate(v)
+                } catch (_: Throwable) {
+                }
+            }
+            endAnchorLps.remove(target.id)
+        }
     }
 
     private fun removeAllAnchorWindows() {
@@ -423,11 +971,20 @@ class OverlayService : Service(), ControlBarView.Listener {
         }
         anchorViews.clear()
         anchorLps.clear()
+
+        for (v in endAnchorViews.values) {
+            try {
+                windowManager.removeViewImmediate(v)
+            } catch (_: Throwable) {
+            }
+        }
+        endAnchorViews.clear()
+        endAnchorLps.clear()
     }
 
-    private fun handleAnchorDragMove(targetId: Int, newLpX: Int, newLpY: Int) {
-        val view = anchorViews[targetId] ?: return
-        val lp = anchorLps[targetId] ?: return
+    private fun handleAnchorDragMove(targetId: Int, isEnd: Boolean, newLpX: Int, newLpY: Int) {
+        val view = (if (isEnd) endAnchorViews[targetId] else anchorViews[targetId]) ?: return
+        val lp = (if (isEnd) endAnchorLps[targetId] else anchorLps[targetId]) ?: return
         val metrics = ShizukuController.getDisplayScreenMetrics(this)
         val minX = -view.halfSizePx
         val maxX = metrics.widthPx - 1 - view.halfSizePx
@@ -438,10 +995,16 @@ class OverlayService : Service(), ControlBarView.Listener {
         lp.y = newLpY.coerceIn(minY, maxY.coerceAtLeast(minY))
         windowManager.updateViewLayout(view, lp)
 
+        val cx = (lp.x + view.halfSizePx).toFloat()
+        val cy = (lp.y + view.halfSizePx).toFloat()
         targets.firstOrNull { it.id == targetId }?.let { t ->
-            t.x = (lp.x + view.halfSizePx).toFloat()
-            t.y = (lp.y + view.halfSizePx).toFloat()
+            if (isEnd) {
+                t.setEndPixel(cx, cy, metrics.widthPx, metrics.heightPx)
+            } else {
+                t.setStartPixel(cx, cy, metrics.widthPx, metrics.heightPx)
+            }
         }
+        swipeConnectorView?.updateSwipes(targets, isClicking, isLocked)
     }
 
     private fun handleAnchorDragFinish(targetId: Int) {
@@ -466,11 +1029,22 @@ class OverlayService : Service(), ControlBarView.Listener {
                 index = t.index,
                 enabled = t.enabled,
                 jitter = t.microJitter,
+                action = t.actionType,
+                isLocked = isLocked,
+                isRunning = isClicking,
+                isSelected = (t.id == selectedTargetId)
+            )
+            endAnchorViews[t.id]?.setVisualState(
+                index = t.index,
+                enabled = t.enabled,
+                jitter = t.microJitter,
+                action = t.actionType,
                 isLocked = isLocked,
                 isRunning = isClicking,
                 isSelected = (t.id == selectedTargetId)
             )
         }
+        syncSwipeConnectorLayer()
     }
 
     private fun refreshControlBarState() {
@@ -485,9 +1059,35 @@ class OverlayService : Service(), ControlBarView.Listener {
         )
     }
 
+    private fun refreshLockedAlphasIfNeeded() {
+        val targetAlpha = if (isLocked) lockedAlpha else 1.0f
+        for ((id, view) in anchorViews) {
+            val lp = anchorLps[id] ?: continue
+            if (lp.alpha != targetAlpha) {
+                lp.alpha = targetAlpha
+                windowManager.updateViewLayout(view, lp)
+            }
+        }
+        for ((id, view) in endAnchorViews) {
+            val lp = endAnchorLps[id] ?: continue
+            if (lp.alpha != targetAlpha) {
+                lp.alpha = targetAlpha
+                windowManager.updateViewLayout(view, lp)
+            }
+        }
+        swipeConnectorView?.let { v ->
+            swipeConnectorLp?.let { lp ->
+                val lineAlpha = if (isLocked) (lockedAlpha * 0.9f) else 0.95f
+                if (lp.alpha != lineAlpha) {
+                    lp.alpha = lineAlpha
+                    windowManager.updateViewLayout(v, lp)
+                }
+            }
+        }
+    }
+
     /**
-     * Switches anchor windows between Edit (touchable) and Locked (FLAG_NOT_TOUCHABLE).
-     * Only calls updateViewLayout when lock state actually changes.
+     * Toggles FLAG_NOT_TOUCHABLE + Android 12+ safe window alpha on all anchors.
      */
     private fun applyLockMode(locked: Boolean) {
         if (isLocked == locked) return
@@ -495,20 +1095,27 @@ class OverlayService : Service(), ControlBarView.Listener {
         if (locked) {
             dismissTunePanel()
         }
-        for ((id, view) in anchorViews) {
-            val lp = anchorLps[id] ?: continue
-            val updatedFlags = if (locked) {
-                lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-            } else {
-                lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-            }
-            val updatedAlpha = if (locked) 0.80f else 1.0f
-            if (lp.flags != updatedFlags || lp.alpha != updatedAlpha) {
-                lp.flags = updatedFlags
-                lp.alpha = updatedAlpha
-                windowManager.updateViewLayout(view, lp)
+        val targetAlpha = if (locked) lockedAlpha else 1.0f
+
+        fun updateWindowMap(views: Map<Int, AnchorPointView>, lps: Map<Int, WindowManager.LayoutParams>) {
+            for ((id, view) in views) {
+                val lp = lps[id] ?: continue
+                val updatedFlags = if (locked) {
+                    lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                } else {
+                    lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                }
+                if (lp.flags != updatedFlags || lp.alpha != targetAlpha) {
+                    lp.flags = updatedFlags
+                    lp.alpha = targetAlpha
+                    windowManager.updateViewLayout(view, lp)
+                }
             }
         }
+
+        updateWindowMap(anchorViews, anchorLps)
+        updateWindowMap(endAnchorViews, endAnchorLps)
+        refreshLockedAlphasIfNeeded()
         refreshAnchorVisuals()
         refreshControlBarState()
     }
@@ -526,49 +1133,116 @@ class OverlayService : Service(), ControlBarView.Listener {
     }
 
     private fun collapseControlBar() {
-        if (isBarCollapsed) return
-        val bar = controlBarView ?: return
-        val lp = controlBarLp ?: return
+        var bar = controlBarView ?: return
+        var lp = controlBarLp ?: return
+        val metrics = ShizukuController.getDisplayScreenMetrics(this)
         cancelAutoCollapse()
         dismissTunePanel()
 
-        val metrics = ShizukuController.getDisplayScreenMetrics(this)
-        dockRight = (lp.x + bar.getCurrentWidthPx() / 2) >= (metrics.widthPx / 2)
-        isBarCollapsed = true
-        bar.setCollapsed(true, dockRight)
+        if (barMorphAnimator != null) {
+            if (morphTargetProgress <= 0f) return
+            morphTargetProgress = 0f
+            barMorphAnimator?.cancel()
+            barMorphAnimator = null
+            startBarMorphAnimation(0f, metrics.widthPx, metrics.heightPx)
+            return
+        }
+        if (pendingPreDrawListener != null) {
+            if (morphTargetProgress <= 0f) return
+            cancelBarSprings()
+            bar = controlBarView ?: return
+            lp = controlBarLp ?: return
+        }
+        if (isBarCollapsed) return
+        cancelBarSprings()
 
-        lp.width = bar.getCollapsedWidthPx()
-        lp.height = bar.getCollapsedHeightPx()
-        lp.x = if (dockRight) (metrics.widthPx - lp.width).coerceAtLeast(0) else 0
-        lp.y = lp.y.coerceIn(0, (metrics.heightPx - lp.height).coerceAtLeast(0))
-        bar.syncWindowPosition(lp.x, lp.y)
-        windowManager.updateViewLayout(bar, lp)
-        ClickConfigStore.saveControlBarCollapseState(this, true, dockRight)
+        val expandedW = bar.getExpandedWidthPx()
+        val expandedH = bar.getExpandedBarHeightPx()
+        val collapsedH = bar.getCollapsedHeightPx()
+        val hostW = bar.getMorphHostWidthPx().coerceAtMost(metrics.widthPx)
+        dockRight = (lp.x + expandedW / 2) >= (metrics.widthPx / 2)
+
+        morphEdgeMarginPx = bar.getEdgeMarginPx().coerceAtMost(((metrics.widthPx - expandedW) / 2).coerceAtLeast(0))
+        morphExpandedTopY = lp.y.coerceIn(0, (metrics.heightPx - expandedH).coerceAtLeast(0))
+        val targetCollapsedY = (morphExpandedTopY + (expandedH - collapsedH) / 2)
+            .coerceIn(0, (metrics.heightPx - collapsedH).coerceAtLeast(0))
+        morphPillTopOffsetPx = (targetCollapsedY - morphExpandedTopY)
+            .coerceIn(0, (expandedH - collapsedH).coerceAtLeast(0))
+        morphScreenWidthPx = metrics.widthPx
+        morphScreenHeightPx = metrics.heightPx
+
+        currentMorphProgress = 1f
+        morphTargetProgress = 0f
+
+        val morphBar = createSyncedControlBar(bar.isToolsExpanded())
+        morphBar.prepareMorphLayout(dockRight, morphPillTopOffsetPx, initiallyCollapsed = false)
+        val morphLp = createBaseOverlayParams(hostW, expandedH, touchable = true).apply {
+            x = if (dockRight) (metrics.widthPx - hostW).coerceAtLeast(0) else 0
+            y = morphExpandedTopY
+        }
+        swapToNewControlBarWindow(morphBar, morphLp) {
+            if (controlBarView === morphBar && morphTargetProgress <= 0f && barMorphAnimator == null) {
+                startBarMorphAnimation(0f, metrics.widthPx, metrics.heightPx)
+            }
+        }
     }
 
     private fun expandControlBar() {
-        cancelAutoCollapse()
-        val bar = controlBarView ?: return
-        val lp = controlBarLp ?: return
+        var bar = controlBarView ?: return
+        var lp = controlBarLp ?: return
         val metrics = ShizukuController.getDisplayScreenMetrics(this)
-        val edgeMarginPx = (12f * resources.displayMetrics.density).roundToInt()
+        cancelAutoCollapse()
+
+        if (barMorphAnimator != null) {
+            if (morphTargetProgress >= 1f) return
+            morphEdgeMarginPx = bar.getEdgeMarginPx()
+                .coerceAtMost(((metrics.widthPx - bar.getExpandedWidthPx()) / 2).coerceAtLeast(0))
+            isBarCollapsed = false
+            morphTargetProgress = 1f
+            barMorphAnimator?.cancel()
+            barMorphAnimator = null
+            startBarMorphAnimation(1f, metrics.widthPx, metrics.heightPx)
+            return
+        }
+        if (pendingPreDrawListener != null) {
+            if (morphTargetProgress >= 1f) return
+            cancelBarSprings()
+            bar = controlBarView ?: return
+            lp = controlBarLp ?: return
+        }
+        if (!isBarCollapsed) return
+        cancelBarSprings()
+
+        val expandedW = bar.getExpandedWidthPx()
+        val expandedH = bar.getExpandedBarHeightPx()
+        val collapsedH = bar.getCollapsedHeightPx()
+        val hostW = bar.getMorphHostWidthPx().coerceAtMost(metrics.widthPx)
+        val currentCollapsedY = lp.y.coerceIn(0, (metrics.heightPx - collapsedH).coerceAtLeast(0))
+
+        morphExpandedTopY = (currentCollapsedY - (expandedH - collapsedH) / 2)
+            .coerceIn(0, (metrics.heightPx - expandedH).coerceAtLeast(0))
+        morphPillTopOffsetPx = (currentCollapsedY - morphExpandedTopY)
+            .coerceIn(0, (expandedH - collapsedH).coerceAtLeast(0))
+        morphEdgeMarginPx = bar.getEdgeMarginPx()
+            .coerceAtMost(((metrics.widthPx - expandedW) / 2).coerceAtLeast(0))
+        morphScreenWidthPx = metrics.widthPx
+        morphScreenHeightPx = metrics.heightPx
 
         isBarCollapsed = false
-        bar.setCollapsed(false, dockRight)
+        currentMorphProgress = 0f
+        morphTargetProgress = 1f
 
-        lp.width = bar.getCurrentWidthPx()
-        lp.height = bar.getCurrentHeightPx()
-        lp.x = if (dockRight) {
-            (metrics.widthPx - lp.width - edgeMarginPx).coerceAtLeast(0)
-        } else {
-            edgeMarginPx.coerceAtMost((metrics.widthPx - lp.width).coerceAtLeast(0))
+        val morphBar = createSyncedControlBar(bar.isToolsExpanded())
+        morphBar.prepareMorphLayout(dockRight, morphPillTopOffsetPx, initiallyCollapsed = true)
+        val morphLp = createBaseOverlayParams(hostW, expandedH, touchable = true).apply {
+            x = if (dockRight) (metrics.widthPx - hostW).coerceAtLeast(0) else 0
+            y = morphExpandedTopY
         }
-        lp.y = lp.y.coerceIn(0, (metrics.heightPx - lp.height).coerceAtLeast(0))
-        bar.syncWindowPosition(lp.x, lp.y)
-        windowManager.updateViewLayout(bar, lp)
-        ClickConfigStore.saveControlBarCollapseState(this, false, dockRight)
-        ClickConfigStore.saveControlBarPosition(this, lp.x, lp.y)
-        scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+        swapToNewControlBarWindow(morphBar, morphLp) {
+            if (controlBarView === morphBar && morphTargetProgress >= 1f && barMorphAnimator == null) {
+                startBarMorphAnimation(1f, metrics.widthPx, metrics.heightPx)
+            }
+        }
     }
 
     override fun onSwitchPreset() {
@@ -612,6 +1286,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         lp.y = lp.y.coerceIn(0, (metrics.heightPx - lp.height).coerceAtLeast(0))
         bar.syncWindowPosition(lp.x, lp.y)
         windowManager.updateViewLayout(bar, lp)
+        animateBarToolsUnfold(bar)
         scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
     }
 
@@ -625,6 +1300,33 @@ class OverlayService : Service(), ControlBarView.Listener {
 
     override fun onDragStart() {
         cancelAutoCollapse()
+        val metrics = ShizukuController.getDisplayScreenMetrics(this)
+        dragScreenWidthPx = metrics.widthPx
+        dragScreenHeightPx = metrics.heightPx
+        val wasMorphHost = barMorphAnimator != null ||
+            (controlBarLp?.width == controlBarView?.getMorphHostWidthPx())
+        cancelBarSprings()
+        if (wasMorphHost) {
+            isBarCollapsed = false
+            currentMorphProgress = 1f
+            val bar = controlBarView
+            val lp = controlBarLp
+            if (bar != null && lp != null) {
+                bar.setCollapsed(false, dockRight)
+                val expandedW = bar.getExpandedWidthPx()
+                val expandedH = bar.getExpandedBarHeightPx()
+                lp.width = expandedW
+                lp.height = expandedH
+                if (!dockRight) {
+                    lp.x = (lp.x + bar.getEdgeMarginPx()).coerceAtMost((metrics.widthPx - expandedW).coerceAtLeast(0))
+                }
+                bar.syncWindowPosition(lp.x, lp.y)
+                try {
+                    windowManager.updateViewLayout(bar, lp)
+                } catch (_: Throwable) {
+                }
+            }
+        }
     }
 
     override fun onTogglePlayStop() {
@@ -633,7 +1335,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             return
         }
         if (targets.none { it.enabled }) {
-            Toast.makeText(this, "请至少启用一个点击锚点", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "请至少启用一个手势锚点", Toast.LENGTH_SHORT).show()
             scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
             return
         }
@@ -644,10 +1346,10 @@ class OverlayService : Service(), ControlBarView.Listener {
             return
         }
 
-        // If already locked, zero updateViewLayout calls occur on Start!
-        if (!isLocked) {
+        // Fixed Bug 1: Respect settings.autoLockOnStart cleanly
+        val settings = ClickConfigStore.loadSettings(this)
+        if (!isLocked && settings.autoLockOnStart) {
             applyLockMode(true)
-            // Wait one animation frame after applying FLAG_NOT_TOUCHABLE before injecting first tap
             controlBarView?.postOnAnimation {
                 startClickingInternal()
             } ?: startClickingInternal()
@@ -659,17 +1361,25 @@ class OverlayService : Service(), ControlBarView.Listener {
     private fun startClickingInternal() {
         cancelAutoCollapse()
         val snapshot = targets.map { it.copy() }
+        val modeSnapshot = activeExecutionMode
+        val loopSnapshot = activePresetLoopCount
+        val durationSnapshot = activePresetDurationSec
         isClicking = true
-        OverlayStateHub.setClickingRunning(true)
+        OverlayStateHub.setClickingRunning(this, true)
         refreshAnchorVisuals()
         refreshControlBarState()
 
         serviceScope.launch(Dispatchers.IO) {
-            val mode = ShizukuController.startClicking(snapshot)
+            val mode = ShizukuController.startClicking(
+                targets = snapshot,
+                executionMode = modeSnapshot,
+                presetLoopCount = loopSnapshot,
+                presetDurationSec = durationSnapshot
+            )
             withContext(Dispatchers.Main) {
                 if (mode < 0) {
                     isClicking = false
-                    OverlayStateHub.setClickingRunning(false)
+                    OverlayStateHub.setClickingRunning(this@OverlayService, false)
                     refreshAnchorVisuals()
                     refreshControlBarState()
                     Toast.makeText(
@@ -691,8 +1401,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         if (!isClicking) return
         cancelAutoCollapse()
         isClicking = false
-        OverlayStateHub.setClickingRunning(false)
-        // Zero WMS updateViewLayout on Stop: only local invalidate()
+        OverlayStateHub.setClickingRunning(this, false)
         refreshAnchorVisuals()
         refreshControlBarState()
         serviceScope.launch(Dispatchers.IO) {
@@ -714,16 +1423,20 @@ class OverlayService : Service(), ControlBarView.Listener {
         val settings = ClickConfigStore.loadSettings(this)
         val offsetIndex = targets.size % 6
         val offsetPx = (offsetIndex - 2) * 34f * resources.displayMetrics.density
+        val sx = (metrics.widthPx * 0.5f + offsetPx).coerceIn(40f, (metrics.widthPx - 40).coerceAtLeast(40).toFloat())
+        val sy = (metrics.heightPx * 0.5f + offsetPx * 0.6f).coerceIn(40f, (metrics.heightPx - 40).coerceAtLeast(40).toFloat())
         val newTarget = ClickTarget(
             id = nextTargetId++,
             index = targets.size + 1,
-            x = (metrics.widthPx * 0.5f + offsetPx).coerceIn(40f, (metrics.widthPx - 40).coerceAtLeast(40).toFloat()),
-            y = (metrics.heightPx * 0.5f + offsetPx * 0.6f).coerceIn(40f, (metrics.heightPx - 40).coerceAtLeast(40).toFloat()),
+            x = sx,
+            y = sy,
             intervalMs = settings.defaultIntervalMs,
             pressDurationMs = settings.defaultPressDurationMs,
             microJitter = settings.defaultMicroJitter,
-            enabled = true
+            enabled = true,
+            actionType = ActionType.TAP
         )
+        newTarget.setStartPixel(sx, sy, metrics.widthPx, metrics.heightPx)
         targets += newTarget
         selectedTargetId = newTarget.id
         attachSingleAnchor(newTarget)
@@ -754,6 +1467,13 @@ class OverlayService : Service(), ControlBarView.Listener {
             }
         }
         anchorLps.remove(removeId)
+        endAnchorViews.remove(removeId)?.let { view ->
+            try {
+                windowManager.removeViewImmediate(view)
+            } catch (_: Throwable) {
+            }
+        }
+        endAnchorLps.remove(removeId)
         selectedTargetId = targets.lastOrNull()?.id ?: -1
         persistCurrentTargets()
         refreshAnchorVisuals()
@@ -797,12 +1517,19 @@ class OverlayService : Service(), ControlBarView.Listener {
     override fun onDragMove(newLpX: Int, newLpY: Int) {
         val bar = controlBarView ?: return
         val lp = controlBarLp ?: return
-        val metrics = ShizukuController.getDisplayScreenMetrics(this)
+        val screenW = if (dragScreenWidthPx > 0) dragScreenWidthPx else {
+            ShizukuController.getDisplayScreenMetrics(this).also {
+                dragScreenWidthPx = it.widthPx
+                dragScreenHeightPx = it.heightPx
+            }.widthPx
+        }
+        val screenH = dragScreenHeightPx.coerceAtLeast(1)
         val w = bar.getCurrentWidthPx()
         val h = bar.getCurrentHeightPx()
-        lp.x = newLpX.coerceIn(0, (metrics.widthPx - w).coerceAtLeast(0))
-        lp.y = newLpY.coerceIn(0, (metrics.heightPx - h).coerceAtLeast(0))
-        dockRight = (lp.x + w / 2) >= (metrics.widthPx / 2)
+        lp.x = newLpX.coerceIn(0, (screenW - w).coerceAtLeast(0))
+        lp.y = newLpY.coerceIn(0, (screenH - h).coerceAtLeast(0))
+        bar.syncWindowPosition(lp.x, lp.y)
+        dockRight = (lp.x + w / 2) >= (screenW / 2)
         bar.setDockRight(dockRight)
         windowManager.updateViewLayout(bar, lp)
     }
@@ -810,52 +1537,71 @@ class OverlayService : Service(), ControlBarView.Listener {
     override fun onDragEnd() {
         val bar = controlBarView ?: return
         val lp = controlBarLp ?: return
-        val metrics = ShizukuController.getDisplayScreenMetrics(this)
+        val screenW = if (dragScreenWidthPx > 0) dragScreenWidthPx else {
+            ShizukuController.getDisplayScreenMetrics(this).widthPx
+        }
+        dragScreenWidthPx = 0
+        dragScreenHeightPx = 0
         val w = bar.getCurrentWidthPx()
-        dockRight = (lp.x + w / 2) >= (metrics.widthPx / 2)
+        val edgeMarginPx = bar.getEdgeMarginPx()
+        dockRight = (lp.x + w / 2) >= (screenW / 2)
         bar.setDockRight(dockRight)
-        if (isBarCollapsed) {
-            lp.x = if (dockRight) (metrics.widthPx - w).coerceAtLeast(0) else 0
-            bar.syncWindowPosition(lp.x, lp.y)
-            windowManager.updateViewLayout(bar, lp)
-            ClickConfigStore.saveControlBarCollapseState(this, true, dockRight)
+
+        val targetX = if (isBarCollapsed) {
+            if (dockRight) (screenW - w).coerceAtLeast(0) else 0
         } else {
-            ClickConfigStore.saveControlBarPosition(this, lp.x, lp.y)
-            ClickConfigStore.saveControlBarCollapseState(this, false, dockRight)
-            scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+            if (dockRight) {
+                (screenW - w - edgeMarginPx).coerceAtLeast(0)
+            } else {
+                edgeMarginPx.coerceAtMost((screenW - w).coerceAtLeast(0))
+            }
+        }
+
+        animateControlBarPosX(targetX) {
+            if (isBarCollapsed) {
+                ClickConfigStore.saveControlBarCollapseState(this, true, dockRight)
+            } else {
+                ClickConfigStore.saveControlBarPosition(this, lp.x, lp.y)
+                ClickConfigStore.saveControlBarCollapseState(this, false, dockRight)
+                scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+            }
         }
     }
 
+    /**
+     * Bug 3 Fix: Remaps normalized coords cleanly on rotation without truncating/saving clamped portrait pixels.
+     */
     private fun onScreenGeometryChanged() {
+        dragScreenWidthPx = 0
+        dragScreenHeightPx = 0
         val metrics = ShizukuController.getDisplayScreenMetrics(this)
-        // Clamp control bar
         val bar = controlBarView
         val barLp = controlBarLp
         if (bar != null && barLp != null) {
+            cancelBarSprings()
+            currentMorphProgress = if (isBarCollapsed) 0f else 1f
+            bar.setCollapsed(isBarCollapsed, dockRight)
             val w = bar.getCurrentWidthPx()
             val h = bar.getCurrentHeightPx()
             barLp.width = w
             barLp.height = h
+            val edgeMarginPx = bar.getEdgeMarginPx()
             barLp.x = if (isBarCollapsed) {
                 if (dockRight) (metrics.widthPx - w).coerceAtLeast(0) else 0
             } else {
-                barLp.x.coerceIn(0, (metrics.widthPx - w).coerceAtLeast(0))
+                if (dockRight) {
+                    (metrics.widthPx - w - edgeMarginPx).coerceAtLeast(0)
+                } else {
+                    barLp.x.coerceIn(0, (metrics.widthPx - w).coerceAtLeast(0))
+                }
             }
             barLp.y = barLp.y.coerceIn(0, (metrics.heightPx - h).coerceAtLeast(0))
             bar.syncWindowPosition(barLp.x, barLp.y)
             windowManager.updateViewLayout(bar, barLp)
         }
 
-        // Clamp anchors inside new display bounds
-        var anyChanged = false
         for (t in targets) {
-            val clampedX = t.x.coerceIn(0f, (metrics.widthPx - 1).coerceAtLeast(1).toFloat())
-            val clampedY = t.y.coerceIn(0f, (metrics.heightPx - 1).coerceAtLeast(1).toFloat())
-            if (clampedX != t.x || clampedY != t.y) {
-                t.x = clampedX
-                t.y = clampedY
-                anyChanged = true
-            }
+            t.remapToScreen(metrics.widthPx, metrics.heightPx)
             val view = anchorViews[t.id]
             val lp = anchorLps[t.id]
             if (view != null && lp != null) {
@@ -864,23 +1610,42 @@ class OverlayService : Service(), ControlBarView.Listener {
                 view.syncWindowPosition(lp.x, lp.y)
                 windowManager.updateViewLayout(view, lp)
             }
+            val endView = endAnchorViews[t.id]
+            val endLp = endAnchorLps[t.id]
+            if (endView != null && endLp != null) {
+                endLp.x = (t.endX - endView.halfSizePx).roundToInt()
+                endLp.y = (t.endY - endView.halfSizePx).roundToInt()
+                endView.syncWindowPosition(endLp.x, endLp.y)
+                windowManager.updateViewLayout(endView, endLp)
+            }
         }
-        if (anyChanged) {
-            ClickConfigStore.saveTargets(this, targets)
-        }
+        swipeConnectorView?.updateSwipes(targets, isClicking, isLocked)
 
         serviceScope.launch(Dispatchers.IO) {
             ShizukuController.updateDisplayMetrics()
             if (isClicking) {
-                ShizukuController.updateTargets(targets.map { it.copy() })
+                ShizukuController.updateTargets(
+                    targets = targets.map { it.copy() },
+                    executionMode = activeExecutionMode,
+                    presetLoopCount = activePresetLoopCount,
+                    presetDurationSec = activePresetDurationSec
+                )
             }
         }
     }
 
     private fun pushTargetsToServiceAsync() {
         val snapshot = targets.map { it.copy() }
+        val modeSnapshot = activeExecutionMode
+        val loopSnapshot = activePresetLoopCount
+        val durationSnapshot = activePresetDurationSec
         serviceScope.launch(Dispatchers.IO) {
-            ShizukuController.updateTargets(snapshot)
+            ShizukuController.updateTargets(
+                targets = snapshot,
+                executionMode = modeSnapshot,
+                presetLoopCount = loopSnapshot,
+                presetDurationSec = durationSnapshot
+            )
         }
     }
 
@@ -905,9 +1670,10 @@ class OverlayService : Service(), ControlBarView.Listener {
         dismissTunePanel()
 
         val colors = themeColors
+        val settings = ClickConfigStore.loadSettings(this)
         val d = resources.displayMetrics.density
         val pad = (14f * d).roundToInt()
-        val panelWidth = (256f * d).roundToInt()
+        val panelWidth = (268f * d).roundToInt()
         val themedCtx = colors.themedContext
 
         val root = LinearLayout(themedCtx).apply {
@@ -926,7 +1692,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             gravity = Gravity.CENTER_VERTICAL
         }
         val titleTv = TextView(themedCtx).apply {
-            text = "锚点 #${target.index}  (${target.x.roundToInt()}, ${target.y.roundToInt()})"
+            text = "手势 #${target.index}  (${target.x.roundToInt()}, ${target.y.roundToInt()})"
             setTextColor(colors.onSurface)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
             paint.isFakeBoldText = true
@@ -954,85 +1720,202 @@ class OverlayService : Service(), ControlBarView.Listener {
         titleRow.addView(closeTv)
         root.addView(titleRow)
 
-        // Interval section
-        val intervalValueTv = TextView(themedCtx).apply {
-            text = "点击间隔: ${target.intervalMs} ms"
+        // Gesture Action Type selector (连点 / 滑动 / 长按)
+        val gestureLabel = TextView(themedCtx).apply {
+            text = "手势类型"
             setTextColor(colors.onSurfaceVariant)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setPadding(0, (10f * d).roundToInt(), 0, (4f * d).roundToInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, (8f * d).roundToInt(), 0, (4f * d).roundToInt())
         }
-        root.addView(intervalValueTv)
+        root.addView(gestureLabel)
 
-        val intervalPresetChips = mutableListOf<Pair<Long, TextView>>()
-        fun refreshIntervalPresetHighlight() {
-            intervalPresetChips.forEach { (preset, chip) ->
-                styleChipButton(chip, selected = (target.intervalMs == preset), colors = colors)
+        val gestureRow = LinearLayout(themedCtx).apply { orientation = LinearLayout.HORIZONTAL }
+        ActionType.entries.forEach { act ->
+            gestureRow.addView(createChipButton(themedCtx, act.label, target.actionType == act, colors) {
+                if (target.actionType != act) {
+                    target.actionType = act
+                    if (act == ActionType.TAP) {
+                        target.intervalMs = settings.defaultIntervalMs
+                        target.pressDurationMs = settings.defaultPressDurationMs
+                    }
+                    attachSingleAnchor(target)
+                    persistCurrentTargets()
+                    refreshAnchorVisuals()
+                    bringControlBarToFrontIfNeeded()
+                    if (isClicking) pushTargetsToServiceAsync()
+                    showOrUpdateTunePanel(forceShow = true)
+                }
+            })
+        }
+        root.addView(gestureRow)
+
+        // Preset Execution Mode row (并发 / 顺序连招)
+        val execRow = LinearLayout(themedCtx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, (6f * d).roundToInt(), 0, 0)
+        }
+        ExecutionMode.entries.forEach { mode ->
+            execRow.addView(createChipButton(themedCtx, mode.label, activeExecutionMode == mode, colors) {
+                if (activeExecutionMode != mode) {
+                    activeExecutionMode = mode
+                    ClickConfigStore.setPresetExecutionMode(this, activePresetId, mode)
+                    OverlayStateHub.bumpConfigVersion()
+                    if (isClicking) pushTargetsToServiceAsync()
+                    showOrUpdateTunePanel(forceShow = true)
+                }
+            })
+        }
+        root.addView(execRow)
+
+        if (target.actionType == ActionType.TAP) {
+            val globalTapInfoTv = TextView(themedCtx).apply {
+                text = "连点节拍: 间隔 ${settings.defaultIntervalMs}ms · 按压 ${settings.defaultPressDurationMs}ms\n（在主界面「调校 → 连点设置」统一调整）"
+                setTextColor(colors.onSurfaceVariant)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(0, (10f * d).roundToInt(), 0, (2f * d).roundToInt())
+            }
+            root.addView(globalTapInfoTv)
+        } else {
+            // Interval section (SWIPE / HOLD only; TAP follows global 连点设置)
+            val intervalValueTv = TextView(themedCtx).apply {
+                text = "循环间隔: ${target.intervalMs} ms"
+                setTextColor(colors.onSurfaceVariant)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                setPadding(0, (9f * d).roundToInt(), 0, (4f * d).roundToInt())
+            }
+            root.addView(intervalValueTv)
+
+            val intervalPresetChips = mutableListOf<Pair<Long, TextView>>()
+            fun refreshIntervalPresetHighlight() {
+                intervalPresetChips.forEach { (preset, chip) ->
+                    styleChipButton(chip, selected = (target.intervalMs == preset), colors = colors)
+                }
+            }
+
+            val intervalBtnRow = LinearLayout(themedCtx).apply { orientation = LinearLayout.HORIZONTAL }
+            listOf(-50L to "-50", -10L to "-10", 10L to "+10", 50L to "+50").forEach { (delta, label) ->
+                intervalBtnRow.addView(createChipButton(themedCtx, label, false, colors) {
+                    target.intervalMs = (target.intervalMs + delta)
+                        .coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS)
+                    intervalValueTv.text = "循环间隔: ${target.intervalMs} ms"
+                    refreshIntervalPresetHighlight()
+                    persistCurrentTargets()
+                    if (isClicking) pushTargetsToServiceAsync()
+                })
+            }
+            root.addView(intervalBtnRow)
+
+            val intervalPresetRow = LinearLayout(themedCtx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, (5f * d).roundToInt(), 0, 0)
+            }
+            listOf(10L, 30L, 80L, 200L).forEach { preset ->
+                val chip = createChipButton(themedCtx, "${preset}ms", target.intervalMs == preset, colors) {
+                    target.intervalMs = preset
+                    intervalValueTv.text = "循环间隔: ${target.intervalMs} ms"
+                    refreshIntervalPresetHighlight()
+                    persistCurrentTargets()
+                    if (isClicking) pushTargetsToServiceAsync()
+                }
+                intervalPresetChips += preset to chip
+                intervalPresetRow.addView(chip)
+            }
+            root.addView(intervalPresetRow)
+
+            // Press or Swipe duration section
+            if (target.actionType == ActionType.SWIPE) {
+                val swipeValueTv = TextView(themedCtx).apply {
+                    text = "滑动耗时: ${target.swipeDurationMs} ms"
+                    setTextColor(colors.onSurfaceVariant)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                    setPadding(0, (9f * d).roundToInt(), 0, (4f * d).roundToInt())
+                }
+                root.addView(swipeValueTv)
+                val swipeChips = mutableListOf<Pair<Long, TextView>>()
+                val swipeRow = LinearLayout(themedCtx).apply { orientation = LinearLayout.HORIZONTAL }
+                listOf(150L, 320L, 600L, 1000L).forEach { preset ->
+                    val chip = createChipButton(themedCtx, "${preset}ms", target.swipeDurationMs == preset, colors) {
+                        target.swipeDurationMs = preset
+                        swipeValueTv.text = "滑动耗时: ${target.swipeDurationMs} ms"
+                        swipeChips.forEach { (p, c) -> styleChipButton(c, target.swipeDurationMs == p, colors) }
+                        persistCurrentTargets()
+                        if (isClicking) pushTargetsToServiceAsync()
+                    }
+                    swipeChips += preset to chip
+                    swipeRow.addView(chip)
+                }
+                root.addView(swipeRow)
+            } else {
+                val pressValueTv = TextView(themedCtx).apply {
+                    text = "长按时长(连招模式): ${target.pressDurationMs} ms"
+                    setTextColor(colors.onSurfaceVariant)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                    setPadding(0, (9f * d).roundToInt(), 0, (4f * d).roundToInt())
+                }
+                root.addView(pressValueTv)
+
+                val pressPresetChips = mutableListOf<Pair<Long, TextView>>()
+                val pressPresetRow = LinearLayout(themedCtx).apply { orientation = LinearLayout.HORIZONTAL }
+                listOf(300L, 800L, 1500L, 3000L).forEach { preset ->
+                    val chip = createChipButton(themedCtx, "${preset}ms", target.pressDurationMs == preset, colors) {
+                        target.pressDurationMs = preset
+                        pressValueTv.text = "长按时长(连招模式): ${target.pressDurationMs} ms"
+                        pressPresetChips.forEach { (p, c) -> styleChipButton(c, target.pressDurationMs == p, colors) }
+                        persistCurrentTargets()
+                        if (isClicking) pushTargetsToServiceAsync()
+                    }
+                    pressPresetChips += preset to chip
+                    pressPresetRow.addView(chip)
+                }
+                root.addView(pressPresetRow)
             }
         }
 
-        val intervalBtnRow = LinearLayout(themedCtx).apply {
-            orientation = LinearLayout.HORIZONTAL
+        // Per-node repeatCount section
+        val repeatValueTv = TextView(themedCtx).apply {
+            text = "循环次数(单轮): ${target.repeatCount} 次"
+            setTextColor(colors.onSurfaceVariant)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            setPadding(0, (9f * d).roundToInt(), 0, (4f * d).roundToInt())
         }
-        listOf(-50L to "-50", -10L to "-10", 10L to "+10", 50L to "+50").forEach { (delta, label) ->
-            intervalBtnRow.addView(createChipButton(themedCtx, label, false, colors) {
-                target.intervalMs = (target.intervalMs + delta)
-                    .coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS)
-                intervalValueTv.text = "点击间隔: ${target.intervalMs} ms"
-                refreshIntervalPresetHighlight()
+        root.addView(repeatValueTv)
+
+        val repeatPresetChips = mutableListOf<Pair<Int, TextView>>()
+        fun refreshRepeatPresetHighlight() {
+            repeatPresetChips.forEach { (presetVal, chip) ->
+                styleChipButton(chip, selected = (target.repeatCount == presetVal), colors = colors)
+            }
+        }
+
+        val repeatStepRow = LinearLayout(themedCtx).apply { orientation = LinearLayout.HORIZONTAL }
+        listOf(-5 to "-5", -1 to "-1", 1 to "+1", 5 to "+5").forEach { (delta, label) ->
+            repeatStepRow.addView(createChipButton(themedCtx, label, false, colors) {
+                target.repeatCount = (target.repeatCount + delta)
+                    .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+                repeatValueTv.text = "循环次数(单轮): ${target.repeatCount} 次"
+                refreshRepeatPresetHighlight()
                 persistCurrentTargets()
                 if (isClicking) pushTargetsToServiceAsync()
             })
         }
-        root.addView(intervalBtnRow)
+        root.addView(repeatStepRow)
 
-        val intervalPresetRow = LinearLayout(themedCtx).apply {
+        val repeatPresetRow = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, (5f * d).roundToInt(), 0, 0)
         }
-        listOf(10L, 30L, 80L, 200L).forEach { preset ->
-            val chip = createChipButton(themedCtx, "${preset}ms", target.intervalMs == preset, colors) {
-                target.intervalMs = preset
-                intervalValueTv.text = "点击间隔: ${target.intervalMs} ms"
-                refreshIntervalPresetHighlight()
+        listOf(1, 3, 5, 10).forEach { presetVal ->
+            val chip = createChipButton(themedCtx, "${presetVal}次", target.repeatCount == presetVal, colors) {
+                target.repeatCount = presetVal
+                repeatValueTv.text = "循环次数(单轮): ${target.repeatCount} 次"
+                refreshRepeatPresetHighlight()
                 persistCurrentTargets()
                 if (isClicking) pushTargetsToServiceAsync()
             }
-            intervalPresetChips += preset to chip
-            intervalPresetRow.addView(chip)
+            repeatPresetChips += presetVal to chip
+            repeatPresetRow.addView(chip)
         }
-        root.addView(intervalPresetRow)
-
-        // Press duration section
-        val pressValueTv = TextView(themedCtx).apply {
-            text = "按压时长: ${target.pressDurationMs} ms"
-            setTextColor(colors.onSurfaceVariant)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setPadding(0, (10f * d).roundToInt(), 0, (4f * d).roundToInt())
-        }
-        root.addView(pressValueTv)
-
-        val pressPresetChips = mutableListOf<Pair<Long, TextView>>()
-        fun refreshPressPresetHighlight() {
-            pressPresetChips.forEach { (preset, chip) ->
-                styleChipButton(chip, selected = (target.pressDurationMs == preset), colors = colors)
-            }
-        }
-
-        val pressPresetRow = LinearLayout(themedCtx).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-        listOf(15L, 25L, 50L, 120L).forEach { preset ->
-            val chip = createChipButton(themedCtx, "${preset}ms", target.pressDurationMs == preset, colors) {
-                target.pressDurationMs = preset
-                pressValueTv.text = "按压时长: ${target.pressDurationMs} ms"
-                refreshPressPresetHighlight()
-                persistCurrentTargets()
-                if (isClicking) pushTargetsToServiceAsync()
-            }
-            pressPresetChips += preset to chip
-            pressPresetRow.addView(chip)
-        }
-        root.addView(pressPresetRow)
+        root.addView(repeatPresetRow)
 
         val thumbTint = ColorStateList(
             arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
@@ -1043,9 +1926,8 @@ class OverlayService : Service(), ControlBarView.Listener {
             intArrayOf(colors.primary, colors.surfaceContainerHighest)
         )
 
-        // Micro jitter switch
         val jitterSwitch = SwitchMaterial(themedCtx).apply {
-            text = "随机微抖动 (±4px)"
+            text = "拟人高斯抖动 (±${settings.jitterRadiusPx.roundToInt()}px)"
             setTextColor(colors.onSurface)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             setPadding(0, (6f * d).roundToInt(), 0, 0)
@@ -1091,7 +1973,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             ((metrics.widthPx - panelWidth) / 2).coerceAtLeast(8)
         }.coerceIn(0, (metrics.widthPx - panelWidth - 8).coerceAtLeast(0))
         val preferredY = (barLp?.y ?: (metrics.heightPx * 0.2f).roundToInt())
-            .coerceIn(16, (metrics.heightPx - (260f * d).roundToInt()).coerceAtLeast(16))
+            .coerceIn(16, (metrics.heightPx - (320f * d).roundToInt()).coerceAtLeast(16))
 
         val lp = createBaseOverlayParams(
             panelWidth,
@@ -1154,6 +2036,12 @@ class OverlayService : Service(), ControlBarView.Listener {
         const val ACTION_STOP_OVERLAY = "com.zerointerrupt.clicker.ACTION_STOP_OVERLAY"
         const val ACTION_STOP_CLICKING = "com.zerointerrupt.clicker.ACTION_STOP_CLICKING"
         const val ACTION_REFRESH_SETTINGS = "com.zerointerrupt.clicker.ACTION_REFRESH_SETTINGS"
+        const val ACTION_RPC_START = "com.zerointerrupt.clicker.ACTION_RPC_START"
+        const val ACTION_RPC_STOP = "com.zerointerrupt.clicker.ACTION_RPC_STOP"
+        const val ACTION_RPC_SWITCH_PRESET = "com.zerointerrupt.clicker.ACTION_RPC_SWITCH_PRESET"
+
+        const val EXTRA_PRESET_ID = "preset_id"
+        const val EXTRA_PRESET_NAME = "preset_name"
 
         private const val CHANNEL_ID = "zero_interrupt_overlay_channel"
         private const val NOTIFICATION_ID = 2001

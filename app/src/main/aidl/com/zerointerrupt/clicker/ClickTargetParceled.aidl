@@ -8,4 +8,9 @@ parcelable ClickTargetParceled {
     long pressDurationMs;
     boolean microJitter;
     boolean enabled;
+    int actionType;
+    float endX;
+    float endY;
+    long swipeDurationMs;
+    int repeatCount;
 }
