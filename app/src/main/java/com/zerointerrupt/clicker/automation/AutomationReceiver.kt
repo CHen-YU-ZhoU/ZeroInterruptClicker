@@ -73,16 +73,10 @@ class AutomationReceiver : BroadcastReceiver() {
                         }
                     )
                 } else {
-                    val metrics = ShizukuController.getDisplayScreenMetrics(ctx)
                     val preset = ClickConfigStore.getActivePreset(ctx)
-                    val targets = preset.targets.map { t ->
-                        t.copy().also { it.remapToScreen(metrics.widthPx, metrics.heightPx) }
-                    }
                     ShizukuController.startClicking(
-                        targets = targets,
-                        executionMode = preset.executionMode,
-                        presetLoopCount = preset.presetLoopCount,
-                        presetDurationSec = preset.presetDurationSec
+                        targets = preset.targets,
+                        executionMode = preset.executionMode
                     )
                 }
             }

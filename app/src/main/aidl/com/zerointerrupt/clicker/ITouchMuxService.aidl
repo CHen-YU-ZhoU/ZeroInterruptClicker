@@ -17,9 +17,7 @@ interface ITouchMuxService {
         boolean allowFallback,
         int executionMode,
         float jitterRadiusPx,
-        int preferredBackend,
-        int presetLoopCount,
-        int presetDurationSec
+        int preferredBackend
     );
     void updateTargets(
         in List<ClickTargetParceled> targets,
@@ -27,9 +25,7 @@ interface ITouchMuxService {
         int displayHeight,
         int rotation,
         int executionMode,
-        float jitterRadiusPx,
-        int presetLoopCount,
-        int presetDurationSec
+        float jitterRadiusPx
     );
     void updateDisplayMetrics(int displayWidth, int displayHeight, int rotation);
     void stopClicking();
@@ -44,5 +40,10 @@ interface ITouchMuxService {
     void injectRpcTap(float x, float y, long durationMs);
     void injectRpcSwipe(float x1, float y1, float x2, float y2, long durationMs);
     void setRpcHold(int holdId, boolean down, float x, float y);
+    boolean startTouchRecording(int displayWidth, int displayHeight, int rotation, int excludeLeft, int excludeTop, int excludeRight, int excludeBottom);
+    void updateRecordingExcludeRect(int excludeLeft, int excludeTop, int excludeRight, int excludeBottom);
+    long[] getTouchRecordingStats();
+    String stopTouchRecording();
+    void cancelTouchRecording();
     void destroy();
 }

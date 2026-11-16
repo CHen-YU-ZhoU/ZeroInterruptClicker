@@ -83,9 +83,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
     private var fallbackDisplayH: Int = 2400
     private var fallbackExecutionMode: Int = 0
     private var fallbackJitterRadiusPx: Float = 4.0f
-    private var fallbackPresetLoopCount: Int = 0
-    private var fallbackPresetDurationSec: Int = 0
-    private var fallbackRunToken: Long = 0L
+    private var fallbackConfigVersion: Long = 0L
     private var fallbackThread: Thread? = null
     private val fallbackRunning = AtomicBoolean(false)
     private val javaRng = JavaRandom()
@@ -126,14 +124,18 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         endYs: FloatArray,
         swipeDurationsMs: LongArray,
         repeatCounts: IntArray,
+        stageIndices: IntArray,
+        stageDurationsMs: LongArray,
+        stageGapsMs: LongArray,
+        stageRepeatCounts: IntArray,
+        holdInIds: IntArray,
+        holdOutIds: IntArray,
         running: Boolean,
         displayW: Int,
         displayH: Int,
         rotation: Int,
         jitterRadiusPx: Float,
-        executionMode: Int,
-        presetLoopCount: Int,
-        presetDurationSec: Int
+        executionMode: Int
     )
     private external fun nativeUpdateDisplayMetrics(displayW: Int, displayH: Int, rotation: Int)
     private external fun nativeStopClicking()
@@ -148,6 +150,24 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
     private external fun nativeInjectRpcTap(x: Float, y: Float, durationMs: Long)
     private external fun nativeInjectRpcSwipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long)
     private external fun nativeSetRpcHold(holdId: Int, down: Boolean, x: Float, y: Float)
+    private external fun nativeStartRecording(
+        displayW: Int,
+        displayH: Int,
+        rotation: Int,
+        excludeLeft: Int,
+        excludeTop: Int,
+        excludeRight: Int,
+        excludeBottom: Int
+    ): Boolean
+    private external fun nativeUpdateRecordingExcludeRect(
+        excludeLeft: Int,
+        excludeTop: Int,
+        excludeRight: Int,
+        excludeBottom: Int
+    )
+    private external fun nativeGetRecordingStats(): LongArray
+    private external fun nativeStopRecording(): String
+    private external fun nativeCancelRecording()
 
     init {
         exemptHiddenApisIfNeeded()
@@ -540,9 +560,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         allowFallback: Boolean,
         executionMode: Int,
         jitterRadiusPx: Float,
-        prefBackend: Int,
-        presetLoopCount: Int,
-        presetDurationSec: Int
+        prefBackend: Int
     ): Int {
         val list = targets ?: emptyList()
         preferredBackend.set(prefBackend.coerceIn(BACKEND_AUTO, BACKEND_FALLBACK))
@@ -554,9 +572,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 displayWidth = displayWidth,
                 displayHeight = displayHeight,
                 executionMode = executionMode,
-                jitterRadiusPx = jitterRadiusPx,
-                presetLoopCount = presetLoopCount,
-                presetDurationSec = presetDurationSec
+                jitterRadiusPx = jitterRadiusPx
             )
         }
 
@@ -571,9 +587,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 displayH = displayHeight,
                 rotation = rotation,
                 jitterRadiusPx = jitterRadiusPx,
-                executionMode = executionMode,
-                presetLoopCount = presetLoopCount,
-                presetDurationSec = presetDurationSec
+                executionMode = executionMode
             )
             currentMode.set(mode)
             clickingActive.set(true)
@@ -591,9 +605,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             displayWidth = displayWidth,
             displayHeight = displayHeight,
             executionMode = executionMode,
-            jitterRadiusPx = jitterRadiusPx,
-            presetLoopCount = presetLoopCount,
-            presetDurationSec = presetDurationSec
+            jitterRadiusPx = jitterRadiusPx
         )
     }
 
@@ -602,9 +614,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         displayWidth: Int,
         displayHeight: Int,
         executionMode: Int,
-        jitterRadiusPx: Float,
-        presetLoopCount: Int,
-        presetDurationSec: Int
+        jitterRadiusPx: Float
     ): Int {
         if (!ensureFallbackInjectorReady()) {
             statusDetail = "Fallback InputManager injector unavailable."
@@ -616,9 +626,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             fallbackDisplayH = displayHeight.coerceAtLeast(1)
             fallbackExecutionMode = executionMode
             fallbackJitterRadiusPx = jitterRadiusPx.coerceIn(0f, 16f)
-            fallbackPresetLoopCount = presetLoopCount.coerceAtLeast(0)
-            fallbackPresetDurationSec = presetDurationSec.coerceIn(0, 86_400)
-            fallbackRunToken++
+            fallbackConfigVersion++
         }
         clickingActive.set(true)
         currentMode.set(MODE_SHIZUKU_FALLBACK)
@@ -633,9 +641,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         displayHeight: Int,
         rotation: Int,
         executionMode: Int,
-        jitterRadiusPx: Float,
-        presetLoopCount: Int,
-        presetDurationSec: Int
+        jitterRadiusPx: Float
     ) {
         val list = targets ?: emptyList()
         val running = clickingActive.get()
@@ -647,9 +653,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 displayH = displayHeight,
                 rotation = rotation,
                 jitterRadiusPx = jitterRadiusPx,
-                executionMode = executionMode,
-                presetLoopCount = presetLoopCount,
-                presetDurationSec = presetDurationSec
+                executionMode = executionMode
             )
         } else {
             synchronized(fallbackLock) {
@@ -658,8 +662,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 fallbackDisplayH = displayHeight.coerceAtLeast(1)
                 fallbackExecutionMode = executionMode
                 fallbackJitterRadiusPx = jitterRadiusPx.coerceIn(0f, 16f)
-                fallbackPresetLoopCount = presetLoopCount.coerceAtLeast(0)
-                fallbackPresetDurationSec = presetDurationSec.coerceIn(0, 86_400)
+                fallbackConfigVersion++
             }
         }
     }
@@ -738,7 +741,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
     }
 
     override fun injectRpcSwipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long) {
-        val dur = durationMs.coerceIn(24L, 15_000L)
+        val dur = durationMs.coerceIn(8L, 15_000L)
         if (isNativeMode(currentMode.get()) && nativeLoaded.get() && nativeGetState() == NATIVE_STATE_RUNNING_GRABBED) {
             nativeInjectRpcSwipe(x1, y1, x2, y2, dur)
             return
@@ -806,7 +809,87 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         }
     }
 
+    override fun startTouchRecording(
+        displayWidth: Int,
+        displayHeight: Int,
+        rotation: Int,
+        excludeLeft: Int,
+        excludeTop: Int,
+        excludeRight: Int,
+        excludeBottom: Int
+    ): Boolean = synchronized(nativeLifecycleLock) {
+        if (!nativeLoaded.get()) return@synchronized false
+        try {
+            cancelWatchdogTask()
+            stopFallbackThread()
+            clickingActive.set(false)
+            selfCheckConfirmed.set(false)
+            currentMode.set(MODE_IDLE)
+            val ok = nativeStartRecording(
+                displayWidth,
+                displayHeight,
+                rotation,
+                excludeLeft,
+                excludeTop,
+                excludeRight,
+                excludeBottom
+            )
+            statusDetail = if (ok) {
+                "Recording Touch..."
+            } else {
+                nativeGetLastError().ifBlank { "Touch recording start failed." }
+            }
+            ok
+        } catch (t: Throwable) {
+            Log.e(TAG, "startTouchRecording failed", t)
+            false
+        }
+    }
+
+    override fun updateRecordingExcludeRect(excludeLeft: Int, excludeTop: Int, excludeRight: Int, excludeBottom: Int) {
+        if (!nativeLoaded.get()) return
+        try {
+            nativeUpdateRecordingExcludeRect(excludeLeft, excludeTop, excludeRight, excludeBottom)
+        } catch (_: Throwable) {
+        }
+    }
+
+    override fun getTouchRecordingStats(): LongArray {
+        if (!nativeLoaded.get()) return longArrayOf(0L, 0L, 0L, 0L)
+        return try {
+            nativeGetRecordingStats()
+        } catch (_: Throwable) {
+            longArrayOf(0L, 0L, 0L, 0L)
+        }
+    }
+
+    override fun stopTouchRecording(): String = synchronized(nativeLifecycleLock) {
+        if (!nativeLoaded.get()) return@synchronized ""
+        return try {
+            val res = nativeStopRecording()
+            statusDetail = "Recording stopped."
+            res
+        } catch (t: Throwable) {
+            Log.e(TAG, "stopTouchRecording failed", t)
+            ""
+        }
+    }
+
+    override fun cancelTouchRecording() = synchronized(nativeLifecycleLock) {
+        if (!nativeLoaded.get()) return@synchronized
+        try {
+            nativeCancelRecording()
+        } catch (_: Throwable) {
+        }
+    }
+
     override fun destroy() {
+        if (nativeLoaded.get()) {
+            try {
+                nativeCancelRecording()
+            } catch (_: Throwable) {
+            }
+        }
         shutdownEngine()
         if (nativeLoaded.get()) {
             try {
@@ -827,9 +910,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         displayH: Int,
         rotation: Int,
         jitterRadiusPx: Float,
-        executionMode: Int,
-        presetLoopCount: Int,
-        presetDurationSec: Int
+        executionMode: Int
     ) {
         val n = list.size
         val ids = IntArray(n)
@@ -844,6 +925,12 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         val endYs = FloatArray(n)
         val swipeDurs = LongArray(n)
         val repeatCounts = IntArray(n)
+        val stageIndices = IntArray(n)
+        val stageDurs = LongArray(n)
+        val stageGaps = LongArray(n)
+        val stageReps = IntArray(n)
+        val holdInIds = IntArray(n)
+        val holdOutIds = IntArray(n)
         for (i in 0 until n) {
             val t = list[i]
             ids[i] = t.id
@@ -857,7 +944,13 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             endXs[i] = t.endX
             endYs[i] = t.endY
             swipeDurs[i] = t.swipeDurationMs
-            repeatCounts[i] = t.repeatCount.coerceIn(1, 9999)
+            repeatCounts[i] = t.repeatCount.coerceIn(0, 9999)
+            stageIndices[i] = t.stageIndex.coerceAtLeast(0)
+            stageDurs[i] = t.stageDurationMs.coerceAtLeast(0L)
+            stageGaps[i] = t.stageGapMs.coerceIn(0L, 60_000L)
+            stageReps[i] = t.stageRepeatCount.coerceIn(0, 9999)
+            holdInIds[i] = t.holdInId.coerceAtLeast(0)
+            holdOutIds[i] = t.holdOutId.coerceAtLeast(0)
         }
         nativeSetTargetsAndRunning(
             ids,
@@ -872,14 +965,18 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             endYs,
             swipeDurs,
             repeatCounts,
+            stageIndices,
+            stageDurs,
+            stageGaps,
+            stageReps,
+            holdInIds,
+            holdOutIds,
             running,
             displayW,
             displayH,
             rotation,
             jitterRadiusPx.coerceIn(0f, 16f),
-            executionMode,
-            presetLoopCount.coerceAtLeast(0),
-            presetDurationSec.coerceIn(0, 86_400)
+            executionMode
         )
     }
 
@@ -900,8 +997,21 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         var finishedRounds: Boolean = false
     )
 
+    private class FallbackStageState(
+        val stageIndex: Int,
+        val durationMs: Long,
+        val gapMs: Long,
+        val repeatCount: Int,
+        val targets: MutableList<FallbackTargetState> = mutableListOf(),
+        var completedRepeats: Int = 0,
+        var startDelayUntilNs: Long = 0L,
+        var stageDeadlineNs: Long = 0L,
+        var inGap: Boolean = false,
+        var gapDeadlineNs: Long = 0L
+    )
+
     private class ActivePointer(
-        val targetId: Int,
+        var targetId: Int,
         val pointerId: Int,
         var x: Float,
         var y: Float
@@ -950,6 +1060,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
 
     private fun runFallbackLoop() {
         val runtimeMap = LinkedHashMap<Int, FallbackTargetState>()
+        val stagesList = ArrayList<FallbackStageState>()
         val activePointers = ArrayList<ActivePointer>(MAX_SLOTS)
         val fbIds = IntArray(MAX_SLOTS)
         val fbXs = FloatArray(MAX_SLOTS)
@@ -957,13 +1068,9 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         val fbPressures = FloatArray(MAX_SLOTS)
         val fbSizes = FloatArray(MAX_SLOTS)
         var downTimeMs = 0L
-        var seqIndex = 0
-        var lastRunToken = -1L
+        var activeStageIdx = 0
+        var lastConfigVersion = -1L
         var lastExecMode = -1
-        var lastLoopCount = -1
-        var lastDurationSec = -1
-        var completedRounds = 0
-        var deadlineNs = 0L
         var completedNaturally = false
 
         fun emitActiveFrame(action: Int, eventTimeMs: Long) {
@@ -1034,79 +1141,94 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 val dispH: Int
                 val execMode: Int
                 val jitterRad: Float
-                val loopCount: Int
-                val durationSec: Int
-                val runToken: Long
+                val configVersion: Long
                 synchronized(fallbackLock) {
                     snapshot = fallbackTargets
                     dispW = fallbackDisplayW
                     dispH = fallbackDisplayH
                     execMode = fallbackExecutionMode
                     jitterRad = fallbackJitterRadiusPx
-                    loopCount = fallbackPresetLoopCount
-                    durationSec = fallbackPresetDurationSec
-                    runToken = fallbackRunToken
+                    configVersion = fallbackConfigVersion
                 }
 
                 val nowNs = System.nanoTime()
-                val timerReset = (lastRunToken != runToken) ||
-                    (lastExecMode != execMode) ||
-                    (lastLoopCount != loopCount) ||
-                    (lastDurationSec != durationSec)
-                if (timerReset) {
-                    lastRunToken = runToken
-                    lastExecMode = execMode
-                    lastLoopCount = loopCount
-                    lastDurationSec = durationSec
-                    completedRounds = 0
-                    seqIndex = 0
-                    deadlineNs = if (durationSec > 0) nowNs + durationSec.toLong() * 1_000_000_000L else 0L
-                    for (st in runtimeMap.values) {
-                        st.completedCycles = 0
-                        if (st.finishedRounds && !st.pressed) {
-                            st.nextDeadlineNs = nowNs
-                        }
-                        st.finishedRounds = false
-                    }
-                }
-
-                if (deadlineNs > 0L && nowNs >= deadlineNs) {
-                    completedNaturally = true
-                    break
-                }
-
-                val enabledIds = HashSet<Int>(snapshot.size)
-
-                for (t in snapshot) {
-                    if (!t.enabled) continue
-                    enabledIds.add(t.id)
-                    val existing = runtimeMap[t.id]
-                    if (existing == null) {
-                        runtimeMap[t.id] = FallbackTargetState(
-                            config = t,
-                            nextDeadlineNs = nowNs + runtimeMap.size * 500_000L
-                        )
-                    } else {
-                        existing.config = t
-                    }
-                }
-
-                val iter = runtimeMap.entries.iterator()
-                while (iter.hasNext()) {
-                    val entry = iter.next()
-                    if (!enabledIds.contains(entry.key)) {
-                        if (entry.value.pressed) {
-                            liftPointer(entry.key)
-                        }
-                        iter.remove()
-                    }
-                }
-
-                val valuesList = runtimeMap.values.toList()
                 val isSeq = execMode == 1
-                if (seqIndex >= valuesList.size) seqIndex = 0
+                val configChanged = (lastConfigVersion != configVersion) || (lastExecMode != execMode)
 
-                var earliestNs = if (deadlineNs > 0L) deadlineNs else Long.MAX_VALUE
+                if (isSeq) {
+                    if (configChanged) {
+                        lastConfigVersion = configVersion
+                        lastExecMode = execMode
+                        runtimeMap.clear()
+                        while (activePointers.isNotEmpty()) {
+                            liftPointer(activePointers.last().targetId)
+                        }
+                        stagesList.clear()
+                        activeStageIdx = 0
+                        for (t in snapshot) {
+                            if (!t.enabled) continue
+                            if (stagesList.isEmpty() || stagesList.last().stageIndex != t.stageIndex) {
+                                stagesList += FallbackStageState(
+                                    stageIndex = t.stageIndex,
+                                    durationMs = t.stageDurationMs.coerceAtLeast(0L),
+                                    gapMs = t.stageGapMs.coerceIn(0L, 60_000L),
+                                    repeatCount = t.stageRepeatCount.coerceIn(0, 9999),
+                                    startDelayUntilNs = nowNs
+                                )
+                            }
+                            stagesList.last().targets += FallbackTargetState(
+                                config = t,
+                                nextDeadlineNs = nowNs
+                            )
+                        }
+                    }
+                } else {
+                    if (lastExecMode == 1) {
+                        stagesList.clear()
+                        activeStageIdx = 0
+                        while (activePointers.isNotEmpty()) {
+                            liftPointer(activePointers.last().targetId)
+                        }
+                    }
+                    lastConfigVersion = configVersion
+                    lastExecMode = execMode
+
+                    val enabledIds = HashSet<Int>(snapshot.size)
+                    for (t in snapshot) {
+                        if (!t.enabled) continue
+                        enabledIds.add(t.id)
+                        val existing = runtimeMap[t.id]
+                        if (existing == null) {
+                            runtimeMap[t.id] = FallbackTargetState(
+                                config = t,
+                                nextDeadlineNs = nowNs + runtimeMap.size * 500_000L
+                            )
+                        } else {
+                            existing.config = t
+                            if (t.repeatCount == 0 && existing.finishedRounds) {
+                                existing.finishedRounds = false
+                                existing.completedCycles = 0
+                                if (!existing.pressed) existing.nextDeadlineNs = nowNs
+                            } else if (t.repeatCount > 0 && existing.completedCycles < t.repeatCount && existing.finishedRounds) {
+                                existing.finishedRounds = false
+                                if (!existing.pressed) existing.nextDeadlineNs = nowNs
+                            }
+                        }
+                    }
+
+                    val iter = runtimeMap.entries.iterator()
+                    while (iter.hasNext()) {
+                        val entry = iter.next()
+                        if (!enabledIds.contains(entry.key)) {
+                            if (entry.value.pressed) {
+                                liftPointer(entry.key)
+                            }
+                            iter.remove()
+                        }
+                    }
+                }
+
+                var earliestNs = Long.MAX_VALUE
                 fun stepState(st: FallbackTargetState): Boolean {
                     if (st.holdLockedDown || st.finishedRounds) return false
                     if (st.nextDeadlineNs > nowNs) return false
@@ -1116,27 +1238,46 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                     val act = st.config.actionType
 
                     if (!st.pressed) {
-                        val sx = (st.config.x + if (st.config.microJitter) sampleGaussianOffset(jitterRad) else 0f).coerceIn(0f, maxX)
-                        val sy = (st.config.y + if (st.config.microJitter) sampleGaussianOffset(jitterRad) else 0f).coerceIn(0f, maxY)
-                        st.startX = sx
-                        st.startY = sy
-                        if (act == ACTION_SWIPE) {
-                            st.endX = (st.config.endX + if (st.config.microJitter) sampleGaussianOffset(jitterRad) else 0f).coerceIn(0f, maxX)
-                            st.endY = (st.config.endY + if (st.config.microJitter) sampleGaussianOffset(jitterRad) else 0f).coerceIn(0f, maxY)
+                        val carriedPtr = if (st.config.holdInId > 0) {
+                            val keyId = -30_000 - st.config.holdInId
+                            activePointers.firstOrNull { it.targetId == keyId }
+                        } else null
+                        val pid = if (carriedPtr != null) {
+                            carriedPtr.targetId = st.config.id
+                            st.startX = carriedPtr.x
+                            st.startY = carriedPtr.y
+                            if (act == ACTION_SWIPE) {
+                                val exJitter = if (st.config.microJitter && st.config.holdOutId <= 0) sampleGaussianOffset(jitterRad) else 0f
+                                val eyJitter = if (st.config.microJitter && st.config.holdOutId <= 0) sampleGaussianOffset(jitterRad) else 0f
+                                st.endX = (st.config.endX + exJitter).coerceIn(0f, maxX)
+                                st.endY = (st.config.endY + eyJitter).coerceIn(0f, maxY)
+                            }
+                            carriedPtr.pointerId
+                        } else {
+                            val sx = (st.config.x + if (st.config.microJitter) sampleGaussianOffset(jitterRad) else 0f).coerceIn(0f, maxX)
+                            val sy = (st.config.y + if (st.config.microJitter) sampleGaussianOffset(jitterRad) else 0f).coerceIn(0f, maxY)
+                            st.startX = sx
+                            st.startY = sy
+                            if (act == ACTION_SWIPE) {
+                                val exJitter = if (st.config.microJitter && st.config.holdOutId <= 0) sampleGaussianOffset(jitterRad) else 0f
+                                val eyJitter = if (st.config.microJitter && st.config.holdOutId <= 0) sampleGaussianOffset(jitterRad) else 0f
+                                st.endX = (st.config.endX + exJitter).coerceIn(0f, maxX)
+                                st.endY = (st.config.endY + eyJitter).coerceIn(0f, maxY)
+                            }
+                            pressPointer(st.config.id, sx, sy)
                         }
-                        val pid = pressPointer(st.config.id, sx, sy)
                         if (pid >= 0) {
                             st.pressed = true
                             st.pointerId = pid
                             st.swipeFinalReached = false
                             when {
                                 act == ACTION_SWIPE -> {
-                                    val durMs = sampleGaussianMs(st.config.swipeDurationMs, st.config.microJitter, 30L, 15_000L)
+                                    val durMs = sampleGaussianMs(st.config.swipeDurationMs, st.config.microJitter, 8L, 15_000L)
                                     st.swipeStartNs = nowNs
                                     st.swipeEndNs = nowNs + durMs * 1_000_000L
-                                    st.nextDeadlineNs = minOf(st.swipeEndNs, nowNs + 8_000_000L)
+                                    st.nextDeadlineNs = minOf(st.swipeEndNs, nowNs + 4_000_000L)
                                 }
-                                act == ACTION_HOLD && !isSeq -> {
+                                act == ACTION_HOLD && st.config.repeatCount == 0 -> {
                                     st.holdLockedDown = true
                                     st.nextDeadlineNs = Long.MAX_VALUE
                                 }
@@ -1144,7 +1285,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                                     val pressMs = sampleGaussianMs(
                                         st.config.pressDurationMs,
                                         st.config.microJitter,
-                                        if (act == ACTION_HOLD) 50L else 8L,
+                                        8L,
                                         if (act == ACTION_HOLD) 30_000L else 5_000L
                                     )
                                     st.nextDeadlineNs = nowNs + pressMs * 1_000_000L
@@ -1165,84 +1306,239 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                                 st.startX + (st.endX - st.startX) * t,
                                 st.startY + (st.endY - st.startY) * t
                             )
-                            st.nextDeadlineNs = minOf(st.swipeEndNs, nowNs + 8_000_000L)
+                            st.nextDeadlineNs = minOf(st.swipeEndNs, nowNs + 4_000_000L)
                             return false
                         } else {
                             movePointer(st.config.id, st.endX, st.endY)
                             st.swipeFinalReached = true
-                            st.nextDeadlineNs = nowNs + 8_000_000L
+                            val curStage = if (isSeq && stagesList.isNotEmpty()) stagesList[activeStageIdx] else null
+                            val advancingStage = curStage != null &&
+                                st.config.holdOutId > 0 &&
+                                curStage.repeatCount >= 1 &&
+                                (curStage.completedRepeats + 1) >= curStage.repeatCount
+                            if (advancingStage && curStage!!.durationMs > 0L) {
+                                st.holdLockedDown = true
+                                st.nextDeadlineNs = Long.MAX_VALUE
+                                return false
+                            }
+                            if (advancingStage && curStage!!.durationMs == 0L && curStage.targets.size == 1) {
+                                val ptr = activePointers.firstOrNull { it.targetId == st.config.id }
+                                if (ptr != null) {
+                                    ptr.targetId = -30_000 - st.config.holdOutId
+                                } else {
+                                    liftPointer(st.config.id)
+                                }
+                                st.pressed = false
+                                st.swipeFinalReached = false
+                                st.pointerId = -1
+                                st.nextDeadlineNs = nowNs
+                                return true
+                            }
+                            st.nextDeadlineNs = nowNs + 4_000_000L
                             return false
                         }
                     }
 
-                    liftPointer(st.config.id)
+                    val curStage = if (isSeq && stagesList.isNotEmpty()) stagesList[activeStageIdx] else null
+                    val handoffOut = curStage != null &&
+                        st.config.holdOutId > 0 &&
+                        curStage.durationMs == 0L &&
+                        curStage.targets.size == 1 &&
+                        curStage.repeatCount >= 1 &&
+                        (curStage.completedRepeats + 1) >= curStage.repeatCount
+                    if (handoffOut) {
+                        val ptr = activePointers.firstOrNull { it.targetId == st.config.id }
+                        if (ptr != null) {
+                            ptr.targetId = -30_000 - st.config.holdOutId
+                        } else {
+                            liftPointer(st.config.id)
+                        }
+                    } else {
+                        liftPointer(st.config.id)
+                    }
                     st.pressed = false
                     st.swipeFinalReached = false
                     st.pointerId = -1
-                    val intervalMs = sampleGaussianMs(st.config.intervalMs, st.config.microJitter, 5L, 60_000L)
-                    if (!isSeq) {
-                        st.nextDeadlineNs = nowNs + intervalMs * 1_000_000L
-                    }
+                    val intervalMs = if (handoffOut) 0L else sampleGaussianMs(st.config.intervalMs, st.config.microJitter, 5L, 60_000L)
+                    st.nextDeadlineNs = nowNs + intervalMs * 1_000_000L
                     return true
                 }
 
-                if (valuesList.isNotEmpty()) {
-                    if (isSeq) {
-                        val cur = valuesList[seqIndex]
-                        val completed = stepState(cur)
-                        if (completed) {
-                            cur.completedCycles++
-                            val targetRepeats = cur.config.repeatCount.coerceAtLeast(1)
-                            if (cur.completedCycles < targetRepeats) {
-                                val intervalMs = sampleGaussianMs(cur.config.intervalMs, cur.config.microJitter, 5L, 60_000L)
-                                cur.nextDeadlineNs = nowNs + intervalMs * 1_000_000L
-                            } else {
-                                cur.completedCycles = 0
-                                if (seqIndex + 1 < valuesList.size) {
-                                    val intervalMs = sampleGaussianMs(cur.config.intervalMs, cur.config.microJitter, 5L, 60_000L)
-                                    seqIndex++
-                                    valuesList[seqIndex].nextDeadlineNs = nowNs + intervalMs * 1_000_000L
-                                } else {
-                                    seqIndex = 0
-                                    completedRounds++
-                                    if (loopCount > 0 && completedRounds >= loopCount) {
-                                        completedNaturally = true
-                                        break
-                                    }
-                                    val intervalMs = sampleGaussianMs(cur.config.intervalMs, cur.config.microJitter, 5L, 60_000L)
-                                    valuesList[0].nextDeadlineNs = nowNs + intervalMs * 1_000_000L
-                                }
-                            }
+                fun resetStageTargets(stage: FallbackStageState, readyAtNs: Long, preserveHeld: Boolean = false) {
+                    stage.stageDeadlineNs = 0L
+                    stage.startDelayUntilNs = readyAtNs
+                    stage.inGap = false
+                    stage.targets.forEachIndexed { i, vt ->
+                        if (preserveHeld && vt.pressed && vt.holdLockedDown && vt.pointerId >= 0) {
+                            vt.completedCycles = 0
+                            vt.finishedRounds = false
+                            return@forEachIndexed
                         }
-                        if (valuesList[seqIndex].nextDeadlineNs < earliestNs) {
-                            earliestNs = valuesList[seqIndex].nextDeadlineNs
+                        vt.pressed = false
+                        vt.holdLockedDown = false
+                        vt.swipeFinalReached = false
+                        vt.pointerId = -1
+                        vt.completedCycles = 0
+                        vt.finishedRounds = false
+                        vt.nextDeadlineNs = if (vt.config.holdInId > 0) readyAtNs else (readyAtNs + i * 500_000L)
+                    }
+                }
+
+                if (isSeq && stagesList.isNotEmpty()) {
+                    for (pass in 0 until 2) {
+                        if (activeStageIdx >= stagesList.size) activeStageIdx = 0
+                        val stage = stagesList[activeStageIdx]
+                        if (stage.targets.isEmpty()) break
+
+                        if (stage.inGap) {
+                            if (nowNs < stage.gapDeadlineNs) {
+                                earliestNs = minOf(earliestNs, stage.gapDeadlineNs)
+                                break
+                            }
+                            stage.inGap = false
+                            activeStageIdx = (activeStageIdx + 1) % stagesList.size
+                            resetStageTargets(stagesList[activeStageIdx], nowNs, preserveHeld = false)
+                            continue
                         }
-                    } else {
-                        var hasFinite = false
-                        var allFiniteDone = true
-                        for (st in valuesList) {
-                            val isFinite = st.config.actionType != ACTION_HOLD
-                            if (isFinite) hasFinite = true
-                            val completed = stepState(st)
-                            if (completed && loopCount > 0 && isFinite) {
-                                st.completedCycles++
-                                val totalNeed = loopCount.toLong() * st.config.repeatCount.coerceAtLeast(1).toLong()
-                                if (st.completedCycles.toLong() >= totalNeed) {
-                                    st.finishedRounds = true
-                                    st.nextDeadlineNs = Long.MAX_VALUE
-                                }
-                            }
-                            if (isFinite && !st.finishedRounds) {
-                                allFiniteDone = false
-                            }
-                            if (!st.finishedRounds && st.nextDeadlineNs < earliestNs) {
-                                earliestNs = st.nextDeadlineNs
-                            }
-                        }
-                        if (loopCount > 0 && hasFinite && allFiniteDone) {
-                            completedNaturally = true
+                        if (stage.startDelayUntilNs > nowNs) {
+                            earliestNs = minOf(earliestNs, stage.startDelayUntilNs)
                             break
                         }
+
+                        if (stage.durationMs > 0L || stage.targets.size > 1) {
+                            if (stage.stageDeadlineNs == 0L) {
+                                resetStageTargets(stage, nowNs, preserveHeld = true)
+                                stage.stageDeadlineNs = if (stage.repeatCount == 0) {
+                                    Long.MAX_VALUE
+                                } else {
+                                    nowNs + stage.durationMs * 1_000_000L
+                                }
+                            }
+                            if (nowNs >= stage.stageDeadlineNs) {
+                                val advancing = (stage.completedRepeats + 1 >= stage.repeatCount)
+                                val gapMs = sampleGaussianMs(stage.gapMs, false, 0L, 60_000L)
+                                for (vt in stage.targets) {
+                                    val isHoldInf = (vt.config.actionType == ACTION_HOLD && vt.config.repeatCount == 0)
+                                    if (advancing && vt.pressed && vt.config.holdOutId > 0) {
+                                        if (vt.config.actionType == ACTION_SWIPE && !vt.swipeFinalReached) {
+                                            movePointer(vt.config.id, vt.endX, vt.endY)
+                                        }
+                                        val ptr = activePointers.firstOrNull { it.targetId == vt.config.id }
+                                        if (ptr != null) {
+                                            ptr.targetId = -30_000 - vt.config.holdOutId
+                                        } else {
+                                            liftPointer(vt.config.id)
+                                        }
+                                        vt.pressed = false
+                                        vt.holdLockedDown = false
+                                        vt.swipeFinalReached = false
+                                        vt.pointerId = -1
+                                    } else if (!advancing && gapMs <= 80L && vt.pressed && isHoldInf) {
+                                        vt.completedCycles = 0
+                                        vt.finishedRounds = false
+                                    } else {
+                                        if (vt.pressed) {
+                                            liftPointer(vt.config.id)
+                                        }
+                                        vt.pressed = false
+                                        vt.holdLockedDown = false
+                                        vt.swipeFinalReached = false
+                                        vt.pointerId = -1
+                                    }
+                                }
+                                stage.stageDeadlineNs = 0L
+                                stage.completedRepeats++
+                                if (!advancing) {
+                                    resetStageTargets(stage, nowNs + gapMs * 1_000_000L, preserveHeld = true)
+                                    if (gapMs == 0L) {
+                                        continue
+                                    }
+                                    earliestNs = minOf(earliestNs, stage.startDelayUntilNs)
+                                } else {
+                                    stage.completedRepeats = 0
+                                    if (gapMs == 0L) {
+                                        activeStageIdx = (activeStageIdx + 1) % stagesList.size
+                                        resetStageTargets(stagesList[activeStageIdx], nowNs, preserveHeld = false)
+                                        if (stagesList.size > 1) {
+                                            continue
+                                        }
+                                    } else {
+                                        stage.inGap = true
+                                        stage.gapDeadlineNs = nowNs + gapMs * 1_000_000L
+                                        earliestNs = minOf(earliestNs, stage.gapDeadlineNs)
+                                    }
+                                }
+                                break
+                            }
+
+                            if (stage.stageDeadlineNs != Long.MAX_VALUE) {
+                                earliestNs = minOf(earliestNs, stage.stageDeadlineNs)
+                            }
+                            for (vt in stage.targets) {
+                                if (!vt.config.enabled || vt.finishedRounds) continue
+                                val completed = stepState(vt)
+                                if (completed && vt.config.repeatCount >= 1) {
+                                    vt.completedCycles++
+                                    if (vt.completedCycles >= vt.config.repeatCount) {
+                                        vt.finishedRounds = true
+                                        vt.nextDeadlineNs = Long.MAX_VALUE
+                                    }
+                                }
+                                if (!vt.holdLockedDown && !vt.finishedRounds) {
+                                    earliestNs = minOf(earliestNs, vt.nextDeadlineNs)
+                                }
+                            }
+                            break
+                        } else {
+                            val vt = stage.targets[0]
+                            val completed = stepState(vt)
+                            if (completed && stage.repeatCount >= 1) {
+                                stage.completedRepeats++
+                                if (stage.completedRepeats < stage.repeatCount) {
+                                    val waitMs = sampleGaussianMs(vt.config.intervalMs, vt.config.microJitter, 5L, 60_000L)
+                                    vt.nextDeadlineNs = nowNs + waitMs * 1_000_000L
+                                } else {
+                                    val waitMs = sampleGaussianMs(stage.gapMs, vt.config.microJitter && stage.gapMs >= 5L, 0L, 60_000L)
+                                    stage.completedRepeats = 0
+                                    activeStageIdx = (activeStageIdx + 1) % stagesList.size
+                                    resetStageTargets(stagesList[activeStageIdx], nowNs + waitMs * 1_000_000L, preserveHeld = false)
+                                    if (waitMs == 0L && stagesList.size > 1) {
+                                        continue
+                                    }
+                                }
+                            }
+                            val nextStage = stagesList[activeStageIdx]
+                            if (nextStage.startDelayUntilNs > nowNs) {
+                                earliestNs = minOf(earliestNs, nextStage.startDelayUntilNs)
+                            } else if (nextStage.targets.isNotEmpty() && !nextStage.targets[0].holdLockedDown) {
+                                earliestNs = minOf(earliestNs, nextStage.targets[0].nextDeadlineNs)
+                            }
+                            break
+                        }
+                    }
+                } else if (!isSeq && runtimeMap.isNotEmpty()) {
+                    var allFinite = true
+                    var allDone = true
+                    for (st in runtimeMap.values) {
+                        if (st.config.repeatCount <= 0) allFinite = false
+                        val completed = stepState(st)
+                        if (completed && st.config.repeatCount >= 1) {
+                            st.completedCycles++
+                            if (st.completedCycles >= st.config.repeatCount) {
+                                st.finishedRounds = true
+                                st.nextDeadlineNs = Long.MAX_VALUE
+                            }
+                        }
+                        if (st.config.repeatCount >= 1 && !st.finishedRounds) {
+                            allDone = false
+                        }
+                        if (!st.holdLockedDown && !st.finishedRounds) {
+                            earliestNs = minOf(earliestNs, st.nextDeadlineNs)
+                        }
+                    }
+                    if (allFinite && allDone) {
+                        completedNaturally = true
+                        break
                     }
                 }
 

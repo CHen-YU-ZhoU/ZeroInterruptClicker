@@ -330,14 +330,18 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeSetTargetsAndRu
     jfloatArray endYs,
     jlongArray swipeDurationsMs,
     jintArray repeatCounts,
+    jintArray stageIndices,
+    jlongArray stageDurationsMs,
+    jlongArray stageGapsMs,
+    jintArray stageRepeatCounts,
+    jintArray holdInIds,
+    jintArray holdOutIds,
     jboolean running,
     jint displayW,
     jint displayH,
     jint rotation,
     jfloat jitterRadiusPx,
-    jint executionMode,
-    jint presetLoopCount,
-    jint presetDurationSec) {
+    jint executionMode) {
     const jsize count = ids ? env->GetArrayLength(ids) : 0;
     std::vector<touchmux::NativeClickTarget> targets;
     if (count > 0) {
@@ -353,6 +357,12 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeSetTargetsAndRu
         jfloat* eyPtr = endYs ? env->GetFloatArrayElements(endYs, nullptr) : nullptr;
         jlong* sdPtr = swipeDurationsMs ? env->GetLongArrayElements(swipeDurationsMs, nullptr) : nullptr;
         jint* repPtr = repeatCounts ? env->GetIntArrayElements(repeatCounts, nullptr) : nullptr;
+        jint* stIdxPtr = stageIndices ? env->GetIntArrayElements(stageIndices, nullptr) : nullptr;
+        jlong* stDurPtr = stageDurationsMs ? env->GetLongArrayElements(stageDurationsMs, nullptr) : nullptr;
+        jlong* stGapPtr = stageGapsMs ? env->GetLongArrayElements(stageGapsMs, nullptr) : nullptr;
+        jint* stRepPtr = stageRepeatCounts ? env->GetIntArrayElements(stageRepeatCounts, nullptr) : nullptr;
+        jint* holdInPtr = holdInIds ? env->GetIntArrayElements(holdInIds, nullptr) : nullptr;
+        jint* holdOutPtr = holdOutIds ? env->GetIntArrayElements(holdOutIds, nullptr) : nullptr;
 
         targets.reserve(static_cast<size_t>(count));
         for (jsize i = 0; i < count; ++i) {
@@ -368,7 +378,13 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeSetTargetsAndRu
             t.endX = exPtr ? exPtr[i] : t.x;
             t.endY = eyPtr ? eyPtr[i] : t.y;
             t.swipeDurationMs = sdPtr ? sdPtr[i] : 300;
-            t.repeatCount = repPtr ? repPtr[i] : 1;
+            t.repeatCount = repPtr ? repPtr[i] : 0;
+            t.stageIndex = stIdxPtr ? stIdxPtr[i] : 0;
+            t.stageDurationMs = stDurPtr ? stDurPtr[i] : 0;
+            t.stageGapMs = stGapPtr ? stGapPtr[i] : 50;
+            t.stageRepeatCount = stRepPtr ? stRepPtr[i] : 1;
+            t.holdInId = holdInPtr ? holdInPtr[i] : 0;
+            t.holdOutId = holdOutPtr ? holdOutPtr[i] : 0;
             targets.push_back(t);
         }
 
@@ -384,6 +400,12 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeSetTargetsAndRu
         if (eyPtr) env->ReleaseFloatArrayElements(endYs, eyPtr, JNI_ABORT);
         if (sdPtr) env->ReleaseLongArrayElements(swipeDurationsMs, sdPtr, JNI_ABORT);
         if (repPtr) env->ReleaseIntArrayElements(repeatCounts, repPtr, JNI_ABORT);
+        if (stIdxPtr) env->ReleaseIntArrayElements(stageIndices, stIdxPtr, JNI_ABORT);
+        if (stDurPtr) env->ReleaseLongArrayElements(stageDurationsMs, stDurPtr, JNI_ABORT);
+        if (stGapPtr) env->ReleaseLongArrayElements(stageGapsMs, stGapPtr, JNI_ABORT);
+        if (stRepPtr) env->ReleaseIntArrayElements(stageRepeatCounts, stRepPtr, JNI_ABORT);
+        if (holdInPtr) env->ReleaseIntArrayElements(holdInIds, holdInPtr, JNI_ABORT);
+        if (holdOutPtr) env->ReleaseIntArrayElements(holdOutIds, holdOutPtr, JNI_ABORT);
     }
 
     getOrCreateEngine().setTargetsAndRunning(
@@ -393,9 +415,7 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeSetTargetsAndRu
         displayH,
         rotation,
         jitterRadiusPx,
-        executionMode,
-        presetLoopCount,
-        presetDurationSec
+        executionMode
     );
 }
 
@@ -517,6 +537,66 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeSetRpcHold(
     jfloat x,
     jfloat y) {
     getOrCreateEngine().setRpcHold(holdId, down == JNI_TRUE, x, y);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeStartRecording(
+    JNIEnv* /* env */,
+    jobject /* thiz */,
+    jint displayW,
+    jint displayH,
+    jint rotation,
+    jint excludeLeft,
+    jint excludeTop,
+    jint excludeRight,
+    jint excludeBottom) {
+    bool ok = getOrCreateEngine().startRecording(
+        displayW, displayH, rotation,
+        excludeLeft, excludeTop, excludeRight, excludeBottom
+    );
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeUpdateRecordingExcludeRect(
+    JNIEnv* /* env */,
+    jobject /* thiz */,
+    jint excludeLeft,
+    jint excludeTop,
+    jint excludeRight,
+    jint excludeBottom) {
+    getOrCreateEngine().updateRecordingExcludeRect(
+        excludeLeft, excludeTop, excludeRight, excludeBottom
+    );
+}
+
+JNIEXPORT jlongArray JNICALL
+Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeGetRecordingStats(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    int64_t stats[4]{};
+    getOrCreateEngine().getRecordingStats(stats);
+    jlongArray out = env->NewLongArray(4);
+    if (out != nullptr) {
+        jlong jStats[4] = {stats[0], stats[1], stats[2], stats[3]};
+        env->SetLongArrayRegion(out, 0, 4, jStats);
+    }
+    return out;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeStopRecording(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    std::string json = getOrCreateEngine().stopRecording(false);
+    return env->NewStringUTF(json.c_str());
+}
+
+JNIEXPORT void JNICALL
+Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeCancelRecording(
+    JNIEnv* /* env */,
+    jobject /* thiz */) {
+    getOrCreateEngine().stopRecording(true);
 }
 
 }  // extern "C"

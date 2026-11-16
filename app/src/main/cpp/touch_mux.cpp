@@ -9,10 +9,12 @@
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
+#include <iomanip>
 #include <limits>
 #include <linux/uhid.h>
 #include <linux/uinput.h>
 #include <poll.h>
+#include <sstream>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
@@ -59,7 +61,7 @@ constexpr int32_t kAndroidActionPointerDown = 5;
 constexpr int32_t kAndroidActionPointerUp = 6;
 constexpr int32_t kAndroidActionPointerIndexShift = 8;
 
-constexpr int64_t kSwipeStepNs = 8000000LL;               // 8ms interpolation period (~125Hz)
+constexpr int64_t kSwipeStepNs = 4000000LL;               // 4ms high-density interpolation (~250Hz)
 constexpr int64_t kVolDoubleTapWindowNs = 420000000LL;    // 420ms double-tap window
 constexpr int64_t kVolEmergencyHoldNs = 3000000000LL;     // 3.0s hold for EVIOCGRAB emergency release
 
@@ -226,6 +228,7 @@ TouchMuxEngine::TouchMuxEngine()
 }
 
 TouchMuxEngine::~TouchMuxEngine() {
+    stopRecording(true);
     shutdown();
     stopKeyWatchThread();
 }
@@ -305,7 +308,12 @@ bool TouchMuxEngine::findBestTouchscreen(DeviceDesc& outDesc, int& outErrno) {
         if (testBit(absBits, ABS_MT_TOUCH_MAJOR)) score += 5;
         if (testBit(absBits, ABS_MT_PRESSURE)) score += 5;
 
-        if (score > bestScore) {
+        auto isPreferredPath = [](const std::string& a, const std::string& b) -> bool {
+            if (b.empty()) return true;
+            if (a.size() != b.size()) return a.size() < b.size();
+            return a < b;
+        };
+        if (score > bestScore || (score == bestScore && isPreferredPath(path, best.path))) {
             DeviceDesc candidate;
             candidate.path = path;
             candidate.name = nameBuf;
@@ -972,6 +980,7 @@ int TouchMuxEngine::initAndGrab(int displayW,
                                 int rotation,
                                 int selfCheckTimeoutMs,
                                 int preferredBackend) {
+    stopRecording(true);
     ensureKeyWatchThread();
 
     if (threadRunning_.load()) {
@@ -1217,14 +1226,10 @@ int TouchMuxEngine::initAndGrab(int displayW,
     typeAFrameContacts_.clear();
     typeAActiveMuxSlots_.clear();
     virtualTargets_.clear();
+    stages_.clear();
     rpcGestures_.clear();
     pendingWrites_.clear();
-    seqIndex_ = 0;
-    seqWaitingToPress_ = true;
-    activePresetLoopCount_ = 0;
-    activePresetDurationSec_ = 0;
-    completedRounds_ = 0;
-    clickingDeadlineNs_ = 0;
+    activeStageIdx_ = 0;
 
     threadRunning_.store(true);
     workerThread_ = std::thread(&TouchMuxEngine::engineLoop, this);
@@ -1284,9 +1289,7 @@ void TouchMuxEngine::setTargetsAndRunning(const std::vector<NativeClickTarget>& 
                                           int displayH,
                                           int rotation,
                                           float jitterRadiusPx,
-                                          int executionMode,
-                                          int32_t presetLoopCount,
-                                          int32_t presetDurationSec) {
+                                          int executionMode) {
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         cfgTargets_ = targets;
@@ -1298,8 +1301,6 @@ void TouchMuxEngine::setTargetsAndRunning(const std::vector<NativeClickTarget>& 
         cfgExecutionMode_ = (executionMode == static_cast<int>(ExecutionMode::SEQUENTIAL))
                                 ? ExecutionMode::SEQUENTIAL
                                 : ExecutionMode::CONCURRENT;
-        cfgPresetLoopCount_ = std::max<int32_t>(0, presetLoopCount);
-        cfgPresetDurationSec_ = std::clamp<int32_t>(presetDurationSec, 0, 86400);
     }
     signalWake();
 }
@@ -1335,7 +1336,7 @@ void TouchMuxEngine::enqueueRpcSwipe(float x1, float y1, float x2, float y2, int
         cmd.y1 = y1;
         cmd.x2 = x2;
         cmd.y2 = y2;
-        cmd.durationMs = std::clamp<int64_t>(durationMs, 24, 15000);
+        cmd.durationMs = std::clamp<int64_t>(durationMs, 8, 15000);
         cfgRpcCommands_.push_back(cmd);
     }
     signalWake();
@@ -1816,6 +1817,21 @@ void TouchMuxEngine::emitSyncAndFlush() {
     pendingWrites_.clear();
 }
 
+void TouchMuxEngine::releaseCarriedHoldSlots() {
+    bool changed = false;
+    for (const auto& kv : carriedHoldSlots_) {
+        int slot = kv.second;
+        if (slot >= 0 && slot < kMaxUinputSlots && muxSlots_[slot].owner == SlotOwner::VIRTUAL) {
+            emitSlotUp(slot);
+            changed = true;
+        }
+    }
+    carriedHoldSlots_.clear();
+    if (changed) {
+        emitSyncAndFlush();
+    }
+}
+
 void TouchMuxEngine::releaseAllVirtualTargetSlots() {
     bool changed = false;
     for (auto& vt : virtualTargets_) {
@@ -1828,6 +1844,26 @@ void TouchMuxEngine::releaseAllVirtualTargetSlots() {
             changed = true;
         }
     }
+    for (auto& st : stages_) {
+        for (auto& vt : st.targets) {
+            if (vt.isPressed && vt.muxSlot >= 0) {
+                emitSlotUp(vt.muxSlot);
+                vt.muxSlot = -1;
+                vt.isPressed = false;
+                vt.holdLockedDown = false;
+                vt.swipeFinalReached = false;
+                changed = true;
+            }
+        }
+    }
+    for (const auto& kv : carriedHoldSlots_) {
+        int slot = kv.second;
+        if (slot >= 0 && slot < kMaxUinputSlots && muxSlots_[slot].owner == SlotOwner::VIRTUAL) {
+            emitSlotUp(slot);
+            changed = true;
+        }
+    }
+    carriedHoldSlots_.clear();
     // Also release any stray VIRTUAL target slot (> -1000 targetId belongs to targets, <= -1000 is RPC)
     for (int i = 0; i < kMaxUinputSlots; ++i) {
         if (muxSlots_[i].owner == SlotOwner::VIRTUAL && muxSlots_[i].ownerSlotOrTargetId > -1000) {
@@ -1870,7 +1906,18 @@ void TouchMuxEngine::forceReleaseAllSlotsAndSync() {
         vt.swipeFinalReached = false;
         vt.muxSlot = -1;
     }
+    for (auto& st : stages_) {
+        st.stageDeadlineNs = 0;
+        st.inGap = false;
+        for (auto& vt : st.targets) {
+            vt.isPressed = false;
+            vt.holdLockedDown = false;
+            vt.swipeFinalReached = false;
+            vt.muxSlot = -1;
+        }
+    }
     rpcGestures_.clear();
+    carriedHoldSlots_.clear();
     if (changed || btnTouchSent_ || uhidHadActiveContacts_ || !hybridReported_.empty()) {
         emitSyncAndFlush();
     }
@@ -1879,13 +1926,21 @@ void TouchMuxEngine::forceReleaseAllSlotsAndSync() {
 void TouchMuxEngine::finishClickingRun() {
     releaseAllVirtualTargetSlots();
     activeClickingRunning_ = false;
-    completedRounds_ = 0;
-    clickingDeadlineNs_ = 0;
-    seqIndex_ = 0;
-    seqWaitingToPress_ = true;
+    activeStageIdx_ = 0;
     for (auto& vt : virtualTargets_) {
         vt.completedCycles = 0;
         vt.finishedRounds = false;
+    }
+    for (auto& st : stages_) {
+        st.completedRepeats = 0;
+        st.stageDeadlineNs = 0;
+        st.startDelayUntilNs = 0;
+        st.inGap = false;
+        st.gapDeadlineNs = 0;
+        for (auto& vt : st.targets) {
+            vt.completedCycles = 0;
+            vt.finishedRounds = false;
+        }
     }
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -1938,15 +1993,22 @@ void TouchMuxEngine::logicalToRaw(float lx, float ly, int32_t& outRx, int32_t& o
     outRy = std::clamp(ry, deviceDesc_.absY.minimum, deviceDesc_.absY.maximum);
 }
 
-void TouchMuxEngine::rawToLogical(int32_t rx, int32_t ry, float& outLx, float& outLy) const {
-    const int64_t spanX = std::max<int64_t>(1, static_cast<int64_t>(deviceDesc_.absX.maximum) - deviceDesc_.absX.minimum);
-    const int64_t spanY = std::max<int64_t>(1, static_cast<int64_t>(deviceDesc_.absY.maximum) - deviceDesc_.absY.minimum);
-    const float uRaw = std::clamp(static_cast<float>(rx - deviceDesc_.absX.minimum) / static_cast<float>(spanX), 0.0f, 1.0f);
-    const float vRaw = std::clamp(static_cast<float>(ry - deviceDesc_.absY.minimum) / static_cast<float>(spanY), 0.0f, 1.0f);
+void TouchMuxEngine::rawToLogicalDesc(const DeviceDesc& desc,
+                                      int dispW,
+                                      int dispH,
+                                      int rotation,
+                                      int32_t rx,
+                                      int32_t ry,
+                                      float& outLx,
+                                      float& outLy) {
+    const int64_t spanX = std::max<int64_t>(1, static_cast<int64_t>(desc.absX.maximum) - desc.absX.minimum);
+    const int64_t spanY = std::max<int64_t>(1, static_cast<int64_t>(desc.absY.maximum) - desc.absY.minimum);
+    const float uRaw = std::clamp(static_cast<float>(rx - desc.absX.minimum) / static_cast<float>(spanX), 0.0f, 1.0f);
+    const float vRaw = std::clamp(static_cast<float>(ry - desc.absY.minimum) / static_cast<float>(spanY), 0.0f, 1.0f);
 
     float u = uRaw;
     float v = vRaw;
-    switch (activeRotation_) {
+    switch (rotation) {
         case 1:  // Inverse of ROTATION_90 (uRaw = 1 - v, vRaw = u)
             u = vRaw;
             v = 1.0f - uRaw;
@@ -1965,10 +2027,14 @@ void TouchMuxEngine::rawToLogical(int32_t rx, int32_t ry, float& outLx, float& o
             break;
     }
 
-    const float maxDispX = static_cast<float>(std::max(1, activeDisplayW_ - 1));
-    const float maxDispY = static_cast<float>(std::max(1, activeDisplayH_ - 1));
+    const float maxDispX = static_cast<float>(std::max(1, dispW - 1));
+    const float maxDispY = static_cast<float>(std::max(1, dispH - 1));
     outLx = std::clamp(u * maxDispX, 0.0f, maxDispX);
     outLy = std::clamp(v * maxDispY, 0.0f, maxDispY);
+}
+
+void TouchMuxEngine::rawToLogical(int32_t rx, int32_t ry, float& outLx, float& outLy) const {
+    rawToLogicalDesc(deviceDesc_, activeDisplayW_, activeDisplayH_, activeRotation_, rx, ry, outLx, outLy);
 }
 
 int32_t TouchMuxEngine::sampleAbsRatio(const struct input_absinfo& abs,
@@ -2024,8 +2090,6 @@ void TouchMuxEngine::handleWakeSignal() {
     std::vector<RpcCommand> pendingRpc;
     bool nextRunning = false;
     ExecutionMode nextExecMode = ExecutionMode::CONCURRENT;
-    int32_t nextPresetLoopCount = 0;
-    int32_t nextPresetDurationSec = 0;
     bool stopThread = false;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -2035,8 +2099,6 @@ void TouchMuxEngine::handleWakeSignal() {
         activeJitterRadiusPx_ = cfgJitterRadiusPx_;
         nextRunning = cfgClickingRunning_;
         nextExecMode = cfgExecutionMode_;
-        nextPresetLoopCount = cfgPresetLoopCount_;
-        nextPresetDurationSec = cfgPresetDurationSec_;
         nextTargets = cfgTargets_;
         pendingRpc.swap(cfgRpcCommands_);
         stopThread = cfgStopThreadRequested_;
@@ -2136,109 +2198,123 @@ void TouchMuxEngine::handleWakeSignal() {
         }
     }
 
+    auto buildSequentialStages = [&](const std::vector<NativeClickTarget>& list, int64_t startNs) {
+        stages_.clear();
+        activeStageIdx_ = 0;
+        for (const auto& t : list) {
+            if (!t.enabled) continue;
+            if (stages_.empty() || stages_.back().stageIndex != t.stageIndex) {
+                StageRuntime st;
+                st.stageIndex = t.stageIndex;
+                st.durationMs = std::max<int64_t>(0, t.stageDurationMs);
+                st.gapMs = std::clamp<int64_t>(t.stageGapMs, 0, 60000);
+                st.repeatCount = std::max<int32_t>(0, t.stageRepeatCount);
+                st.startDelayUntilNs = startNs;
+                stages_.push_back(std::move(st));
+            }
+            VirtualTargetRuntime rt;
+            rt.config = t;
+            rt.nextDeadlineNs = startNs;
+            stages_.back().targets.push_back(rt);
+        }
+    };
+
     // Handle loop targets update
     if (!nextRunning) {
         activeClickingRunning_ = false;
         activeExecutionMode_ = nextExecMode;
-        activePresetLoopCount_ = nextPresetLoopCount;
-        activePresetDurationSec_ = nextPresetDurationSec;
-        completedRounds_ = 0;
-        clickingDeadlineNs_ = 0;
         releaseAllVirtualTargetSlots();
         virtualTargets_.clear();
-        for (const auto& t : nextTargets) {
-            if (!t.enabled) continue;
-            VirtualTargetRuntime rt;
-            rt.config = t;
-            virtualTargets_.push_back(rt);
+        stages_.clear();
+        activeStageIdx_ = 0;
+        if (nextExecMode == ExecutionMode::SEQUENTIAL) {
+            buildSequentialStages(nextTargets, now);
+        } else {
+            for (const auto& t : nextTargets) {
+                if (!t.enabled) continue;
+                VirtualTargetRuntime rt;
+                rt.config = t;
+                virtualTargets_.push_back(rt);
+            }
         }
-        seqIndex_ = 0;
-        seqWaitingToPress_ = true;
         handleTimerEvents();
         return;
     }
 
     const bool freshStart = !activeClickingRunning_;
     const bool execModeChanged = (activeExecutionMode_ != nextExecMode) || freshStart;
-    const bool timerReset = execModeChanged ||
-                            (activePresetLoopCount_ != nextPresetLoopCount) ||
-                            (activePresetDurationSec_ != nextPresetDurationSec);
     activeExecutionMode_ = nextExecMode;
-    activePresetLoopCount_ = nextPresetLoopCount;
-    activePresetDurationSec_ = nextPresetDurationSec;
-    if (timerReset) {
-        completedRounds_ = 0;
-        clickingDeadlineNs_ = (nextPresetDurationSec > 0)
-                                  ? (now + static_cast<int64_t>(nextPresetDurationSec) * 1000000000LL)
-                                  : 0;
-    }
 
-    if (execModeChanged) {
+    if (nextExecMode == ExecutionMode::SEQUENTIAL) {
         releaseAllVirtualTargetSlots();
+        virtualTargets_.clear();
+        buildSequentialStages(nextTargets, now);
     } else {
-        // Release removed or disabled targets when staying in same execution mode
-        for (auto& oldRt : virtualTargets_) {
-            bool stillEnabled = false;
-            for (const auto& nt : nextTargets) {
-                if (nt.id == oldRt.config.id && nt.enabled) {
-                    stillEnabled = true;
-                    break;
-                }
-            }
-            if (!stillEnabled && oldRt.isPressed && oldRt.muxSlot >= 0) {
-                emitSlotUp(oldRt.muxSlot);
-                oldRt.muxSlot = -1;
-                oldRt.isPressed = false;
-                oldRt.holdLockedDown = false;
-            }
-        }
-        emitSyncAndFlush();
-    }
-
-    std::vector<VirtualTargetRuntime> rebuilt;
-    rebuilt.reserve(nextTargets.size());
-
-    for (size_t i = 0; i < nextTargets.size(); ++i) {
-        const auto& nt = nextTargets[i];
-        if (!nt.enabled) continue;
-        bool matched = false;
-        if (!execModeChanged) {
-            for (const auto& oldRt : virtualTargets_) {
-                if (oldRt.config.id == nt.id && activeClickingRunning_) {
-                    VirtualTargetRuntime updated = oldRt;
-                    updated.config = nt;
-                    if (timerReset) {
-                        updated.completedCycles = 0;
-                        if (updated.finishedRounds && !updated.isPressed) {
-                            updated.nextDeadlineNs = now;
-                        }
-                        updated.finishedRounds = false;
+        stages_.clear();
+        activeStageIdx_ = 0;
+        if (execModeChanged) {
+            releaseAllVirtualTargetSlots();
+        } else {
+            // Release removed or disabled targets when staying in same execution mode
+            for (auto& oldRt : virtualTargets_) {
+                bool stillEnabled = false;
+                for (const auto& nt : nextTargets) {
+                    if (nt.id == oldRt.config.id && nt.enabled) {
+                        stillEnabled = true;
+                        break;
                     }
-                    rebuilt.push_back(updated);
-                    matched = true;
-                    break;
+                }
+                if (!stillEnabled && oldRt.isPressed && oldRt.muxSlot >= 0) {
+                    emitSlotUp(oldRt.muxSlot);
+                    oldRt.muxSlot = -1;
+                    oldRt.isPressed = false;
+                    oldRt.holdLockedDown = false;
                 }
             }
+            emitSyncAndFlush();
         }
-        if (!matched) {
-            VirtualTargetRuntime fresh;
-            fresh.config = nt;
-            fresh.isPressed = false;
-            fresh.muxSlot = -1;
-            fresh.nextDeadlineNs = (activeExecutionMode_ == ExecutionMode::CONCURRENT)
-                                       ? (now + static_cast<int64_t>(rebuilt.size()) * 500000LL)
-                                       : now;
-            rebuilt.push_back(fresh);
-        }
-    }
 
-    virtualTargets_ = std::move(rebuilt);
-    if (virtualTargets_.empty()) {
-        seqIndex_ = 0;
-        seqWaitingToPress_ = true;
-    } else if (execModeChanged || seqIndex_ >= virtualTargets_.size()) {
-        seqIndex_ = 0;
-        seqWaitingToPress_ = true;
+        std::vector<VirtualTargetRuntime> rebuilt;
+        rebuilt.reserve(nextTargets.size());
+
+        for (size_t i = 0; i < nextTargets.size(); ++i) {
+            const auto& nt = nextTargets[i];
+            if (!nt.enabled) continue;
+            bool matched = false;
+            if (!execModeChanged) {
+                for (const auto& oldRt : virtualTargets_) {
+                    if (oldRt.config.id == nt.id && activeClickingRunning_) {
+                        VirtualTargetRuntime updated = oldRt;
+                        updated.config = nt;
+                        if (nt.repeatCount == 0 && updated.finishedRounds) {
+                            updated.finishedRounds = false;
+                            updated.completedCycles = 0;
+                            if (!updated.isPressed) {
+                                updated.nextDeadlineNs = now;
+                            }
+                        } else if (nt.repeatCount > 0 && updated.completedCycles < nt.repeatCount && updated.finishedRounds) {
+                            updated.finishedRounds = false;
+                            if (!updated.isPressed) {
+                                updated.nextDeadlineNs = now;
+                            }
+                        }
+                        rebuilt.push_back(updated);
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if (!matched) {
+                VirtualTargetRuntime fresh;
+                fresh.config = nt;
+                fresh.isPressed = false;
+                fresh.muxSlot = -1;
+                fresh.nextDeadlineNs = now + static_cast<int64_t>(rebuilt.size()) * 500000LL;
+                rebuilt.push_back(fresh);
+            }
+        }
+
+        virtualTargets_ = std::move(rebuilt);
     }
     activeClickingRunning_ = true;
 
@@ -2440,13 +2516,19 @@ void TouchMuxEngine::stepRpcGestures(int64_t now) {
 }
 
 void TouchMuxEngine::stepVirtualTargets(int64_t now) {
-    if (!activeClickingRunning_ || virtualTargets_.empty()) {
+    if (!activeClickingRunning_) {
+        return;
+    }
+    if (activeExecutionMode_ == ExecutionMode::SEQUENTIAL && stages_.empty()) {
+        return;
+    }
+    if (activeExecutionMode_ != ExecutionMode::SEQUENTIAL && virtualTargets_.empty()) {
         return;
     }
 
     bool anyEmitted = false;
 
-    auto handleSingleTargetTick = [&](VirtualTargetRuntime& vt, bool isSequential) -> bool {
+    auto handleSingleTargetTick = [&](VirtualTargetRuntime& vt) -> bool {
         // Returns true if this target JUST COMPLETED (released) its gesture cycle
         if (vt.holdLockedDown || vt.finishedRounds) {
             return false;
@@ -2458,50 +2540,82 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
         const ActionType act = static_cast<ActionType>(vt.config.actionType);
 
         if (!vt.isPressed) {
-            int slot = allocateVirtualSlot(vt.config.id);
+            int slot = -1;
+            bool carriedIn = false;
+            if (vt.config.holdInId > 0) {
+                auto it = carriedHoldSlots_.find(vt.config.holdInId);
+                if (it != carriedHoldSlots_.end()) {
+                    int candidate = it->second;
+                    carriedHoldSlots_.erase(it);
+                    if (candidate >= 0 && candidate < kMaxUinputSlots &&
+                        muxSlots_[candidate].owner == SlotOwner::VIRTUAL) {
+                        slot = candidate;
+                        muxSlots_[slot].ownerSlotOrTargetId = vt.config.id;
+                        carriedIn = true;
+                    }
+                }
+            }
             if (slot < 0) {
-                vt.nextDeadlineNs = now + 5000000LL;
-                return false;
+                slot = allocateVirtualSlot(vt.config.id);
+                if (slot < 0) {
+                    vt.nextDeadlineNs = now + 5000000LL;
+                    return false;
+                }
             }
-            float sx = vt.config.x;
-            float sy = vt.config.y;
-            applySpatialJitter(sx, sy, vt.config.microJitter);
-
-            vt.startX = sx;
-            vt.startY = sy;
-            if (act == ActionType::SWIPE) {
-                float ex = vt.config.endX;
-                float ey = vt.config.endY;
-                applySpatialJitter(ex, ey, vt.config.microJitter);
-                vt.endX = ex;
-                vt.endY = ey;
-            }
-
             vt.sampledMajor = sampleTouchMajor();
             vt.sampledPressure = samplePressure();
+            if (!carriedIn) {
+                float sx = vt.config.x;
+                float sy = vt.config.y;
+                applySpatialJitter(sx, sy, vt.config.microJitter);
 
-            int32_t rx = 0, ry = 0;
-            logicalToRaw(sx, sy, rx, ry);
-            emitSlotDown(slot, rx, ry, vt.sampledMajor, vt.sampledPressure, true, sx, sy);
+                vt.startX = sx;
+                vt.startY = sy;
+                if (act == ActionType::SWIPE) {
+                    float ex = vt.config.endX;
+                    float ey = vt.config.endY;
+                    if (vt.config.holdOutId <= 0) {
+                        applySpatialJitter(ex, ey, vt.config.microJitter);
+                    }
+                    vt.endX = ex;
+                    vt.endY = ey;
+                }
+
+                int32_t rx = 0, ry = 0;
+                logicalToRaw(sx, sy, rx, ry);
+                emitSlotDown(slot, rx, ry, vt.sampledMajor, vt.sampledPressure, true, sx, sy);
+                anyEmitted = true;
+            } else {
+                vt.startX = vt.config.x;
+                vt.startY = vt.config.y;
+                if (act == ActionType::SWIPE) {
+                    float ex = vt.config.endX;
+                    float ey = vt.config.endY;
+                    if (vt.config.holdOutId <= 0) {
+                        applySpatialJitter(ex, ey, vt.config.microJitter);
+                    }
+                    vt.endX = ex;
+                    vt.endY = ey;
+                }
+            }
 
             vt.muxSlot = slot;
             vt.isPressed = true;
             vt.swipeFinalReached = false;
-            anyEmitted = true;
 
             if (act == ActionType::SWIPE) {
-                int64_t durMs = sampleDurationMs(vt.config.swipeDurationMs, vt.config.microJitter, 30, 15000);
+                int64_t durMs = sampleDurationMs(vt.config.swipeDurationMs, vt.config.microJitter, 8, 15000);
                 vt.swipeStartNs = now;
                 vt.swipeEndNs = now + durMs * 1000000LL;
                 vt.nextDeadlineNs = std::min(vt.swipeEndNs, now + kSwipeStepNs);
-            } else if (act == ActionType::HOLD && !isSequential) {
+            } else if (act == ActionType::HOLD && vt.config.repeatCount == 0) {
                 vt.holdLockedDown = true;
                 vt.nextDeadlineNs = std::numeric_limits<int64_t>::max();
             } else {
                 int64_t pressMs = sampleDurationMs(
                     vt.config.pressDurationMs,
                     vt.config.microJitter,
-                    act == ActionType::HOLD ? 50 : 8,
+                    8,
                     act == ActionType::HOLD ? 30000 : 5000
                 );
                 vt.nextDeadlineNs = now + pressMs * 1000000LL;
@@ -2509,7 +2623,7 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
             return false;
         }
 
-        // Currently pressed: handle SWIPE 8ms interpolation steps
+        // Currently pressed: handle SWIPE 4ms interpolation steps
         if (act == ActionType::SWIPE && !vt.swipeFinalReached) {
             if (now < vt.swipeEndNs) {
                 double total = static_cast<double>(std::max<int64_t>(1, vt.swipeEndNs - vt.swipeStartNs));
@@ -2527,86 +2641,225 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
                 logicalToRaw(vt.endX, vt.endY, rx, ry);
                 emitSlotMove(vt.muxSlot, rx, ry, vt.sampledMajor, vt.sampledPressure, true, vt.endX, vt.endY);
                 vt.swipeFinalReached = true;
-                vt.nextDeadlineNs = now + kSwipeStepNs;
                 anyEmitted = true;
+
+                if (activeExecutionMode_ == ExecutionMode::SEQUENTIAL &&
+                    vt.config.holdOutId > 0 &&
+                    !stages_.empty() &&
+                    activeStageIdx_ < stages_.size()) {
+                    const auto& curSt = stages_[activeStageIdx_];
+                    const bool advancingStage = (curSt.repeatCount >= 1 && (curSt.completedRepeats + 1) >= curSt.repeatCount);
+                    if (curSt.durationMs > 0 && advancingStage) {
+                        vt.holdLockedDown = true;
+                        vt.nextDeadlineNs = std::numeric_limits<int64_t>::max();
+                        return false;
+                    }
+                    if (curSt.durationMs == 0 && curSt.targets.size() == 1 && advancingStage && vt.muxSlot >= 0) {
+                        carriedHoldSlots_[vt.config.holdOutId] = vt.muxSlot;
+                        vt.muxSlot = -1;
+                        vt.isPressed = false;
+                        vt.swipeFinalReached = false;
+                        vt.nextDeadlineNs = now;
+                        return true;
+                    }
+                }
+
+                vt.nextDeadlineNs = now + kSwipeStepNs;
                 return false;
             }
         }
 
-        // Release slot
-        if (vt.muxSlot >= 0) {
+        // Release slot unless seamlessly carried out to the immediately following stage
+        bool handoffOut = false;
+        if (activeExecutionMode_ == ExecutionMode::SEQUENTIAL &&
+            vt.config.holdOutId > 0 &&
+            !stages_.empty() &&
+            activeStageIdx_ < stages_.size()) {
+            const auto& curSt = stages_[activeStageIdx_];
+            if (curSt.durationMs == 0 && curSt.targets.size() == 1 &&
+                curSt.repeatCount >= 1 && (curSt.completedRepeats + 1) >= curSt.repeatCount &&
+                vt.muxSlot >= 0) {
+                carriedHoldSlots_[vt.config.holdOutId] = vt.muxSlot;
+                handoffOut = true;
+            }
+        }
+        if (!handoffOut && vt.muxSlot >= 0) {
             emitSlotUp(vt.muxSlot);
+            anyEmitted = true;
         }
         vt.muxSlot = -1;
         vt.isPressed = false;
         vt.swipeFinalReached = false;
-        anyEmitted = true;
 
-        int64_t intervalMs = sampleDurationMs(vt.config.intervalMs, vt.config.microJitter, 5, 60000);
-        if (!isSequential) {
-            vt.nextDeadlineNs = now + intervalMs * 1000000LL;
-        }
+        int64_t intervalMs = handoffOut ? 0 : sampleDurationMs(vt.config.intervalMs, vt.config.microJitter, 5, 60000);
+        vt.nextDeadlineNs = now + intervalMs * 1000000LL;
         return true;
     };
 
-    if (activeExecutionMode_ == ExecutionMode::SEQUENTIAL) {
-        if (seqIndex_ >= virtualTargets_.size()) {
-            seqIndex_ = 0;
-        }
-        auto& vt = virtualTargets_[seqIndex_];
-        bool completed = handleSingleTargetTick(vt, true);
-        if (completed) {
-            vt.completedCycles++;
-            const int32_t targetRepeats = std::max<int32_t>(1, vt.config.repeatCount);
-            if (vt.completedCycles < targetRepeats) {
-                int64_t intervalMs = sampleDurationMs(vt.config.intervalMs, vt.config.microJitter, 5, 60000);
-                vt.nextDeadlineNs = now + intervalMs * 1000000LL;
-            } else {
+    auto resetStageTargets = [](StageRuntime& st, int64_t readyAtNs, bool preserveHeld = false) {
+        st.stageDeadlineNs = 0;
+        st.startDelayUntilNs = readyAtNs;
+        st.inGap = false;
+        for (size_t i = 0; i < st.targets.size(); ++i) {
+            auto& vt = st.targets[i];
+            if (preserveHeld && vt.isPressed && vt.holdLockedDown && vt.muxSlot >= 0) {
                 vt.completedCycles = 0;
-                if (seqIndex_ + 1 < virtualTargets_.size()) {
-                    int64_t intervalMs = sampleDurationMs(vt.config.intervalMs, vt.config.microJitter, 5, 60000);
-                    seqIndex_++;
-                    virtualTargets_[seqIndex_].nextDeadlineNs = now + intervalMs * 1000000LL;
-                } else {
-                    seqIndex_ = 0;
-                    completedRounds_++;
-                    if (activePresetLoopCount_ > 0 && completedRounds_ >= activePresetLoopCount_) {
-                        if (anyEmitted) {
-                            emitSyncAndFlush();
-                        }
-                        finishClickingRun();
-                        return;
-                    }
-                    int64_t intervalMs = sampleDurationMs(vt.config.intervalMs, vt.config.microJitter, 5, 60000);
-                    virtualTargets_[0].nextDeadlineNs = now + intervalMs * 1000000LL;
+                vt.finishedRounds = false;
+                continue;
+            }
+            vt.isPressed = false;
+            vt.holdLockedDown = false;
+            vt.swipeFinalReached = false;
+            vt.muxSlot = -1;
+            vt.completedCycles = 0;
+            vt.finishedRounds = false;
+            vt.nextDeadlineNs = (vt.config.holdInId > 0)
+                ? readyAtNs
+                : (readyAtNs + static_cast<int64_t>(i) * 500000LL);
+        }
+    };
+
+    if (activeExecutionMode_ == ExecutionMode::SEQUENTIAL) {
+        for (int pass = 0; pass < 2; ++pass) {
+            if (activeStageIdx_ >= stages_.size()) {
+                activeStageIdx_ = 0;
+            }
+            auto& st = stages_[activeStageIdx_];
+            if (st.targets.empty()) {
+                break;
+            }
+            if (st.inGap) {
+                if (now < st.gapDeadlineNs) {
+                    break;
                 }
+                st.inGap = false;
+                activeStageIdx_ = (activeStageIdx_ + 1) % stages_.size();
+                resetStageTargets(stages_[activeStageIdx_], now, false);
+                continue;
+            }
+            if (st.startDelayUntilNs > now) {
+                break;
+            }
+
+            if (st.durationMs > 0 || st.targets.size() > 1) {
+                // Timed concurrent sub-preset stage
+                if (st.stageDeadlineNs == 0) {
+                    resetStageTargets(st, now, true);
+                    st.stageDeadlineNs = (st.repeatCount == 0)
+                                             ? std::numeric_limits<int64_t>::max()
+                                             : (now + st.durationMs * 1000000LL);
+                }
+                if (now >= st.stageDeadlineNs) {
+                    const bool advancingToNextStage = (st.completedRepeats + 1 >= st.repeatCount);
+                    int64_t gapMs = sampleDurationMs(st.gapMs, false, 0, 60000);
+                    for (auto& vt : st.targets) {
+                        const bool isHoldInf = (static_cast<ActionType>(vt.config.actionType) == ActionType::HOLD &&
+                                                vt.config.repeatCount == 0);
+                        if (advancingToNextStage && vt.isPressed && vt.muxSlot >= 0 && vt.config.holdOutId > 0) {
+                            if (static_cast<ActionType>(vt.config.actionType) == ActionType::SWIPE && !vt.swipeFinalReached) {
+                                int32_t rx = 0, ry = 0;
+                                logicalToRaw(vt.endX, vt.endY, rx, ry);
+                                emitSlotMove(vt.muxSlot, rx, ry, vt.sampledMajor, vt.sampledPressure, true, vt.endX, vt.endY);
+                                anyEmitted = true;
+                            }
+                            carriedHoldSlots_[vt.config.holdOutId] = vt.muxSlot;
+                            vt.muxSlot = -1;
+                            vt.isPressed = false;
+                            vt.holdLockedDown = false;
+                            vt.swipeFinalReached = false;
+                        } else if (!advancingToNextStage && gapMs <= 80 && vt.isPressed && vt.muxSlot >= 0 && isHoldInf) {
+                            // Keep finger down seamlessly across intra-stage repeat
+                            vt.completedCycles = 0;
+                            vt.finishedRounds = false;
+                        } else {
+                            if (vt.isPressed && vt.muxSlot >= 0) {
+                                emitSlotUp(vt.muxSlot);
+                                anyEmitted = true;
+                            }
+                            vt.muxSlot = -1;
+                            vt.isPressed = false;
+                            vt.holdLockedDown = false;
+                            vt.swipeFinalReached = false;
+                        }
+                    }
+                    st.stageDeadlineNs = 0;
+                    st.completedRepeats++;
+                    if (!advancingToNextStage) {
+                        resetStageTargets(st, now + gapMs * 1000000LL, true);
+                        if (gapMs == 0) {
+                            continue;
+                        }
+                    } else {
+                        st.completedRepeats = 0;
+                        if (gapMs == 0) {
+                            activeStageIdx_ = (activeStageIdx_ + 1) % stages_.size();
+                            resetStageTargets(stages_[activeStageIdx_], now, false);
+                            if (stages_.size() > 1) {
+                                continue;
+                            }
+                        } else {
+                            st.inGap = true;
+                            st.gapDeadlineNs = now + gapMs * 1000000LL;
+                        }
+                    }
+                    break;
+                }
+                for (auto& vt : st.targets) {
+                    if (!vt.config.enabled || vt.finishedRounds) continue;
+                    bool completed = handleSingleTargetTick(vt);
+                    if (completed && vt.config.repeatCount >= 1) {
+                        vt.completedCycles++;
+                        if (vt.completedCycles >= vt.config.repeatCount) {
+                            vt.finishedRounds = true;
+                            vt.nextDeadlineNs = std::numeric_limits<int64_t>::max();
+                        }
+                    }
+                }
+                break;
+            } else {
+                // Single-gesture sequential stage (TAP / SWIPE / HOLD)
+                auto& vt = st.targets[0];
+                bool completed = handleSingleTargetTick(vt);
+                if (completed && st.repeatCount >= 1) {
+                    st.completedRepeats++;
+                    if (st.completedRepeats < st.repeatCount) {
+                        int64_t waitMs = sampleDurationMs(vt.config.intervalMs, vt.config.microJitter, 5, 60000);
+                        vt.nextDeadlineNs = now + waitMs * 1000000LL;
+                    } else {
+                        int64_t waitMs = sampleDurationMs(st.gapMs, vt.config.microJitter && st.gapMs >= 5, 0, 60000);
+                        st.completedRepeats = 0;
+                        activeStageIdx_ = (activeStageIdx_ + 1) % stages_.size();
+                        resetStageTargets(stages_[activeStageIdx_], now + waitMs * 1000000LL, false);
+                        if (waitMs == 0 && stages_.size() > 1) {
+                            continue;
+                        }
+                    }
+                }
+                break;
             }
         }
     } else {
-        bool hasFiniteTarget = false;
-        bool allFiniteFinished = true;
+        // Pure CONCURRENT execution: each target honors its own repeatCount (0 = infinite, >=1 = N cycles)
+        bool allHaveFiniteCount = true;
+        bool allFinished = true;
         for (auto& vt : virtualTargets_) {
             if (!vt.config.enabled) continue;
-            const ActionType act = static_cast<ActionType>(vt.config.actionType);
-            const bool isFinite = (act != ActionType::HOLD);
-            if (isFinite) {
-                hasFiniteTarget = true;
+            if (vt.config.repeatCount <= 0) {
+                allHaveFiniteCount = false;
             }
-            bool completed = handleSingleTargetTick(vt, false);
-            if (completed && activePresetLoopCount_ > 0 && isFinite) {
+            bool completed = handleSingleTargetTick(vt);
+            if (completed && vt.config.repeatCount >= 1) {
                 vt.completedCycles++;
-                const int64_t totalNeed =
-                    static_cast<int64_t>(activePresetLoopCount_) * std::max<int64_t>(1, vt.config.repeatCount);
-                if (vt.completedCycles >= totalNeed) {
+                if (vt.completedCycles >= vt.config.repeatCount) {
                     vt.finishedRounds = true;
                     vt.nextDeadlineNs = std::numeric_limits<int64_t>::max();
                 }
             }
-            if (isFinite && !vt.finishedRounds) {
-                allFiniteFinished = false;
+            if (vt.config.repeatCount >= 1 && !vt.finishedRounds) {
+                allFinished = false;
             }
         }
-        if (activePresetLoopCount_ > 0 && hasFiniteTarget && allFiniteFinished) {
+        if (allHaveFiniteCount && allFinished) {
             if (anyEmitted) {
                 emitSyncAndFlush();
             }
@@ -2638,9 +2891,6 @@ void TouchMuxEngine::handleTimerEvents() {
     }
 
     stepRpcGestures(now);
-    if (activeClickingRunning_ && clickingDeadlineNs_ > 0 && now >= clickingDeadlineNs_) {
-        finishClickingRun();
-    }
     stepVirtualTargets(now);
     rearmTimerFd();
 }
@@ -2665,20 +2915,30 @@ void TouchMuxEngine::rearmTimerFd() {
         }
     }
     if (activeClickingRunning_) {
-        if (clickingDeadlineNs_ > 0) {
-            considerDeadline(clickingDeadlineNs_);
-        }
-        if (!virtualTargets_.empty()) {
-            if (activeExecutionMode_ == ExecutionMode::SEQUENTIAL) {
-                size_t idx = (seqIndex_ < virtualTargets_.size()) ? seqIndex_ : 0;
-                if (!virtualTargets_[idx].finishedRounds) {
-                    considerDeadline(virtualTargets_[idx].nextDeadlineNs);
+        if (activeExecutionMode_ == ExecutionMode::SEQUENTIAL) {
+            if (!stages_.empty()) {
+                const auto& st = stages_[(activeStageIdx_ < stages_.size()) ? activeStageIdx_ : 0];
+                if (st.inGap) {
+                    considerDeadline(st.gapDeadlineNs);
+                } else if (st.startDelayUntilNs > 0 && (st.stageDeadlineNs == 0 || st.targets.empty())) {
+                    considerDeadline(st.startDelayUntilNs);
+                } else {
+                    if (st.startDelayUntilNs > 0) {
+                        considerDeadline(st.startDelayUntilNs);
+                    }
+                    if (st.stageDeadlineNs > 0) {
+                        considerDeadline(st.stageDeadlineNs);
+                    }
+                    for (const auto& vt : st.targets) {
+                        if (!vt.config.enabled || vt.holdLockedDown || vt.finishedRounds) continue;
+                        considerDeadline(vt.nextDeadlineNs);
+                    }
                 }
-            } else {
-                for (const auto& vt : virtualTargets_) {
-                    if (!vt.config.enabled || vt.holdLockedDown || vt.finishedRounds) continue;
-                    considerDeadline(vt.nextDeadlineNs);
-                }
+            }
+        } else {
+            for (const auto& vt : virtualTargets_) {
+                if (!vt.config.enabled || vt.holdLockedDown || vt.finishedRounds) continue;
+                considerDeadline(vt.nextDeadlineNs);
             }
         }
     }
@@ -2738,6 +2998,519 @@ void TouchMuxEngine::engineLoop() {
     }
     closeAllFds();
     LOGI("TouchMux engineLoop exited cleanly and released EVIOCGRAB.");
+}
+
+bool TouchMuxEngine::startRecording(int displayW,
+                                    int displayH,
+                                    int rotation,
+                                    int excludeLeft,
+                                    int excludeTop,
+                                    int excludeRight,
+                                    int excludeBottom) {
+    stopRecording(true);
+    if (threadRunning_.load()) {
+        LOGW("startRecording called while active TouchMux session running; shutting down session first.");
+        shutdown();
+    }
+
+    // Reclaim any stale :touchmux daemon (e.g. after app update or Shizuku rebind) that could still
+    // hold EVIOCGRAB on the physical touchscreen and starve non-grabbed O_RDONLY listeners.
+    cleanupOrphanProcesses();
+
+    DeviceDesc desc;
+    int err = 0;
+    if (!findBestTouchscreen(desc, err)) {
+        lastError_ = formatErrno("Recording probe failed", err);
+        LOGE("%s", lastError_.c_str());
+        return false;
+    }
+
+    int fd = open(desc.path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        int openErr = errno;
+        lastError_ = formatErrno("open(touchscreen) for recording failed", openErr);
+        LOGE("%s", lastError_.c_str());
+        return false;
+    }
+
+    // Verify no process currently holds an exclusive EVIOCGRAB on this touchscreen node; otherwise
+    // kernel evdev_events() routes all touches solely to the grab holder and fd reads nothing.
+    if (ioctl(fd, EVIOCGRAB, 1) < 0) {
+        int grabErr = errno;
+        if (grabErr == EBUSY) {
+            LOGW("startRecording: %s returned EBUSY on grab probe; retrying orphan cleanup...",
+                 desc.path.c_str());
+            cleanupOrphanProcesses();
+            usleep(150000);
+            if (ioctl(fd, EVIOCGRAB, 1) == 0) {
+                ioctl(fd, EVIOCGRAB, 0);
+                grabErr = 0;
+            } else {
+                grabErr = errno;
+            }
+        }
+        if (grabErr == EBUSY) {
+            close(fd);
+            lastError_ = formatErrno("Touchscreen exclusively grabbed by another process (EBUSY)", grabErr);
+            LOGE("%s on %s", lastError_.c_str(), desc.path.c_str());
+            return false;
+        }
+    } else {
+        ioctl(fd, EVIOCGRAB, 0);
+    }
+
+    // Drain any buffered events right after opening (such as tap-release from "Ready" button)
+    struct input_event drainBuf[64];
+    while (read(fd, drainBuf, sizeof(drainBuf)) > 0) {
+    }
+
+    int wakeFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wakeFd < 0) {
+        int wErr = errno;
+        close(fd);
+        lastError_ = formatErrno("eventfd for recording failed", wErr);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(recMutex_);
+        recDesc_ = std::move(desc);
+        recPhysFd_ = fd;
+        recWakeFd_ = wakeFd;
+        recDisplayW_ = std::max(1, displayW);
+        recDisplayH_ = std::max(1, displayH);
+        recRotation_ = rotation;
+        recExL_ = excludeLeft;
+        recExT_ = excludeTop;
+        recExR_ = excludeRight;
+        recExB_ = excludeBottom;
+        recFirstTouchNs_ = 0;
+        recActiveFingers_ = 0;
+        recStrokeSeq_ = 0;
+        recStrokes_.clear();
+    }
+    recStarted_.store(false);
+    recRunning_.store(true);
+    recThread_ = std::thread(&TouchMuxEngine::recordLoop, this);
+    LOGI("Touch recording started (waiting for first touch outside [%d,%d,%d,%d]) on %s",
+         excludeLeft, excludeTop, excludeRight, excludeBottom, recDesc_.path.c_str());
+    return true;
+}
+
+void TouchMuxEngine::updateRecordingExcludeRect(int excludeLeft,
+                                                int excludeTop,
+                                                int excludeRight,
+                                                int excludeBottom) {
+    std::lock_guard<std::mutex> lock(recMutex_);
+    recExL_ = excludeLeft;
+    recExT_ = excludeTop;
+    recExR_ = excludeRight;
+    recExB_ = excludeBottom;
+}
+
+void TouchMuxEngine::getRecordingStats(int64_t outStats[4]) const {
+    if (!recRunning_.load()) {
+        outStats[0] = 0;
+        outStats[1] = 0;
+        outStats[2] = 0;
+        outStats[3] = 0;
+        return;
+    }
+    std::lock_guard<std::mutex> lock(recMutex_);
+    const bool started = recStarted_.load();
+    outStats[0] = started ? 2 : 1;
+    outStats[1] = started && recFirstTouchNs_ > 0
+                      ? std::max<int64_t>(0, (nowMonotonicNs() - recFirstTouchNs_) / 1000000LL)
+                      : 0;
+    outStats[2] = static_cast<int64_t>(recStrokes_.size());
+    outStats[3] = static_cast<int64_t>(recActiveFingers_);
+}
+
+std::string TouchMuxEngine::stopRecording(bool cancel) {
+    if (recRunning_.exchange(false)) {
+        if (recWakeFd_ >= 0) {
+            uint64_t v = 1;
+            ssize_t ignored = write(recWakeFd_, &v, sizeof(v));
+            (void)ignored;
+        }
+    }
+    if (recThread_.joinable()) {
+        recThread_.join();
+    }
+
+    std::vector<RecordedStroke> snapshot;
+    int dispW = 1080;
+    int dispH = 2400;
+    bool hadStart = recStarted_.exchange(false);
+    {
+        std::lock_guard<std::mutex> lock(recMutex_);
+        if (recPhysFd_ >= 0) {
+            close(recPhysFd_);
+            recPhysFd_ = -1;
+        }
+        if (recWakeFd_ >= 0) {
+            close(recWakeFd_);
+            recWakeFd_ = -1;
+        }
+        dispW = recDisplayW_;
+        dispH = recDisplayH_;
+        if (!cancel && hadStart) {
+            snapshot = std::move(recStrokes_);
+        }
+        recStrokes_.clear();
+        recActiveFingers_ = 0;
+        recFirstTouchNs_ = 0;
+    }
+
+    if (cancel || !hadStart || snapshot.empty()) {
+        return "";
+    }
+
+    std::sort(snapshot.begin(), snapshot.end(), [](const RecordedStroke& a, const RecordedStroke& b) {
+        if (a.downMs != b.downMs) return a.downMs < b.downMs;
+        return a.id < b.id;
+    });
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1);
+    oss << "{\"screenW\":" << dispW << ",\"screenH\":" << dispH << ",\"strokes\":[";
+    for (size_t i = 0; i < snapshot.size(); ++i) {
+        const auto& s = snapshot[i];
+        if (i > 0) oss << ",";
+        oss << "{\"id\":" << s.id
+            << ",\"downMs\":" << s.downMs
+            << ",\"upMs\":" << std::max(s.downMs + 8, s.upMs)
+            << ",\"points\":[";
+        for (size_t j = 0; j < s.points.size(); ++j) {
+            if (j > 0) oss << ",";
+            oss << "{\"t\":" << s.points[j].tMs
+                << ",\"x\":" << s.points[j].x
+                << ",\"y\":" << s.points[j].y << "}";
+        }
+        oss << "]}";
+    }
+    oss << "]}";
+    return oss.str();
+}
+
+void TouchMuxEngine::recordLoop() {
+    struct RecSlotState {
+        bool down = false;
+        bool pendingDown = false;
+        bool pendingUp = false;
+        bool excluded = false;
+        bool hasX = false;
+        bool hasY = false;
+        int32_t rawX = 0;
+        int32_t rawY = 0;
+        float lastX = 0.0f;
+        float lastY = 0.0f;
+        int64_t lastSampleNs = 0;
+        RecordedStroke stroke{};
+    };
+
+    RecSlotState slots[kMaxPhysSlots]{};
+    int curSlot = 0;
+    DeviceDesc descCopy;
+    int dispW = 1080;
+    int dispH = 2400;
+    int rot = 0;
+    int pFd = -1;
+    int wFd = -1;
+    {
+        std::lock_guard<std::mutex> lock(recMutex_);
+        descCopy = recDesc_;
+        dispW = recDisplayW_;
+        dispH = recDisplayH_;
+        rot = recRotation_;
+        pFd = recPhysFd_;
+        wFd = recWakeFd_;
+    }
+
+    if (pFd < 0 || wFd < 0) {
+        recRunning_.store(false);
+        return;
+    }
+
+    if (descCopy.isTypeB) {
+        struct input_absinfo absSlotNow {};
+        if (ioctl(pFd, EVIOCGABS(ABS_MT_SLOT), &absSlotNow) == 0) {
+            curSlot = std::clamp(absSlotNow.value, 0, kMaxPhysSlots - 1);
+        }
+    }
+    const int32_t midX = (descCopy.absX.minimum + descCopy.absX.maximum) / 2;
+    const int32_t midY = (descCopy.absY.minimum + descCopy.absY.maximum) / 2;
+    for (auto& s : slots) {
+        s.rawX = midX;
+        s.rawY = midY;
+    }
+
+    auto commitSynFrame = [&](int64_t frameNs) {
+        int exL = 0, exT = 0, exR = 0, exB = 0;
+        {
+            std::lock_guard<std::mutex> lock(recMutex_);
+            exL = recExL_;
+            exT = recExT_;
+            exR = recExR_;
+            exB = recExB_;
+        }
+        auto insideExclude = [&](float x, float y) -> bool {
+            if (exR <= exL || exB <= exT) return false;
+            return x >= static_cast<float>(exL - 8) &&
+                   x <= static_cast<float>(exR + 8) &&
+                   y >= static_cast<float>(exT - 8) &&
+                   y <= static_cast<float>(exB + 8);
+        };
+
+        int activeCnt = 0;
+        for (int s = 0; s < kMaxPhysSlots; ++s) {
+            auto& st = slots[s];
+            float lx = 0.0f;
+            float ly = 0.0f;
+            rawToLogicalDesc(descCopy, dispW, dispH, rot, st.rawX, st.rawY, lx, ly);
+
+            if (st.pendingDown) {
+                st.pendingDown = false;
+                if (st.down && !st.excluded) {
+                    // Close previous un-ended stroke defensively
+                    int64_t upMs = std::max<int64_t>(st.stroke.downMs + 8, (frameNs - recFirstTouchNs_) / 1000000LL);
+                    st.stroke.upMs = upMs;
+                    std::lock_guard<std::mutex> lock(recMutex_);
+                    recStrokes_.push_back(std::move(st.stroke));
+                }
+                st.down = true;
+                st.excluded = insideExclude(lx, ly);
+                if (!st.excluded) {
+                    std::lock_guard<std::mutex> lock(recMutex_);
+                    if (!recStarted_.load()) {
+                        recFirstTouchNs_ = frameNs;
+                        recStarted_.store(true);
+                        LOGI("Touch recording first touch captured at (%.1f, %.1f), excl=[%d,%d,%d,%d]",
+                             lx, ly, exL, exT, exR, exB);
+                    }
+                    int64_t tMs = std::max<int64_t>(0, (frameNs - recFirstTouchNs_) / 1000000LL);
+                    st.stroke = RecordedStroke{};
+                    st.stroke.id = ++recStrokeSeq_;
+                    st.stroke.downMs = tMs;
+                    st.stroke.upMs = tMs;
+                    st.stroke.points.push_back(RecordedPoint{tMs, lx, ly});
+                    st.lastX = lx;
+                    st.lastY = ly;
+                    st.lastSampleNs = frameNs;
+                }
+            } else if (st.down && !st.excluded && !st.pendingUp && (st.hasX || st.hasY)) {
+                float dx = lx - st.lastX;
+                float dy = ly - st.lastY;
+                float dist = std::hypot(dx, dy);
+                if (dist >= 2.0f || (frameNs - st.lastSampleNs) >= 8000000LL) {
+                    int64_t tMs = std::max<int64_t>(st.stroke.downMs, (frameNs - recFirstTouchNs_) / 1000000LL);
+                    st.stroke.points.push_back(RecordedPoint{tMs, lx, ly});
+                    st.lastX = lx;
+                    st.lastY = ly;
+                    st.lastSampleNs = frameNs;
+                }
+            }
+
+            if (st.pendingUp) {
+                st.pendingUp = false;
+                if (st.down && !st.excluded) {
+                    int64_t tMs = std::max<int64_t>(st.stroke.downMs, (frameNs - recFirstTouchNs_) / 1000000LL);
+                    if (st.stroke.points.empty() ||
+                        std::hypot(lx - st.lastX, ly - st.lastY) >= 1.5f ||
+                        st.stroke.points.back().tMs != tMs) {
+                        st.stroke.points.push_back(RecordedPoint{tMs, lx, ly});
+                    }
+                    st.stroke.upMs = std::max<int64_t>(st.stroke.downMs + 8, tMs);
+                    std::lock_guard<std::mutex> lock(recMutex_);
+                    recStrokes_.push_back(std::move(st.stroke));
+                }
+                st.down = false;
+                st.excluded = false;
+                st.stroke = RecordedStroke{};
+            }
+
+            st.hasX = false;
+            st.hasY = false;
+            if (st.down && !st.excluded) {
+                ++activeCnt;
+            }
+        }
+        std::lock_guard<std::mutex> lock(recMutex_);
+        recActiveFingers_ = activeCnt;
+    };
+
+    // Type-A frame accumulation helpers
+    TypeAContact recTypeACur{};
+    std::vector<TypeAContact> recTypeAContacts;
+    int recTypeASlots[kMaxPhysSlots];
+    std::fill(std::begin(recTypeASlots), std::end(recTypeASlots), -1);
+
+    auto commitTypeAFrame = [&](int64_t frameNs) {
+        bool usedSlot[kMaxPhysSlots]{};
+        int assignedSlots[16]{};
+        const size_t contactCnt = std::min<size_t>(recTypeAContacts.size(), 16);
+
+        for (size_t c = 0; c < contactCnt; ++c) {
+            assignedSlots[c] = -1;
+            const auto& ct = recTypeAContacts[c];
+            int bestS = -1;
+            int64_t bestDistSq = std::numeric_limits<int64_t>::max();
+            for (int s = 0; s < kMaxPhysSlots; ++s) {
+                if (usedSlot[s] || (!slots[s].down)) continue;
+                int64_t dx = static_cast<int64_t>(ct.x) - slots[s].rawX;
+                int64_t dy = static_cast<int64_t>(ct.y) - slots[s].rawY;
+                int64_t d2 = dx * dx + dy * dy;
+                if (d2 < bestDistSq) {
+                    bestDistSq = d2;
+                    bestS = s;
+                }
+            }
+            if (bestS >= 0) {
+                usedSlot[bestS] = true;
+                assignedSlots[c] = bestS;
+            }
+        }
+        for (int s = 0; s < kMaxPhysSlots; ++s) {
+            if (slots[s].down && !usedSlot[s]) {
+                slots[s].pendingUp = true;
+            }
+        }
+        for (size_t c = 0; c < contactCnt; ++c) {
+            const auto& ct = recTypeAContacts[c];
+            int s = assignedSlots[c];
+            if (s < 0) {
+                for (int k = 0; k < kMaxPhysSlots; ++k) {
+                    if (!slots[k].down && !usedSlot[k]) {
+                        s = k;
+                        usedSlot[k] = true;
+                        slots[s].pendingDown = true;
+                        break;
+                    }
+                }
+            }
+            if (s >= 0) {
+                slots[s].rawX = ct.x;
+                slots[s].rawY = ct.y;
+                slots[s].hasX = true;
+                slots[s].hasY = true;
+            }
+        }
+        recTypeAContacts.clear();
+        recTypeACur = TypeAContact{};
+        commitSynFrame(frameNs);
+    };
+
+    struct pollfd pfds[2] = {
+        {wFd, POLLIN, 0},
+        {pFd, POLLIN, 0}
+    };
+    struct input_event evBuf[64];
+
+    while (recRunning_.load()) {
+        int rc = poll(pfds, 2, 200);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pfds[0].revents & POLLIN) {
+            uint64_t drained = 0;
+            while (read(wFd, &drained, sizeof(drained)) > 0) {}
+            if (!recRunning_.load()) break;
+        }
+        if (!(pfds[1].revents & POLLIN)) {
+            continue;
+        }
+        while (recRunning_.load()) {
+            ssize_t n = read(pFd, evBuf, sizeof(evBuf));
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                if (errno == EINTR) continue;
+                recRunning_.store(false);
+                break;
+            }
+            if (n == 0) break;
+
+            const size_t count = static_cast<size_t>(n) / sizeof(struct input_event);
+            for (size_t i = 0; i < count; ++i) {
+                const struct input_event& ev = evBuf[i];
+                if (!descCopy.isTypeB) {
+                    if (ev.type == EV_ABS) {
+                        if (ev.code == ABS_MT_POSITION_X) {
+                            recTypeACur.hasX = true;
+                            recTypeACur.x = ev.value;
+                        } else if (ev.code == ABS_MT_POSITION_Y) {
+                            recTypeACur.hasY = true;
+                            recTypeACur.y = ev.value;
+                        }
+                    } else if (ev.type == EV_SYN && ev.code == SYN_MT_REPORT) {
+                        if (recTypeACur.hasX || recTypeACur.hasY) {
+                            recTypeAContacts.push_back(recTypeACur);
+                        }
+                        recTypeACur = TypeAContact{};
+                    } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+                        commitTypeAFrame(nowMonotonicNs());
+                    } else if (ev.type == EV_SYN && ev.code == SYN_DROPPED) {
+                        recTypeAContacts.clear();
+                        recTypeACur = TypeAContact{};
+                        commitTypeAFrame(nowMonotonicNs());
+                    }
+                    continue;
+                }
+
+                // Type-B event parsing
+                if (ev.type == EV_SYN) {
+                    if (ev.code == SYN_REPORT) {
+                        commitSynFrame(nowMonotonicNs());
+                    } else if (ev.code == SYN_DROPPED) {
+                        for (int s = 0; s < kMaxPhysSlots; ++s) {
+                            if (slots[s].down) slots[s].pendingUp = true;
+                        }
+                        commitSynFrame(nowMonotonicNs());
+                    }
+                } else if (ev.type == EV_ABS) {
+                    if (ev.code == ABS_MT_SLOT) {
+                        curSlot = std::clamp(ev.value, 0, kMaxPhysSlots - 1);
+                    } else if (ev.code == ABS_MT_TRACKING_ID) {
+                        if (ev.value >= 0) {
+                            slots[curSlot].pendingDown = true;
+                            slots[curSlot].pendingUp = false;
+                        } else if (slots[curSlot].down || slots[curSlot].pendingDown) {
+                            slots[curSlot].pendingUp = true;
+                        }
+                    } else if (ev.code == ABS_MT_POSITION_X) {
+                        slots[curSlot].rawX = ev.value;
+                        slots[curSlot].hasX = true;
+                        if (!slots[curSlot].down && !slots[curSlot].pendingDown) {
+                            slots[curSlot].pendingDown = true;
+                        }
+                    } else if (ev.code == ABS_MT_POSITION_Y) {
+                        slots[curSlot].rawY = ev.value;
+                        slots[curSlot].hasY = true;
+                        if (!slots[curSlot].down && !slots[curSlot].pendingDown) {
+                            slots[curSlot].pendingDown = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Finalize any still-pressed non-excluded strokes cleanly before returning
+    const int64_t endNs = nowMonotonicNs();
+    if (recStarted_.load()) {
+        std::lock_guard<std::mutex> lock(recMutex_);
+        for (int s = 0; s < kMaxPhysSlots; ++s) {
+            if (slots[s].down && !slots[s].excluded) {
+                int64_t tMs = std::max<int64_t>(slots[s].stroke.downMs + 8, (endNs - recFirstTouchNs_) / 1000000LL);
+                slots[s].stroke.upMs = tMs;
+                if (slots[s].stroke.points.empty() || slots[s].stroke.points.back().tMs != tMs) {
+                    slots[s].stroke.points.push_back(RecordedPoint{tMs, slots[s].lastX, slots[s].lastY});
+                }
+                recStrokes_.push_back(std::move(slots[s].stroke));
+            }
+        }
+        recActiveFingers_ = 0;
+    }
 }
 
 }  // namespace touchmux

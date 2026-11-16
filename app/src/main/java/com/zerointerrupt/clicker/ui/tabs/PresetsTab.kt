@@ -2,16 +2,20 @@ package com.zerointerrupt.clicker.ui.tabs
 
 import android.content.ClipboardManager
 import android.content.Context
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -19,60 +23,74 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Edit
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
+import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
+import androidx.compose.material3.carousel.CarouselItemScope
+import androidx.compose.material3.carousel.HorizontalMultiBrowseCarousel
+import androidx.compose.material3.carousel.rememberCarouselState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.zerointerrupt.clicker.R
 import com.zerointerrupt.clicker.model.ActionType
+import com.zerointerrupt.clicker.model.ClickConfigStore
 import com.zerointerrupt.clicker.model.ClickPreset
 import com.zerointerrupt.clicker.model.ClickTarget
 import com.zerointerrupt.clicker.model.ExecutionMode
 import com.zerointerrupt.clicker.ui.MainScreenCallbacks
 import com.zerointerrupt.clicker.ui.MainUiState
+import com.zerointerrupt.clicker.ui.components.BatchCreateEmptyPresetsDialog
+import com.zerointerrupt.clicker.ui.components.BatchDeletePresetsDialog
+import com.zerointerrupt.clicker.ui.components.BatchFreezePresetsDialog
 import com.zerointerrupt.clicker.ui.components.CheckSwitch
 import com.zerointerrupt.clicker.ui.components.ExpressiveCard
 import com.zerointerrupt.clicker.ui.components.ExpressiveConnectedGroup
+import com.zerointerrupt.clicker.ui.components.ExpressiveFabMenuItem
+import com.zerointerrupt.clicker.ui.components.ExpressiveFloatingActionButtonMenu
 import com.zerointerrupt.clicker.ui.components.ExpressiveOption
+import com.zerointerrupt.clicker.ui.components.ExpressiveToggleFab
 import com.zerointerrupt.clicker.ui.components.ImportJsonDialog
 import com.zerointerrupt.clicker.ui.components.OverflowMenuAction
 import com.zerointerrupt.clicker.ui.components.PageTopHeader
 import com.zerointerrupt.clicker.ui.components.PresetMiniCanvas
 import com.zerointerrupt.clicker.ui.components.PresetNameDialog
+import com.zerointerrupt.clicker.ui.components.ScriptImportDialog
 import com.zerointerrupt.clicker.ui.components.TargetEditDialog
 import kotlin.math.roundToInt
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PresetsTab(
     state: MainUiState,
@@ -81,93 +99,178 @@ fun PresetsTab(
 ) {
     val context = LocalContext.current
     val cs = MaterialTheme.colorScheme
+    val haptic = LocalHapticFeedback.current
 
+    var fabMenuExpanded by remember { mutableStateOf(false) }
     var showCreateDialog by remember { mutableStateOf(false) }
+    var showScriptDialog by remember { mutableStateOf(false) }
+    var scriptInitialText by remember { mutableStateOf("") }
     var renameTargetPreset by remember { mutableStateOf<ClickPreset?>(null) }
-    var showImportDialog by remember { mutableStateOf(false) }
-    var importInitialText by remember { mutableStateOf("") }
+    var showBatchImportDialog by remember { mutableStateOf(false) }
+    var batchImportInitialText by remember { mutableStateOf("") }
+    var showBatchFreezeDialog by remember { mutableStateOf(false) }
+    var showBatchUnfreezeDialog by remember { mutableStateOf(false) }
+    var showBatchDeleteDialog by remember { mutableStateOf(false) }
+    var showBatchCreateDialog by remember { mutableStateOf(false) }
     var editingTarget by remember { mutableStateOf<ClickTarget?>(null) }
     var showNewTargetDialog by remember { mutableStateOf(false) }
-    var stopConditionPreset by remember { mutableStateOf<ClickPreset?>(null) }
 
-    val activePreset = state.activePreset
+    val visiblePresets = remember(state.presets) { state.presets.filter { !it.isFrozen } }
+    val displayedPreset = remember(visiblePresets, state.activePresetId) {
+        visiblePresets.firstOrNull { it.id == state.activePresetId } ?: visiblePresets.firstOrNull()
+    }
+    LaunchedEffect(displayedPreset?.id, state.activePresetId) {
+        if (displayedPreset != null && displayedPreset.id != state.activePresetId) {
+            callbacks.onSelectPreset(displayedPreset.id)
+        }
+    }
+    val presetIdsKey = remember(visiblePresets) { visiblePresets.joinToString("|") { it.id } }
+    val latestPresetCount by rememberUpdatedState(visiblePresets.size)
+    val seamlessOutgoingStepIds = remember(state.presets, displayedPreset, state.screenWidthPx, state.screenHeightPx) {
+        if (displayedPreset == null) emptySet()
+        else ClickConfigStore.findSeamlessMergeStepIds(
+            presets = state.presets,
+            activePreset = displayedPreset,
+            screenW = state.screenWidthPx,
+            screenH = state.screenHeightPx
+        )
+    }
+    val subPresetParentCount = remember(state.presets) {
+        val counts = HashMap<String, Int>()
+        for (p in state.presets) {
+            if (p.executionMode != ExecutionMode.SEQUENTIAL) continue
+            for (t in p.targets) {
+                if (t.actionType == ActionType.SUB_PRESET && t.refPresetId.isNotBlank()) {
+                    counts[t.refPresetId] = (counts[t.refPresetId] ?: 0) + 1
+                }
+            }
+        }
+        counts
+    }
 
+    val hasUnfrozenPreset = state.presets.any { !it.isFrozen }
+    val hasFrozenPreset = state.presets.any { it.isFrozen }
     val menuActions = listOf(
         OverflowMenuAction(
-            label = "导入 JSON",
+            label = "批量导出 JSON",
+            enabled = state.presets.isNotEmpty(),
+            onClick = callbacks.onExportAllPresetsJson
+        ),
+        OverflowMenuAction(
+            label = "批量导入 JSON",
             onClick = {
                 val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                 val clip = cm?.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
-                importInitialText = if (clip.contains("\"targets\"")) clip else ""
-                showImportDialog = true
+                batchImportInitialText = if (clip.contains("\"presets\"") || clip.contains("\"targets\"")) clip else ""
+                showBatchImportDialog = true
             }
         ),
         OverflowMenuAction(
-            label = "导出当前方案",
-            enabled = activePreset != null,
-            onClick = {
-                if (activePreset != null) {
-                    callbacks.onExportPresetJson(activePreset)
-                }
-            }
+            label = "批量冻结方案",
+            enabled = hasUnfrozenPreset,
+            onClick = { showBatchFreezeDialog = true }
+        ),
+        OverflowMenuAction(
+            label = "批量解冻方案",
+            enabled = hasFrozenPreset,
+            onClick = { showBatchUnfreezeDialog = true }
+        ),
+        OverflowMenuAction(
+            label = "批量删除方案",
+            enabled = state.presets.size > 1,
+            isDestructive = true,
+            onClick = { showBatchDeleteDialog = true }
+        ),
+        OverflowMenuAction(
+            label = "批量添加空方案",
+            onClick = { showBatchCreateDialog = true }
         )
     )
 
-    BoxWithConstraints(modifier = modifier.fillMaxSize()) {
-        val columnCount = if (maxWidth >= 700.dp) 3 else 2
-        val presetRows = remember(state.presets, columnCount) {
-            state.presets.chunked(columnCount)
-        }
-
+    Box(modifier = modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
+            contentPadding = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item {
                 PageTopHeader(
                     title = "方案",
                     menuActions = menuActions,
-                    trailingAction = {
-                        IconButton(onClick = { showCreateDialog = true }) {
-                            Icon(
-                                imageVector = Icons.Rounded.Add,
-                                contentDescription = "新建方案",
-                                tint = cs.onSurfaceVariant
-                            )
-                        }
-                    }
+                    modifier = Modifier.padding(horizontal = 20.dp)
                 )
             }
 
-            items(presetRows, key = { row -> row.joinToString(",") { it.id } }) { rowPresets ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    rowPresets.forEach { preset ->
-                        PresetGridCard(
-                            preset = preset,
-                            isSelected = preset.id == state.activePresetId,
-                            canDelete = state.presets.size > 1,
-                            screenWidthPx = state.screenWidthPx,
-                            screenHeightPx = state.screenHeightPx,
-                            onSelect = { callbacks.onSelectPreset(preset.id) },
-                            onRename = { renameTargetPreset = preset },
-                            onDelete = { callbacks.onDeletePreset(preset.id) },
-                            modifier = Modifier.weight(1f)
-                        )
+            if (visiblePresets.isNotEmpty()) {
+                item {
+                    // Re-key on structural preset IDs so Material3 1.3.1 PagerState refreshes immediately on add/delete/freeze/unfreeze
+                    key(presetIdsKey) {
+                        val activeIdx = visiblePresets.indexOfFirst { it.id == displayedPreset?.id }.coerceAtLeast(0)
+                        val carouselState = rememberCarouselState(initialItem = activeIdx) { latestPresetCount }
+                        HorizontalMultiBrowseCarousel(
+                            state = carouselState,
+                            preferredItemWidth = 148.dp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(210.dp),
+                            itemSpacing = 10.dp,
+                            contentPadding = PaddingValues(horizontal = 20.dp)
+                        ) { index ->
+                            val preset = visiblePresets.getOrNull(index) ?: return@HorizontalMultiBrowseCarousel
+                            PresetCarouselCard(
+                                preset = preset,
+                                allPresets = state.presets,
+                                isSelected = preset.id == displayedPreset?.id,
+                                isChildSubPreset = (subPresetParentCount[preset.id] ?: 0) > 0,
+                                canDelete = state.presets.size > 1,
+                                screenWidthPx = state.screenWidthPx,
+                                screenHeightPx = state.screenHeightPx,
+                                onSelect = { callbacks.onSelectPreset(preset.id) },
+                                onRename = { renameTargetPreset = preset },
+                                onExportJson = { callbacks.onExportPresetJson(preset) },
+                                onDelete = { callbacks.onDeletePreset(preset.id) }
+                            )
+                        }
                     }
-                    repeat(columnCount - rowPresets.size) {
-                        Spacer(Modifier.weight(1f))
+                }
+            } else if (state.presets.isNotEmpty()) {
+                item {
+                    ExpressiveCard(
+                        modifier = Modifier.padding(horizontal = 20.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(18.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text(
+                                text = "当前方案均已冻结",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "# 开头的冻结方案已从方案页隐藏，点击「批量解冻方案」或新建方案即可继续使用。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = cs.onSurfaceVariant
+                            )
+                            FilledTonalButton(
+                                onClick = { showBatchUnfreezeDialog = true },
+                                shape = CircleShape
+                            ) {
+                                Text("批量解冻方案", fontWeight = FontWeight.SemiBold)
+                            }
+                        }
                     }
                 }
             }
 
+            val activePreset = displayedPreset
             if (activePreset != null) {
                 item {
-                    Spacer(Modifier.height(4.dp))
-                    ExpressiveCard {
+                    ExpressiveCard(
+                        modifier = Modifier.padding(horizontal = 20.dp)
+                    ) {
                         Column(
                             modifier = Modifier.padding(18.dp),
                             verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -186,7 +289,7 @@ fun PresetsTab(
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Text(
-                                        text = "${activePreset.targets.size} 节点",
+                                        text = "${activePreset.targets.size} 步骤",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = cs.onSurfaceVariant
                                     )
@@ -220,34 +323,6 @@ fun PresetsTab(
                                 height = 42.dp
                             )
 
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                val loopText = if (activePreset.presetLoopCount > 0) {
-                                    "循环 ${activePreset.presetLoopCount} 轮"
-                                } else {
-                                    "无限轮次"
-                                }
-                                val timerText = if (activePreset.presetDurationSec > 0) {
-                                    "定时 ${formatPresetDuration(activePreset.presetDurationSec)}"
-                                } else {
-                                    "不限时"
-                                }
-                                StopConditionPill(
-                                    label = loopText,
-                                    active = activePreset.presetLoopCount > 0,
-                                    onClick = { stopConditionPreset = activePreset },
-                                    modifier = Modifier.weight(1f)
-                                )
-                                StopConditionPill(
-                                    label = timerText,
-                                    active = activePreset.presetDurationSec > 0,
-                                    onClick = { stopConditionPreset = activePreset },
-                                    modifier = Modifier.weight(1f)
-                                )
-                            }
-
                             if (activePreset.targets.isEmpty()) {
                                 Surface(
                                     shape = RoundedCornerShape(18.dp),
@@ -255,7 +330,7 @@ fun PresetsTab(
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Text(
-                                        text = "暂无节点",
+                                        text = "暂无步骤，点击右上角「+ 添加」配置手势或子方案",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = cs.onSurfaceVariant,
                                         modifier = Modifier.padding(16.dp)
@@ -267,9 +342,11 @@ fun PresetsTab(
                                     activePreset.targets.forEach { target ->
                                         TargetRowCard(
                                             target = target,
+                                            allPresets = state.presets,
                                             globalIntervalMs = state.intervalMs,
                                             globalPressMs = state.pressDurationMs,
                                             isConcurrent = isConcurrent,
+                                            hasSeamlessHandoff = target.id in seamlessOutgoingStepIds,
                                             onToggle = { enabled ->
                                                 callbacks.onTogglePresetTargetEnabled(target.id, enabled)
                                             },
@@ -284,13 +361,58 @@ fun PresetsTab(
                 }
             }
 
-            item { Spacer(Modifier.height(6.dp)) }
+            item { Spacer(Modifier.height(78.dp)) }
         }
+
+        AnimatedVisibility(
+            visible = fabMenuExpanded,
+            enter = fadeIn(tween(180)),
+            exit = fadeOut(tween(150))
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.28f))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) { fabMenuExpanded = false }
+            )
+        }
+
+        PresetAddSpeedDial(
+            expanded = fabMenuExpanded,
+            onToggle = {
+                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                fabMenuExpanded = !fabMenuExpanded
+            },
+            onRecord = {
+                fabMenuExpanded = false
+                callbacks.onStartMacroRecording()
+            },
+            onManual = {
+                fabMenuExpanded = false
+                showCreateDialog = true
+            },
+            onScript = {
+                fabMenuExpanded = false
+                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                val clip = cm?.primaryClip?.getItemAt(0)?.text?.toString().orEmpty().trim()
+                scriptInitialText = if (
+                    clip.contains("\"targets\"") ||
+                    clip.startsWith("tap ") ||
+                    clip.startsWith("hold ") ||
+                    clip.startsWith("# name:")
+                ) clip else ""
+                showScriptDialog = true
+            },
+            modifier = Modifier.align(Alignment.BottomEnd)
+        )
     }
 
     if (showCreateDialog) {
         PresetNameDialog(
-            title = "新建方案",
+            title = "手动新建方案",
             initialName = "方案 ${state.presets.size + 1}",
             confirmLabel = "创建",
             showCopySwitch = true,
@@ -298,6 +420,17 @@ fun PresetsTab(
             onConfirm = { name, copyCurrent ->
                 callbacks.onCreatePreset(name, copyCurrent)
                 showCreateDialog = false
+            }
+        )
+    }
+
+    if (showScriptDialog) {
+        ScriptImportDialog(
+            initialText = scriptInitialText,
+            onDismiss = { showScriptDialog = false },
+            onImport = { script ->
+                callbacks.onImportPresetScript(script)
+                showScriptDialog = false
             }
         )
     }
@@ -316,175 +449,281 @@ fun PresetsTab(
         )
     }
 
-    if (showImportDialog) {
+    if (showBatchImportDialog) {
         ImportJsonDialog(
-            initialText = importInitialText,
-            onDismiss = { showImportDialog = false },
+            initialText = batchImportInitialText,
+            title = "批量导入 JSON",
+            hintText = "粘贴导出的多方案 JSON 包或单方案 JSON 文本：",
+            confirmLabel = "批量导入",
+            onDismiss = { showBatchImportDialog = false },
             onImport = { json ->
-                callbacks.onImportPresetJson(json)
-                showImportDialog = false
+                callbacks.onBatchImportPresetsJson(json)
+                showBatchImportDialog = false
             }
         )
     }
 
-    if (showNewTargetDialog) {
+    if (showBatchFreezeDialog) {
+        BatchFreezePresetsDialog(
+            presets = state.presets,
+            activePresetId = state.activePresetId,
+            freezeMode = true,
+            onDismiss = { showBatchFreezeDialog = false },
+            onConfirm = { selectedIds ->
+                callbacks.onBatchFreezePresets(selectedIds)
+                showBatchFreezeDialog = false
+            }
+        )
+    }
+
+    if (showBatchUnfreezeDialog) {
+        BatchFreezePresetsDialog(
+            presets = state.presets,
+            activePresetId = state.activePresetId,
+            freezeMode = false,
+            onDismiss = { showBatchUnfreezeDialog = false },
+            onConfirm = { selectedIds ->
+                callbacks.onBatchUnfreezePresets(selectedIds)
+                showBatchUnfreezeDialog = false
+            }
+        )
+    }
+
+    if (showBatchDeleteDialog) {
+        BatchDeletePresetsDialog(
+            presets = state.presets,
+            activePresetId = state.activePresetId,
+            onDismiss = { showBatchDeleteDialog = false },
+            onConfirm = { selectedIds ->
+                callbacks.onBatchDeletePresets(selectedIds)
+                showBatchDeleteDialog = false
+            }
+        )
+    }
+
+    if (showBatchCreateDialog) {
+        BatchCreateEmptyPresetsDialog(
+            existingCount = state.presets.size,
+            onDismiss = { showBatchCreateDialog = false },
+            onConfirm = { count, mode ->
+                callbacks.onBatchCreateEmptyPresets(count, mode)
+                showBatchCreateDialog = false
+            }
+        )
+    }
+
+    if (showNewTargetDialog && displayedPreset != null) {
         TargetEditDialog(
             initial = null,
+            activePresetId = displayedPreset.id,
+            executionMode = displayedPreset.executionMode,
+            allPresets = state.presets,
             screenW = state.screenWidthPx,
             screenH = state.screenHeightPx,
             defaultIntervalMs = state.intervalMs,
             defaultPressMs = state.pressDurationMs,
             defaultJitter = state.microJitter,
             onDismiss = { showNewTargetDialog = false },
-            onSave = { x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount ->
+            onSave = { x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs ->
                 callbacks.onSavePresetTarget(
                     null, x, y, intervalMs, pressMs, jitter, enabled,
-                    actionType, endX, endY, swipeDur, repeatCount
+                    actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs
                 )
                 showNewTargetDialog = false
             }
         )
     }
 
-    editingTarget?.let { target ->
+    if (editingTarget != null && displayedPreset != null) {
+        val target = editingTarget!!
         TargetEditDialog(
             initial = target,
+            activePresetId = displayedPreset.id,
+            executionMode = displayedPreset.executionMode,
+            allPresets = state.presets,
             screenW = state.screenWidthPx,
             screenH = state.screenHeightPx,
             defaultIntervalMs = state.intervalMs,
             defaultPressMs = state.pressDurationMs,
             defaultJitter = state.microJitter,
             onDismiss = { editingTarget = null },
-            onSave = { x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount ->
+            onSave = { x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs ->
                 callbacks.onSavePresetTarget(
                     target.id, x, y, intervalMs, pressMs, jitter, enabled,
-                    actionType, endX, endY, swipeDur, repeatCount
+                    actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs
                 )
                 editingTarget = null
             }
         )
     }
-
-    stopConditionPreset?.let { preset ->
-        PresetStopConditionDialog(
-            initialLoopCount = preset.presetLoopCount,
-            initialDurationSec = preset.presetDurationSec,
-            onDismiss = { stopConditionPreset = null },
-            onSave = { loopCount, durationSec ->
-                callbacks.onSetPresetLoopCondition(preset.id, loopCount, durationSec)
-                stopConditionPreset = null
-            }
-        )
-    }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun PresetGridCard(
+private fun CarouselItemScope.PresetCarouselCard(
     preset: ClickPreset,
+    allPresets: List<ClickPreset>,
     isSelected: Boolean,
+    isChildSubPreset: Boolean,
     canDelete: Boolean,
     screenWidthPx: Int,
     screenHeightPx: Int,
     onSelect: () -> Unit,
     onRename: () -> Unit,
-    onDelete: () -> Unit,
-    modifier: Modifier = Modifier
+    onExportJson: () -> Unit,
+    onDelete: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
-    val ratio = (screenWidthPx.toFloat() / screenHeightPx.coerceAtLeast(1).toFloat()).coerceIn(0.45f, 1.8f)
+    var cardMenuExpanded by remember { mutableStateOf(false) }
 
     val cardBg = if (isSelected) {
         lerp(cs.surfaceContainerLow, cs.primaryContainer, 0.42f)
     } else {
         cs.surfaceContainerLow
     }
-    Surface(
-        shape = RoundedCornerShape(24.dp),
-        color = cardBg,
-        tonalElevation = 0.dp,
-        shadowElevation = 0.dp,
-        border = if (isSelected) BorderStroke(1.5.dp, cs.primary) else null,
-        modifier = modifier
-            .clip(RoundedCornerShape(24.dp))
+    val shape = RoundedCornerShape(24.dp)
+    val fadeModifier = Modifier.graphicsLayer {
+        val maxW = carouselItemInfo.maxSize
+        val visFrac = if (maxW > 4f) (carouselItemInfo.maskRect.width / maxW).coerceIn(0f, 1f) else 1f
+        alpha = ((visFrac - 0.60f) / 0.20f).coerceIn(0f, 1f)
+    }
+
+    Box(
+        modifier = Modifier
+            .height(210.dp)
+            .maskClip(shape)
+            .then(
+                if (isSelected) {
+                    Modifier.maskBorder(BorderStroke(1.5.dp, cs.primary), shape)
+                } else {
+                    Modifier.maskBorder(BorderStroke(1.dp, cs.outlineVariant.copy(alpha = 0.4f)), shape)
+                }
+            )
+            .background(cardBg)
             .clickable(onClick = onSelect)
     ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+        // Slim centered phone layout preview filling the slim card cleanly
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(top = 12.dp, bottom = 52.dp, start = 12.dp, end = 12.dp),
+            contentAlignment = Alignment.Center
         ) {
-            Box(
-                modifier = Modifier.fillMaxWidth(),
-                contentAlignment = Alignment.Center
-            ) {
-                PresetMiniCanvas(
-                    preset = preset,
-                    screenWidthPx = screenWidthPx,
-                    screenHeightPx = screenHeightPx,
-                    modifier = Modifier
-                        .height(106.dp)
-                        .aspectRatio(ratio)
-                )
-            }
+            PresetMiniCanvas(
+                preset = preset,
+                allPresets = allPresets,
+                screenWidthPx = screenWidthPx,
+                screenHeightPx = screenHeightPx,
+                modifier = Modifier.height(132.dp)
+            )
+        }
 
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+        // Top overlay: active badge (left) + compact ⋮ menu matching Files by Google (right)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp)
+                .then(fadeModifier),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (isSelected) {
+                Surface(
+                    shape = CircleShape,
+                    color = cs.primary,
+                    contentColor = cs.onPrimary
                 ) {
                     Text(
-                        text = preset.name,
-                        style = MaterialTheme.typography.titleSmall,
+                        text = "使用中",
+                        style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
                     )
-                    if (isSelected) {
-                        Surface(
-                            shape = CircleShape,
-                            color = cs.primary,
-                            contentColor = cs.onPrimary
-                        ) {
-                            Text(
-                                text = "使用中",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
-                            )
-                        }
-                    }
                 }
-                val modeTag = if (preset.executionMode == ExecutionMode.SEQUENTIAL) "顺序连招" else "并发"
-                Text(
-                    text = "${preset.targets.size} 节点 · $modeTag",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = cs.onSurfaceVariant
-                )
+            } else {
+                Spacer(Modifier.width(1.dp))
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End
-            ) {
-                IconButton(onClick = onRename, modifier = Modifier.size(30.dp)) {
-                    Icon(
-                        imageVector = Icons.Rounded.Edit,
-                        contentDescription = "重命名",
-                        modifier = Modifier.size(16.dp),
-                        tint = cs.onSurfaceVariant
-                    )
-                }
-                if (canDelete) {
-                    IconButton(onClick = onDelete, modifier = Modifier.size(30.dp)) {
+            Box {
+                Surface(
+                    shape = CircleShape,
+                    color = cs.surfaceContainerLowest.copy(alpha = 0.85f),
+                    contentColor = cs.onSurface,
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .clickable { cardMenuExpanded = true }
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
                         Icon(
-                            imageVector = Icons.Rounded.Delete,
-                            contentDescription = "删除方案",
-                            modifier = Modifier.size(16.dp),
-                            tint = cs.error
+                            imageVector = Icons.Rounded.MoreVert,
+                            contentDescription = "方案操作",
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+                DropdownMenu(
+                    expanded = cardMenuExpanded,
+                    onDismissRequest = { cardMenuExpanded = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("重命名") },
+                        onClick = {
+                            cardMenuExpanded = false
+                            onRename()
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("导出为 JSON") },
+                        onClick = {
+                            cardMenuExpanded = false
+                            onExportJson()
+                        }
+                    )
+                    if (canDelete) {
+                        DropdownMenuItem(
+                            text = { Text("删除方案", color = cs.error) },
+                            onClick = {
+                                cardMenuExpanded = false
+                                onDelete()
+                            }
                         )
                     }
                 }
             }
+        }
+
+        // Bottom info cleanly inside narrow card width
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .fillMaxWidth()
+                .background(cardBg.copy(alpha = 0.86f))
+                .padding(horizontal = 12.dp, vertical = 9.dp)
+                .then(fadeModifier),
+            verticalArrangement = Arrangement.spacedBy(1.dp)
+        ) {
+            Text(
+                text = preset.name,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                color = cs.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            val modeTag = when {
+                preset.executionMode == ExecutionMode.SEQUENTIAL -> "顺序"
+                isChildSubPreset -> "并发子方案"
+                else -> "并发"
+            }
+            Text(
+                text = "${preset.targets.size} 步骤 · $modeTag",
+                style = MaterialTheme.typography.labelSmall,
+                color = cs.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
         }
     }
 }
@@ -492,14 +731,20 @@ private fun PresetGridCard(
 @Composable
 private fun TargetRowCard(
     target: ClickTarget,
+    allPresets: List<ClickPreset>,
     globalIntervalMs: Long,
     globalPressMs: Long,
     isConcurrent: Boolean,
+    hasSeamlessHandoff: Boolean,
     onToggle: (Boolean) -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
+    val refPreset = if (target.actionType == ActionType.SUB_PRESET) {
+        allPresets.firstOrNull { it.id == target.refPresetId }
+    } else null
+
     Surface(
         shape = RoundedCornerShape(18.dp),
         color = cs.surfaceContainer,
@@ -551,6 +796,12 @@ private fun TargetRowCard(
                             modifier = Modifier.size(14.dp),
                             tint = cs.tertiary
                         )
+                        ActionType.SUB_PRESET -> Icon(
+                            painter = painterResource(R.drawable.ic_layers),
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = cs.primary
+                        )
                         ActionType.TAP -> Icon(
                             painter = painterResource(R.drawable.ic_touch_app),
                             contentDescription = null,
@@ -561,7 +812,12 @@ private fun TargetRowCard(
                     Text(
                         text = when (target.actionType) {
                             ActionType.SWIPE -> "滑动 (${target.x.roundToInt()},${target.y.roundToInt()})→(${target.endX.roundToInt()},${target.endY.roundToInt()})"
-                            ActionType.HOLD -> "长按 (${target.x.roundToInt()},${target.y.roundToInt()})"
+                            ActionType.HOLD -> if (!isConcurrent && target.pressDurationMs <= 120L && target.repeatCount >= 1) {
+                                "按住点击 (${target.x.roundToInt()},${target.y.roundToInt()})"
+                            } else {
+                                "长按 (${target.x.roundToInt()},${target.y.roundToInt()})"
+                            }
+                            ActionType.SUB_PRESET -> "并发方案: ${refPreset?.name ?: "未找到方案"}"
                             ActionType.TAP -> "连点 (${target.x.roundToInt()},${target.y.roundToInt()})"
                         },
                         style = MaterialTheme.typography.bodyMedium,
@@ -570,21 +826,46 @@ private fun TargetRowCard(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
-                val repeatTag = "${target.repeatCount.coerceAtLeast(1)}次"
+                val repeatTag = if (target.repeatCount <= 0) "无限" else "${target.repeatCount}次"
+                val gapLabel = if (target.intervalMs <= 0L) "无缝(0ms)" else "停顿 ${target.intervalMs}ms"
                 val detail = when (target.actionType) {
-                    ActionType.SWIPE -> "间隔 ${target.intervalMs}ms · 耗时 ${target.swipeDurationMs}ms · $repeatTag"
-                    ActionType.HOLD -> if (isConcurrent) {
-                        "持续长按驻留"
+                    ActionType.SUB_PRESET -> when {
+                        isConcurrent -> "仅在顺序模式中生效"
+                        refPreset == null -> "引用的方案已不存在"
+                        refPreset.executionMode != ExecutionMode.CONCURRENT -> "引用方案当前非并发模式"
+                        target.repeatCount <= 0 -> "${refPreset.targets.count { it.enabled }} 节点 · 无限并发"
+                        else -> "持续 ${formatMsShort(target.subDurationMs)} · $gapLabel · $repeatTag"
+                    }
+                    ActionType.SWIPE -> "${if (!isConcurrent) gapLabel else "间隔 ${target.intervalMs}ms"} · 耗时 ${target.swipeDurationMs}ms · $repeatTag"
+                    ActionType.HOLD -> if (target.repeatCount <= 0) {
+                        "持续长按驻留 · 无限"
                     } else {
-                        "长按 ${target.pressDurationMs}ms · 间隔 ${target.intervalMs}ms · $repeatTag"
+                        "按住 ${target.pressDurationMs}ms · ${if (!isConcurrent) gapLabel else "间隔 ${target.intervalMs}ms"} · $repeatTag"
                     }
                     ActionType.TAP -> "间隔 ${globalIntervalMs}ms · 按压 ${globalPressMs}ms · $repeatTag"
                 }
                 Text(
                     text = detail,
                     style = MaterialTheme.typography.bodySmall,
-                    color = cs.onSurfaceVariant
+                    color = cs.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
+                if (hasSeamlessHandoff && !isConcurrent) {
+                    Surface(
+                        shape = CircleShape,
+                        color = cs.secondaryContainer,
+                        contentColor = cs.onSecondaryContainer,
+                        modifier = Modifier.padding(top = 2.dp)
+                    ) {
+                        Text(
+                            text = "不断触衔接下步",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
+                    }
+                }
             }
 
             CheckSwitch(
@@ -595,7 +876,7 @@ private fun TargetRowCard(
             IconButton(onClick = onDelete, modifier = Modifier.size(30.dp)) {
                 Icon(
                     imageVector = Icons.Rounded.Delete,
-                    contentDescription = "删除节点",
+                    contentDescription = "删除步骤",
                     modifier = Modifier.size(16.dp),
                     tint = cs.error
                 )
@@ -604,170 +885,80 @@ private fun TargetRowCard(
     }
 }
 
-@Composable
-private fun StopConditionPill(
-    label: String,
-    active: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val cs = MaterialTheme.colorScheme
-    Surface(
-        shape = RoundedCornerShape(14.dp),
-        color = if (active) cs.secondaryContainer else cs.surfaceContainerHigh,
-        contentColor = if (active) cs.onSecondaryContainer else cs.onSurfaceVariant,
-        modifier = modifier
-            .clip(RoundedCornerShape(14.dp))
-            .clickable(onClick = onClick)
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.Medium,
-            textAlign = TextAlign.Center,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 9.dp)
-        )
+private fun formatMsShort(ms: Long): String {
+    return if (ms >= 1000L && ms % 1000L == 0L) {
+        "${ms / 1000L}秒"
+    } else {
+        "${ms}ms"
     }
 }
 
 @Composable
-private fun PresetStopConditionDialog(
-    initialLoopCount: Int,
-    initialDurationSec: Int,
-    onDismiss: () -> Unit,
-    onSave: (loopCount: Int, durationSec: Int) -> Unit
+private fun PresetAddSpeedDial(
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    onRecord: () -> Unit,
+    onManual: () -> Unit,
+    onScript: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    val cs = MaterialTheme.colorScheme
-    var loopText by remember { mutableStateOf(initialLoopCount.toString()) }
-    var durationText by remember { mutableStateOf(initialDurationSec.toString()) }
-
-    val loopVal = loopText.toIntOrNull()?.coerceIn(ClickPreset.MIN_LOOP_COUNT, ClickPreset.MAX_LOOP_COUNT)
-        ?: initialLoopCount
-    val durVal = durationText.toIntOrNull()?.coerceIn(ClickPreset.MIN_DURATION_SEC, ClickPreset.MAX_DURATION_SEC)
-        ?: initialDurationSec
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("停止条件", fontWeight = FontWeight.SemiBold) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    text = "总轮次（全部节点各执行一轮）",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = cs.onSurfaceVariant
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    listOf(
-                        0 to "无限",
-                        1 to "1轮",
-                        5 to "5轮",
-                        10 to "10轮",
-                        50 to "50轮"
-                    ).forEach { (v, tag) ->
-                        val selected = loopVal == v
-                        Surface(
-                            shape = CircleShape,
-                            color = if (selected) cs.primary else cs.surfaceContainerHigh,
-                            contentColor = if (selected) cs.onPrimary else cs.onSurfaceVariant,
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(CircleShape)
-                                .clickable { loopText = v.toString() }
-                        ) {
-                            Text(
-                                text = tag,
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                textAlign = TextAlign.Center,
-                                maxLines = 1,
-                                modifier = Modifier.padding(vertical = 8.dp)
-                            )
-                        }
-                    }
-                }
-                OutlinedTextField(
-                    value = loopText,
-                    onValueChange = { loopText = it.filter(Char::isDigit).take(4) },
-                    label = { Text("自定义总轮次 (0=无限, 1~9999)") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
-
-                Text(
-                    text = "定时停止",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = cs.onSurfaceVariant
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    listOf(
-                        0 to "不限",
-                        30 to "30秒",
-                        60 to "1分",
-                        300 to "5分",
-                        1800 to "30分"
-                    ).forEach { (v, tag) ->
-                        val selected = durVal == v
-                        Surface(
-                            shape = CircleShape,
-                            color = if (selected) cs.primary else cs.surfaceContainerHigh,
-                            contentColor = if (selected) cs.onPrimary else cs.onSurfaceVariant,
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(CircleShape)
-                                .clickable { durationText = v.toString() }
-                        ) {
-                            Text(
-                                text = tag,
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                textAlign = TextAlign.Center,
-                                maxLines = 1,
-                                modifier = Modifier.padding(vertical = 8.dp)
-                            )
-                        }
-                    }
-                }
-                OutlinedTextField(
-                    value = durationText,
-                    onValueChange = { durationText = it.filter(Char::isDigit).take(5) },
-                    label = { Text("自定义定时/秒 (0=不限, 1~86400)") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.fillMaxWidth()
+    ExpressiveFloatingActionButtonMenu(
+        expanded = expanded,
+        horizontalAlignment = Alignment.End,
+        modifier = modifier,
+        button = {
+            ExpressiveToggleFab(
+                checked = expanded,
+                onCheckedChange = { onToggle() },
+                initialSize = 48.dp,
+                finalSize = 52.dp,
+                initialCornerRadius = 14.dp,
+                finalCornerRadius = 26.dp
+            ) { progress, iconColor ->
+                val p = progress()
+                Icon(
+                    imageVector = Icons.Rounded.Add,
+                    contentDescription = if (expanded) "收起新建方式" else "新增方案",
+                    tint = iconColor,
+                    modifier = Modifier
+                        .size(22.dp)
+                        .graphicsLayer { rotationZ = p * 45f }
                 )
             }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    val safeLoop = (loopText.toIntOrNull() ?: 0)
-                        .coerceIn(ClickPreset.MIN_LOOP_COUNT, ClickPreset.MAX_LOOP_COUNT)
-                    val safeDur = (durationText.toIntOrNull() ?: 0)
-                        .coerceIn(ClickPreset.MIN_DURATION_SEC, ClickPreset.MAX_DURATION_SEC)
-                    onSave(safeLoop, safeDur)
-                }
-            ) { Text("保存") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("取消") }
         }
-    )
-}
-
-private fun formatPresetDuration(sec: Int): String {
-    if (sec < 60) return "${sec}秒"
-    val mins = sec / 60
-    val rem = sec % 60
-    return if (rem == 0) "${mins}分" else "${mins}分${rem}秒"
+    ) {
+        ExpressiveFabMenuItem(
+            onClick = onScript,
+            icon = {
+                Icon(
+                    painter = painterResource(R.drawable.ic_terminal),
+                    contentDescription = null,
+                    modifier = Modifier.size(22.dp)
+                )
+            },
+            text = { Text("脚本", maxLines = 1) }
+        )
+        ExpressiveFabMenuItem(
+            onClick = onManual,
+            icon = {
+                Icon(
+                    imageVector = Icons.Rounded.Edit,
+                    contentDescription = null,
+                    modifier = Modifier.size(22.dp)
+                )
+            },
+            text = { Text("手动", maxLines = 1) }
+        )
+        ExpressiveFabMenuItem(
+            onClick = onRecord,
+            icon = {
+                Icon(
+                    painter = painterResource(R.drawable.ic_record),
+                    contentDescription = null,
+                    modifier = Modifier.size(22.dp)
+                )
+            },
+            text = { Text("录制", maxLines = 1) }
+        )
+    }
 }

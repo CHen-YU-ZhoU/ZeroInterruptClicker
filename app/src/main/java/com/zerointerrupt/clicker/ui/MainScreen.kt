@@ -9,46 +9,60 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarDefaults
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.zerointerrupt.clicker.R
 import com.zerointerrupt.clicker.ui.components.SetupWizardBottomSheet
 import com.zerointerrupt.clicker.ui.tabs.HomeTab
@@ -61,12 +75,21 @@ fun MainScreen(
     state: MainUiState,
     callbacks: MainScreenCallbacks,
     snackbarHostState: SnackbarHostState,
+    requestedTab: MainTab? = null,
+    onConsumeRequestedTab: () -> Unit = {},
     onCurrentTabChanged: (MainTab) -> Unit = {}
 ) {
     var currentTab by rememberSaveable { mutableStateOf(MainTab.HOME) }
     var showWizardSheet by rememberSaveable { mutableStateOf(false) }
     val cs = MaterialTheme.colorScheme
     val haptic = LocalHapticFeedback.current
+
+    LaunchedEffect(requestedTab) {
+        if (requestedTab != null) {
+            currentTab = requestedTab
+            onConsumeRequestedTab()
+        }
+    }
 
     LaunchedEffect(currentTab) {
         onCurrentTabChanged(currentTab)
@@ -187,38 +210,65 @@ private fun ClassicM3NavigationBar(
     val cs = MaterialTheme.colorScheme
     val haptic = LocalHapticFeedback.current
 
-    NavigationBar(
-        containerColor = cs.surfaceContainer,
-        tonalElevation = 0.dp,
-        windowInsets = NavigationBarDefaults.windowInsets
+    Surface(
+        color = cs.surfaceContainer,
+        tonalElevation = 0.dp
     ) {
-        MainTab.entries.forEach { tab ->
-            val selected = tab == currentTab
-            NavigationBarItem(
-                selected = selected,
-                onClick = {
-                    if (!selected) {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSelectTab(tab)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .windowInsetsPadding(NavigationBarDefaults.windowInsets)
+                .height(62.dp)
+                .padding(horizontal = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            MainTab.entries.forEach { tab ->
+                val selected = tab == currentTab
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .clip(CircleShape)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            if (!selected) {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onSelectTab(tab)
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .width(56.dp)
+                                .height(30.dp)
+                                .clip(CircleShape)
+                                .background(if (selected) cs.secondaryContainer else Color.Transparent),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CompositionLocalProvider(
+                                LocalContentColor provides if (selected) cs.onSecondaryContainer else cs.onSurfaceVariant
+                            ) {
+                                TabIcon(tab = tab, sizeDp = 21)
+                            }
+                        }
+                        Text(
+                            text = tab.title,
+                            fontSize = 11.5.sp,
+                            lineHeight = 14.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                            color = if (selected) cs.onSurface else cs.onSurfaceVariant,
+                            maxLines = 1
+                        )
                     }
-                },
-                icon = { TabIcon(tab = tab) },
-                label = {
-                    Text(
-                        text = tab.title,
-                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                        maxLines = 1
-                    )
-                },
-                alwaysShowLabel = true,
-                colors = NavigationBarItemDefaults.colors(
-                    indicatorColor = cs.secondaryContainer,
-                    selectedIconColor = cs.onSecondaryContainer,
-                    selectedTextColor = cs.onSurface,
-                    unselectedIconColor = cs.onSurfaceVariant,
-                    unselectedTextColor = cs.onSurfaceVariant
-                )
-            )
+                }
+            }
         }
     }
 }

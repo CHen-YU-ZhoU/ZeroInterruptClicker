@@ -13,4 +13,10 @@ parcelable ClickTargetParceled {
     float endY;
     long swipeDurationMs;
     int repeatCount;
+    int stageIndex;
+    long stageDurationMs;
+    long stageGapMs;
+    int stageRepeatCount;
+    int holdInId;
+    int holdOutId;
 }

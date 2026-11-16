@@ -3,6 +3,7 @@ package com.zerointerrupt.clicker.model
 import android.content.Context
 import android.os.Parcel
 import android.os.Parcelable
+import com.zerointerrupt.clicker.BuildConfig
 import com.zerointerrupt.clicker.ClickTargetParceled
 import org.json.JSONArray
 import org.json.JSONObject
@@ -12,7 +13,8 @@ import kotlin.math.max
 enum class ActionType(val code: Int, val label: String) {
     TAP(0, "连点"),
     SWIPE(1, "滑动"),
-    HOLD(2, "长按");
+    HOLD(2, "长按"),
+    SUB_PRESET(3, "并发方案");
 
     companion object {
         fun fromCode(code: Int): ActionType = entries.firstOrNull { it.code == code } ?: TAP
@@ -29,7 +31,7 @@ enum class ExecutionMode(val code: Int, val label: String) {
 }
 
 /**
- * Click/Swipe/Hold target anchor configuration with normalized coordinates and Parcelable support.
+ * Click/Swipe/Hold/SubPreset target step configuration with normalized coordinates and Parcelable support.
  */
 data class ClickTarget(
     val id: Int,
@@ -48,7 +50,9 @@ data class ClickTarget(
     var endNormX: Float = -1f,
     var endNormY: Float = -1f,
     var swipeDurationMs: Long = DEFAULT_SWIPE_DURATION_MS,
-    var repeatCount: Int = DEFAULT_REPEAT_COUNT
+    var repeatCount: Int = DEFAULT_REPEAT_COUNT,
+    var refPresetId: String = "",
+    var subDurationMs: Long = DEFAULT_SUB_DURATION_MS
 ) : Parcelable {
 
     constructor(parcel: Parcel) : this(
@@ -68,7 +72,9 @@ data class ClickTarget(
         endNormX = parcel.readFloat(),
         endNormY = parcel.readFloat(),
         swipeDurationMs = parcel.readLong(),
-        repeatCount = parcel.readInt().coerceIn(MIN_REPEAT_COUNT, MAX_REPEAT_COUNT)
+        repeatCount = parcel.readInt().coerceIn(MIN_REPEAT_COUNT, MAX_REPEAT_COUNT),
+        refPresetId = parcel.readString().orEmpty(),
+        subDurationMs = parcel.readLong().coerceIn(MIN_SUB_DURATION_MS, MAX_SUB_DURATION_MS)
     )
 
     override fun writeToParcel(parcel: Parcel, flags: Int) {
@@ -89,6 +95,8 @@ data class ClickTarget(
         parcel.writeFloat(endNormY)
         parcel.writeLong(swipeDurationMs)
         parcel.writeInt(repeatCount.coerceIn(MIN_REPEAT_COUNT, MAX_REPEAT_COUNT))
+        parcel.writeString(refPresetId)
+        parcel.writeLong(subDurationMs.coerceIn(MIN_SUB_DURATION_MS, MAX_SUB_DURATION_MS))
     }
 
     override fun describeContents(): Int = 0
@@ -153,11 +161,18 @@ data class ClickTarget(
         }
     }
 
-    fun toParceled(): ClickTargetParceled = ClickTargetParceled().apply {
+    fun toParceled(
+        stageIndex: Int = 0,
+        stageDurationMs: Long = 0L,
+        stageGapMs: Long = this.intervalMs,
+        stageRepeatCount: Int = this.repeatCount,
+        holdInId: Int = 0,
+        holdOutId: Int = 0
+    ): ClickTargetParceled = ClickTargetParceled().apply {
         id = this@ClickTarget.id
         x = this@ClickTarget.x
         y = this@ClickTarget.y
-        intervalMs = this@ClickTarget.intervalMs.coerceIn(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
+        intervalMs = this@ClickTarget.intervalMs.coerceIn(MIN_STAGE_GAP_MS, MAX_INTERVAL_MS)
         pressDurationMs = this@ClickTarget.pressDurationMs.coerceIn(MIN_PRESS_MS, MAX_PRESS_MS)
         microJitter = this@ClickTarget.microJitter
         enabled = this@ClickTarget.enabled
@@ -166,9 +181,16 @@ data class ClickTarget(
         endY = this@ClickTarget.endY
         swipeDurationMs = this@ClickTarget.swipeDurationMs.coerceIn(MIN_SWIPE_MS, MAX_SWIPE_MS)
         repeatCount = this@ClickTarget.repeatCount.coerceIn(MIN_REPEAT_COUNT, MAX_REPEAT_COUNT)
+        this.stageIndex = stageIndex
+        this.stageDurationMs = stageDurationMs.coerceAtLeast(0L)
+        this.stageGapMs = stageGapMs.coerceIn(MIN_STAGE_GAP_MS, MAX_INTERVAL_MS)
+        this.stageRepeatCount = stageRepeatCount.coerceIn(MIN_REPEAT_COUNT, MAX_REPEAT_COUNT)
+        this.holdInId = holdInId.coerceAtLeast(0)
+        this.holdOutId = holdOutId.coerceAtLeast(0)
     }
 
     companion object {
+        const val MIN_STAGE_GAP_MS = 0L
         const val MIN_INTERVAL_MS = 5L
         const val MAX_INTERVAL_MS = 60_000L
         const val DEFAULT_INTERVAL_MS = 80L
@@ -177,13 +199,23 @@ data class ClickTarget(
         const val MAX_PRESS_MS = 30_000L
         const val DEFAULT_PRESS_DURATION_MS = 25L
 
-        const val MIN_SWIPE_MS = 30L
+        const val MIN_SWIPE_MS = 8L
         const val MAX_SWIPE_MS = 15_000L
         const val DEFAULT_SWIPE_DURATION_MS = 320L
 
-        const val MIN_REPEAT_COUNT = 1
+        const val MIN_REPEAT_COUNT = 0
         const val MAX_REPEAT_COUNT = 9999
-        const val DEFAULT_REPEAT_COUNT = 1
+        const val DEFAULT_REPEAT_COUNT = 0
+
+        const val MIN_SUB_DURATION_MS = 8L
+        const val MAX_SUB_DURATION_MS = 600_000L
+        const val DEFAULT_SUB_DURATION_MS = 3_000L
+
+        const val SEAMLESS_HOLD_GAP_MS = 80L
+        const val SEAMLESS_HOLD_DIST_PX = 20f
+
+        fun defaultRepeatFor(executionMode: ExecutionMode): Int =
+            if (executionMode == ExecutionMode.CONCURRENT) 0 else 1
 
         @JvmField
         val CREATOR = object : Parcelable.Creator<ClickTarget> {
@@ -197,15 +229,23 @@ data class ClickPreset(
     val id: String,
     var name: String,
     var executionMode: ExecutionMode = ExecutionMode.CONCURRENT,
-    var presetLoopCount: Int = 0,
-    var presetDurationSec: Int = 0,
     val targets: MutableList<ClickTarget> = mutableListOf()
 ) {
+    val isFrozen: Boolean
+        get() = name.trimStart().startsWith(FROZEN_PREFIX)
+
     companion object {
-        const val MIN_LOOP_COUNT = 0
-        const val MAX_LOOP_COUNT = 9999
-        const val MIN_DURATION_SEC = 0
-        const val MAX_DURATION_SEC = 86_400
+        const val FROZEN_PREFIX = "#"
+
+        fun freezeName(rawName: String): String {
+            val trimmed = rawName.trimStart()
+            return if (trimmed.startsWith(FROZEN_PREFIX)) trimmed else "$FROZEN_PREFIX$trimmed"
+        }
+
+        fun unfreezeName(rawName: String): String {
+            val stripped = rawName.trimStart().dropWhile { it == '#' }.trimStart()
+            return stripped.ifEmpty { "方案" }
+        }
     }
 }
 
@@ -223,6 +263,7 @@ data class ClickGlobalSettings(
     val lockedAnchorAlpha: Float = DEFAULT_LOCKED_ALPHA,
     val themeMode: Int = THEME_SYSTEM,
     val dynamicColor: Boolean = true,
+    val launcherIconMode: Int = LAUNCHER_SYSTEM,
     val volumeKeyToggleEnabled: Boolean = true,
     val proModeEnabled: Boolean = false,
     val preferredBackend: Int = BACKEND_AUTO,
@@ -249,6 +290,10 @@ data class ClickGlobalSettings(
         const val THEME_SYSTEM = 0
         const val THEME_LIGHT = 1
         const val THEME_DARK = 2
+
+        const val LAUNCHER_SYSTEM = 0
+        const val LAUNCHER_DARK = 1
+        const val LAUNCHER_LIGHT = 2
 
         const val BACKEND_AUTO = 0
         const val BACKEND_UINPUT = 1
@@ -278,11 +323,13 @@ object ClickConfigStore {
     private const val KEY_LOCKED_ANCHOR_ALPHA = "locked_anchor_alpha"
     private const val KEY_THEME_MODE = "theme_mode"
     private const val KEY_DYNAMIC_COLOR = "dynamic_color"
+    private const val KEY_LAUNCHER_ICON_MODE = "launcher_icon_mode"
     private const val KEY_VOL_KEY_TOGGLE = "volume_key_toggle_enabled"
     private const val KEY_PRO_MODE = "pro_mode_enabled"
     private const val KEY_PREFERRED_BACKEND = "preferred_backend"
     private const val KEY_RPC_BRIDGE_ENABLED = "rpc_bridge_enabled"
     private const val KEY_RPC_TOKEN = "rpc_token"
+    private const val KEY_MIGRATED_CONCURRENT_ZERO = "migrated_concurrent_zero_v3"
 
     private const val KEY_CONTROL_BAR_X = "control_bar_x"
     private const val KEY_CONTROL_BAR_Y = "control_bar_y"
@@ -346,6 +393,8 @@ object ClickConfigStore {
             themeMode = prefs.getInt(KEY_THEME_MODE, ClickGlobalSettings.THEME_SYSTEM)
                 .coerceIn(ClickGlobalSettings.THEME_SYSTEM, ClickGlobalSettings.THEME_DARK),
             dynamicColor = prefs.getBoolean(KEY_DYNAMIC_COLOR, true),
+            launcherIconMode = prefs.getInt(KEY_LAUNCHER_ICON_MODE, ClickGlobalSettings.LAUNCHER_SYSTEM)
+                .coerceIn(ClickGlobalSettings.LAUNCHER_SYSTEM, ClickGlobalSettings.LAUNCHER_LIGHT),
             volumeKeyToggleEnabled = prefs.getBoolean(KEY_VOL_KEY_TOGGLE, true),
             proModeEnabled = prefs.getBoolean(KEY_PRO_MODE, false),
             preferredBackend = prefs.getInt(KEY_PREFERRED_BACKEND, ClickGlobalSettings.BACKEND_AUTO)
@@ -377,6 +426,13 @@ object ClickConfigStore {
             )
             .putInt(KEY_THEME_MODE, settings.themeMode)
             .putBoolean(KEY_DYNAMIC_COLOR, settings.dynamicColor)
+            .putInt(
+                KEY_LAUNCHER_ICON_MODE,
+                settings.launcherIconMode.coerceIn(
+                    ClickGlobalSettings.LAUNCHER_SYSTEM,
+                    ClickGlobalSettings.LAUNCHER_LIGHT
+                )
+            )
             .putBoolean(KEY_VOL_KEY_TOGGLE, settings.volumeKeyToggleEnabled)
             .putBoolean(KEY_PRO_MODE, settings.proModeEnabled)
             .putInt(KEY_PREFERRED_BACKEND, settings.preferredBackend)
@@ -385,13 +441,16 @@ object ClickConfigStore {
             .apply()
     }
 
+    fun hasLauncherIconModePref(context: Context): Boolean =
+        context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).contains(KEY_LAUNCHER_ICON_MODE)
+
     fun markSelfCheckPassed(context: Context, passed: Boolean) {
         context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit()
             .putBoolean(KEY_SELF_CHECK_PASSED, passed)
             .apply()
     }
 
-    private fun jsonArrayToTargets(array: JSONArray?): MutableList<ClickTarget> {
+    private fun jsonArrayToTargets(array: JSONArray?, defaultRepeat: Int = ClickTarget.DEFAULT_REPEAT_COUNT): MutableList<ClickTarget> {
         if (array == null) return mutableListOf()
         val result = mutableListOf<ClickTarget>()
         for (i in 0 until array.length()) {
@@ -407,7 +466,7 @@ object ClickConfigStore {
                 normX = obj.optDouble("normX", -1.0).toFloat(),
                 normY = obj.optDouble("normY", -1.0).toFloat(),
                 intervalMs = obj.optLong("intervalMs", ClickTarget.DEFAULT_INTERVAL_MS)
-                    .coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS),
+                    .coerceIn(ClickTarget.MIN_STAGE_GAP_MS, ClickTarget.MAX_INTERVAL_MS),
                 pressDurationMs = obj.optLong("pressDurationMs", ClickTarget.DEFAULT_PRESS_DURATION_MS)
                     .coerceIn(ClickTarget.MIN_PRESS_MS, ClickTarget.MAX_PRESS_MS),
                 microJitter = obj.optBoolean("microJitter", true),
@@ -419,8 +478,11 @@ object ClickConfigStore {
                 endNormY = obj.optDouble("endNormY", -1.0).toFloat(),
                 swipeDurationMs = obj.optLong("swipeDurationMs", ClickTarget.DEFAULT_SWIPE_DURATION_MS)
                     .coerceIn(ClickTarget.MIN_SWIPE_MS, ClickTarget.MAX_SWIPE_MS),
-                repeatCount = obj.optInt("repeatCount", ClickTarget.DEFAULT_REPEAT_COUNT)
-                    .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+                repeatCount = obj.optInt("repeatCount", defaultRepeat)
+                    .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT),
+                refPresetId = obj.optString("refPresetId", ""),
+                subDurationMs = obj.optLong("subDurationMs", ClickTarget.DEFAULT_SUB_DURATION_MS)
+                    .coerceIn(ClickTarget.MIN_SUB_DURATION_MS, ClickTarget.MAX_SUB_DURATION_MS)
             )
         }
         return result
@@ -447,6 +509,8 @@ object ClickConfigStore {
                 put("endNormY", t.endNormY.toDouble())
                 put("swipeDurationMs", t.swipeDurationMs)
                 put("repeatCount", t.repeatCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT))
+                if (t.refPresetId.isNotBlank()) put("refPresetId", t.refPresetId)
+                put("subDurationMs", t.subDurationMs.coerceIn(ClickTarget.MIN_SUB_DURATION_MS, ClickTarget.MAX_SUB_DURATION_MS))
             }
             array.put(obj)
         }
@@ -457,7 +521,7 @@ object ClickConfigStore {
         val raw = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             .getString(KEY_TARGETS, null) ?: return mutableListOf()
         return try {
-            jsonArrayToTargets(JSONArray(raw))
+            jsonArrayToTargets(JSONArray(raw), defaultRepeat = 0)
         } catch (_: Throwable) {
             mutableListOf()
         }
@@ -475,17 +539,14 @@ object ClickConfigStore {
                     val id = obj.optString("id", "").ifBlank { "preset_${i + 1}" }
                     val name = obj.optString("name", "").ifBlank { "方案 ${i + 1}" }
                     val execMode = ExecutionMode.fromCode(obj.optInt("executionMode", 0))
-                    val loopCount = obj.optInt("presetLoopCount", 0)
-                        .coerceIn(ClickPreset.MIN_LOOP_COUNT, ClickPreset.MAX_LOOP_COUNT)
-                    val durationSec = obj.optInt("presetDurationSec", 0)
-                        .coerceIn(ClickPreset.MIN_DURATION_SEC, ClickPreset.MAX_DURATION_SEC)
-                    val targets = jsonArrayToTargets(obj.optJSONArray("targets"))
+                    val targets = jsonArrayToTargets(
+                        obj.optJSONArray("targets"),
+                        defaultRepeat = ClickTarget.defaultRepeatFor(execMode)
+                    )
                     list += ClickPreset(
                         id = id,
                         name = name,
                         executionMode = execMode,
-                        presetLoopCount = loopCount,
-                        presetDurationSec = durationSec,
                         targets = targets
                     )
                 }
@@ -498,6 +559,24 @@ object ClickConfigStore {
         }
 
         if (parsed.isNotEmpty()) {
+            if (!prefs.getBoolean(KEY_MIGRATED_CONCURRENT_ZERO, false)) {
+                var changed = false
+                for (p in parsed) {
+                    if (p.executionMode == ExecutionMode.CONCURRENT) {
+                        for (t in p.targets) {
+                            if (t.repeatCount == 1) {
+                                t.repeatCount = 0
+                                changed = true
+                            }
+                        }
+                    }
+                }
+                prefs.edit().putBoolean(KEY_MIGRATED_CONCURRENT_ZERO, true).apply()
+                if (changed) {
+                    val savedId = prefs.getString(KEY_ACTIVE_PRESET_ID, parsed.first().id) ?: parsed.first().id
+                    persistPresetsInternal(context, parsed, savedId)
+                }
+            }
             return parsed
         }
 
@@ -508,6 +587,7 @@ object ClickConfigStore {
             targets = loadLegacyTargetsRaw(context)
         )
         val initialList = mutableListOf(migrated)
+        prefs.edit().putBoolean(KEY_MIGRATED_CONCURRENT_ZERO, true).apply()
         persistPresetsInternal(context, initialList, migrated.id)
         return initialList
     }
@@ -529,8 +609,6 @@ object ClickConfigStore {
                 put("id", preset.id)
                 put("name", preset.name)
                 put("executionMode", preset.executionMode.code)
-                put("presetLoopCount", preset.presetLoopCount.coerceIn(ClickPreset.MIN_LOOP_COUNT, ClickPreset.MAX_LOOP_COUNT))
-                put("presetDurationSec", preset.presetDurationSec.coerceIn(ClickPreset.MIN_DURATION_SEC, ClickPreset.MAX_DURATION_SEC))
                 put("targets", targetsToJsonArray(preset.targets))
             })
         }
@@ -579,9 +657,7 @@ object ClickConfigStore {
         name: String,
         initialTargets: List<ClickTarget> = emptyList(),
         executionMode: ExecutionMode = ExecutionMode.CONCURRENT,
-        activate: Boolean = true,
-        presetLoopCount: Int = 0,
-        presetDurationSec: Int = 0
+        activate: Boolean = true
     ): ClickPreset {
         val presets = loadPresets(context)
         val existingIds = presets.map { it.id }.toSet()
@@ -599,8 +675,6 @@ object ClickConfigStore {
             id = newId,
             name = cleanName,
             executionMode = executionMode,
-            presetLoopCount = presetLoopCount.coerceIn(ClickPreset.MIN_LOOP_COUNT, ClickPreset.MAX_LOOP_COUNT),
-            presetDurationSec = presetDurationSec.coerceIn(ClickPreset.MIN_DURATION_SEC, ClickPreset.MAX_DURATION_SEC),
             targets = copiedTargets
         )
         presets += created
@@ -609,36 +683,337 @@ object ClickConfigStore {
         return created
     }
 
+    fun createPresetBatchAndActivate(
+        context: Context,
+        subPresets: List<ClickPreset>,
+        mainPreset: ClickPreset
+    ): ClickPreset {
+        val presets = loadPresets(context)
+        val existingIds = presets.map { it.id }.toMutableSet()
+        var seq = presets.size + 1
+        fun allocId(): String {
+            while ("preset_$seq" in existingIds) seq++
+            val id = "preset_$seq"
+            existingIds += id
+            return id
+        }
+
+        val idRemap = HashMap<String, String>()
+        val finalSubs = subPresets.map { sub ->
+            val newId = allocId()
+            idRemap[sub.id] = newId
+            val copiedTargets = sub.targets.mapIndexed { idx, t ->
+                t.copy(id = idx + 1, index = idx + 1)
+            }.toMutableList()
+            ClickPreset(
+                id = newId,
+                name = sub.name.trim().ifEmpty { newId },
+                executionMode = sub.executionMode,
+                targets = copiedTargets
+            )
+        }
+
+        val mainId = allocId()
+        val finalMainTargets = mainPreset.targets.mapIndexed { idx, t ->
+            val remappedRef = if (t.actionType == ActionType.SUB_PRESET) {
+                idRemap[t.refPresetId] ?: t.refPresetId
+            } else ""
+            t.copy(id = idx + 1, index = idx + 1, refPresetId = remappedRef)
+        }.toMutableList()
+        val finalMain = ClickPreset(
+            id = mainId,
+            name = mainPreset.name.trim().ifEmpty { "方案 ${presets.size + 1}" },
+            executionMode = mainPreset.executionMode,
+            targets = finalMainTargets
+        )
+
+        presets += finalSubs
+        presets += finalMain
+        persistPresetsInternal(context, presets, finalMain.id)
+        return finalMain
+    }
+
     fun renamePreset(context: Context, presetId: String, newName: String): Boolean {
         val clean = newName.trim()
         if (clean.isEmpty()) return false
         val presets = loadPresets(context)
         val target = presets.firstOrNull { it.id == presetId } ?: return false
         target.name = clean
-        persistPresetsInternal(context, presets, getActivePresetId(context))
+        val currentActive = getActivePresetId(context)
+        val activeObj = presets.firstOrNull { it.id == currentActive }
+        val nextActive = if (activeObj == null || activeObj.isFrozen) {
+            presets.firstOrNull { !it.isFrozen }?.id ?: currentActive
+        } else {
+            currentActive
+        }
+        persistPresetsInternal(context, presets, nextActive)
         return true
     }
 
     fun setPresetExecutionMode(context: Context, presetId: String, mode: ExecutionMode): Boolean {
         val presets = loadPresets(context)
         val target = presets.firstOrNull { it.id == presetId } ?: return false
-        target.executionMode = mode
-        persistPresetsInternal(context, presets, getActivePresetId(context))
+        if (target.executionMode != mode) {
+            if (mode == ExecutionMode.SEQUENTIAL) {
+                for (t in target.targets) {
+                    if (t.repeatCount == 0) t.repeatCount = 1
+                }
+            } else {
+                for (t in target.targets) {
+                    if (t.actionType != ActionType.SUB_PRESET && t.repeatCount == 1) {
+                        t.repeatCount = 0
+                    }
+                }
+            }
+            target.executionMode = mode
+            persistPresetsInternal(context, presets, getActivePresetId(context))
+        }
         return true
     }
 
-    fun setPresetLoopCondition(
-        context: Context,
-        presetId: String,
-        loopCount: Int,
-        durationSec: Int
-    ): Boolean {
-        val presets = loadPresets(context)
-        val target = presets.firstOrNull { it.id == presetId } ?: return false
-        target.presetLoopCount = loopCount.coerceIn(ClickPreset.MIN_LOOP_COUNT, ClickPreset.MAX_LOOP_COUNT)
-        target.presetDurationSec = durationSec.coerceIn(ClickPreset.MIN_DURATION_SEC, ClickPreset.MAX_DURATION_SEC)
-        persistPresetsInternal(context, presets, getActivePresetId(context))
-        return true
+    fun collectPreviewTargets(
+        presets: List<ClickPreset>,
+        preset: ClickPreset,
+        visitedIds: MutableSet<String> = mutableSetOf(preset.id)
+    ): List<ClickTarget> {
+        val out = mutableListOf<ClickTarget>()
+        for (t in preset.targets) {
+            if (t.actionType == ActionType.SUB_PRESET) {
+                if (t.refPresetId.isNotBlank() && t.refPresetId !in visitedIds) {
+                    val child = presets.firstOrNull { it.id == t.refPresetId }
+                    if (child != null) {
+                        visitedIds += child.id
+                        out += collectPreviewTargets(presets, child, visitedIds)
+                        visitedIds -= child.id
+                    }
+                }
+            } else {
+                out += t
+            }
+        }
+        return out
+    }
+
+    private data class CompiledStageDraft(
+        val sourceStepId: Int,
+        val isSubPreset: Boolean,
+        val gapMs: Long,
+        val items: MutableList<ClickTargetParceled>
+    )
+
+    private data class StageCompileOutput(
+        val targets: List<ClickTargetParceled>,
+        val seamlessOutgoingStepIds: Set<Int>
+    )
+
+    private fun buildCompiledStages(
+        presets: List<ClickPreset>,
+        activePreset: ClickPreset,
+        liveOverrideTargets: List<ClickTarget>?,
+        executionMode: ExecutionMode,
+        settings: ClickGlobalSettings,
+        screenW: Int,
+        screenH: Int
+    ): StageCompileOutput {
+        val rawTargets = liveOverrideTargets ?: activePreset.targets
+        val globalIntervalMs = settings.defaultIntervalMs.coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS)
+        val globalPressMs = settings.defaultPressDurationMs.coerceIn(ClickTarget.MIN_PRESS_MS, ClickTarget.MAX_PRESS_MS)
+
+        fun resolveSingle(src: ClickTarget): ClickTarget {
+            val copy = src.copy()
+            copy.remapToScreen(screenW, screenH)
+            return if (copy.actionType == ActionType.TAP) {
+                copy.copy(intervalMs = globalIntervalMs, pressDurationMs = globalPressMs)
+            } else {
+                copy
+            }
+        }
+
+        if (executionMode == ExecutionMode.CONCURRENT) {
+            val list = rawTargets
+                .filter { it.enabled && it.actionType != ActionType.SUB_PRESET }
+                .map { t ->
+                    val r = resolveSingle(t)
+                    r.toParceled(
+                        stageIndex = 0,
+                        stageDurationMs = 0L,
+                        stageGapMs = r.intervalMs.coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS),
+                        stageRepeatCount = r.repeatCount
+                    )
+                }
+            return StageCompileOutput(list, emptySet())
+        }
+
+        val drafts = mutableListOf<CompiledStageDraft>()
+        var stageIdx = 0
+        for (step in rawTargets) {
+            if (!step.enabled) continue
+            if (step.actionType != ActionType.SUB_PRESET) {
+                val r = resolveSingle(step)
+                val gapMs = r.intervalMs.coerceIn(ClickTarget.MIN_STAGE_GAP_MS, ClickTarget.MAX_INTERVAL_MS)
+                drafts += CompiledStageDraft(
+                    sourceStepId = step.id,
+                    isSubPreset = false,
+                    gapMs = gapMs,
+                    items = mutableListOf(
+                        r.toParceled(
+                            stageIndex = stageIdx++,
+                            stageDurationMs = 0L,
+                            stageGapMs = gapMs,
+                            stageRepeatCount = r.repeatCount
+                        )
+                    )
+                )
+            } else {
+                val child = presets.firstOrNull {
+                    it.id == step.refPresetId &&
+                        it.id != activePreset.id &&
+                        it.executionMode == ExecutionMode.CONCURRENT
+                } ?: continue
+                val childTargets = child.targets.filter { it.enabled && it.actionType != ActionType.SUB_PRESET }
+                if (childTargets.isEmpty()) continue
+                val durMs = step.subDurationMs.coerceIn(ClickTarget.MIN_SUB_DURATION_MS, ClickTarget.MAX_SUB_DURATION_MS)
+                val gapMs = step.intervalMs.coerceIn(ClickTarget.MIN_STAGE_GAP_MS, ClickTarget.MAX_INTERVAL_MS)
+                val stRep = step.repeatCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+                val stageItems = mutableListOf<ClickTargetParceled>()
+                childTargets.forEachIndexed { childOffset, childTarget ->
+                    val r = resolveSingle(childTarget)
+                    val virtualId = 100_000 + stageIdx * 1000 + childOffset
+                    stageItems += r.copy(id = virtualId).toParceled(
+                        stageIndex = stageIdx,
+                        stageDurationMs = durMs,
+                        stageGapMs = gapMs,
+                        stageRepeatCount = stRep
+                    )
+                }
+                drafts += CompiledStageDraft(
+                    sourceStepId = step.id,
+                    isSubPreset = true,
+                    gapMs = gapMs,
+                    items = stageItems
+                )
+                stageIdx++
+            }
+        }
+
+        // Automatically pair adjacent stages where continuous HOLD/SWIPE fingers can bridge seamlessly without lifting
+        val seamlessStepIds = LinkedHashSet<Int>()
+        fun outBridgePoint(item: ClickTargetParceled, isSub: Boolean): Pair<Float, Float>? {
+            return when (item.actionType) {
+                ActionType.HOLD.code -> {
+                    val continuous = if (isSub) item.repeatCount == 0 else item.repeatCount >= 1
+                    if (continuous) Pair(item.x, item.y) else null
+                }
+                ActionType.SWIPE.code -> {
+                    val continuous = if (isSub) item.repeatCount == 1 else item.repeatCount >= 1
+                    if (continuous) Pair(item.endX, item.endY) else null
+                }
+                else -> null
+            }
+        }
+
+        fun inBridgePoint(item: ClickTargetParceled, isSub: Boolean): Pair<Float, Float>? {
+            return when (item.actionType) {
+                ActionType.HOLD.code -> {
+                    val continuous = if (isSub) item.repeatCount == 0 else item.repeatCount >= 1
+                    if (continuous) Pair(item.x, item.y) else null
+                }
+                ActionType.SWIPE.code -> {
+                    val continuous = if (isSub) item.repeatCount == 1 else item.repeatCount >= 1
+                    if (continuous) Pair(item.x, item.y) else null
+                }
+                else -> null
+            }
+        }
+
+        var nextHoldLinkId = 1
+        if (drafts.isNotEmpty()) {
+            for (s in drafts.indices) {
+                val cur = drafts[s]
+                if (cur.gapMs > ClickTarget.SEAMLESS_HOLD_GAP_MS) continue
+                val nextIdx = (s + 1) % drafts.size
+                if (drafts.size == 1 && !cur.isSubPreset) continue
+                val next = drafts[nextIdx]
+
+                val curCandidates = cur.items.mapNotNull { item ->
+                    outBridgePoint(item, cur.isSubPreset)?.let { pt -> Pair(item, pt) }
+                }
+                val nextCandidates = next.items.mapNotNull { item ->
+                    if (item.holdInId != 0) null
+                    else inBridgePoint(item, next.isSubPreset)?.let { pt -> Pair(item, pt) }
+                }
+                if (curCandidates.isEmpty() || nextCandidates.isEmpty()) continue
+
+                val usedNext = HashSet<Int>()
+                var stageMerged = false
+                for ((u, outPt) in curCandidates) {
+                    var bestIdx = -1
+                    var bestDist = ClickTarget.SEAMLESS_HOLD_DIST_PX
+                    for (j in nextCandidates.indices) {
+                        if (j in usedNext) continue
+                        val (_, inPt) = nextCandidates[j]
+                        val dist = kotlin.math.hypot((outPt.first - inPt.first).toDouble(), (outPt.second - inPt.second).toDouble()).toFloat()
+                        if (dist <= bestDist) {
+                            bestDist = dist
+                            bestIdx = j
+                        }
+                    }
+                    if (bestIdx >= 0) {
+                        usedNext += bestIdx
+                        val linkId = nextHoldLinkId++
+                        u.holdOutId = linkId
+                        nextCandidates[bestIdx].first.holdInId = linkId
+                        stageMerged = true
+                    }
+                }
+                if (stageMerged) {
+                    seamlessStepIds += cur.sourceStepId
+                }
+            }
+        }
+
+        val compiled = drafts.flatMap { it.items }
+        return StageCompileOutput(compiled, seamlessStepIds)
+    }
+
+    fun findSeamlessMergeStepIds(
+        presets: List<ClickPreset>,
+        activePreset: ClickPreset,
+        screenW: Int,
+        screenH: Int
+    ): Set<Int> {
+        if (activePreset.executionMode != ExecutionMode.SEQUENTIAL || activePreset.targets.isEmpty()) {
+            return emptySet()
+        }
+        return buildCompiledStages(
+            presets = presets,
+            activePreset = activePreset,
+            liveOverrideTargets = null,
+            executionMode = ExecutionMode.SEQUENTIAL,
+            settings = ClickGlobalSettings(),
+            screenW = screenW,
+            screenH = screenH
+        ).seamlessOutgoingStepIds
+    }
+
+    fun compileTargetsForExecution(
+        presets: List<ClickPreset>,
+        activePreset: ClickPreset,
+        liveOverrideTargets: List<ClickTarget>?,
+        executionMode: ExecutionMode,
+        settings: ClickGlobalSettings,
+        screenW: Int,
+        screenH: Int
+    ): List<ClickTargetParceled> {
+        return buildCompiledStages(
+            presets = presets,
+            activePreset = activePreset,
+            liveOverrideTargets = liveOverrideTargets,
+            executionMode = executionMode,
+            settings = settings,
+            screenW = screenW,
+            screenH = screenH
+        ).targets
     }
 
     fun applyGlobalTapSettingsToAllPresets(
@@ -685,7 +1060,12 @@ object ClickConfigStore {
         val currentActive = getActivePresetId(context)
         presets.removeAt(idx)
         val nextActive = if (currentActive == presetId) {
-            presets[idx.coerceAtMost(presets.lastIndex)].id
+            val idxCandidate = presets[idx.coerceAtMost(presets.lastIndex)]
+            if (!idxCandidate.isFrozen) {
+                idxCandidate.id
+            } else {
+                presets.firstOrNull { !it.isFrozen }?.id ?: idxCandidate.id
+            }
         } else {
             currentActive
         }
@@ -693,24 +1073,134 @@ object ClickConfigStore {
         return true
     }
 
+    fun deletePresetsBatch(context: Context, presetIds: Set<String>): Int {
+        if (presetIds.isEmpty()) return 0
+        val presets = loadPresets(context)
+        val remaining = presets.filter { it.id !in presetIds }
+        if (remaining.isEmpty()) return 0
+        val deletedCount = presets.size - remaining.size
+        if (deletedCount <= 0) return 0
+        val currentActive = getActivePresetId(context)
+        val nextActive = if (remaining.any { it.id == currentActive }) {
+            currentActive
+        } else {
+            remaining.firstOrNull { !it.isFrozen }?.id ?: remaining.first().id
+        }
+        persistPresetsInternal(context, remaining, nextActive)
+        return deletedCount
+    }
+
+    fun createEmptyPresetsBatch(
+        context: Context,
+        count: Int,
+        executionMode: ExecutionMode = ExecutionMode.CONCURRENT
+    ): List<ClickPreset> {
+        val safeCount = count.coerceIn(1, 50)
+        val presets = loadPresets(context)
+        val existingIds = presets.map { it.id }.toMutableSet()
+        val existingNames = presets.map { it.name }.toMutableSet()
+        var seq = presets.size + 1
+        var nameNum = presets.size + 1
+        val created = mutableListOf<ClickPreset>()
+        repeat(safeCount) {
+            while ("preset_$seq" in existingIds) seq++
+            val newId = "preset_$seq"
+            existingIds += newId
+            while ("方案 $nameNum" in existingNames) nameNum++
+            val name = "方案 $nameNum"
+            existingNames += name
+            val p = ClickPreset(
+                id = newId,
+                name = name,
+                executionMode = executionMode,
+                targets = mutableListOf()
+            )
+            presets += p
+            created += p
+        }
+        persistPresetsInternal(context, presets, created.first().id)
+        return created
+    }
+
+    fun freezePresetsBatch(context: Context, presetIds: Set<String>): Int {
+        if (presetIds.isEmpty()) return 0
+        val presets = loadPresets(context)
+        var changed = 0
+        for (preset in presets) {
+            if (preset.id in presetIds && !preset.isFrozen) {
+                preset.name = ClickPreset.freezeName(preset.name)
+                changed++
+            }
+        }
+        if (changed > 0) {
+            val currentActive = getActivePresetId(context)
+            val activeObj = presets.firstOrNull { it.id == currentActive }
+            val nextActive = if (activeObj == null || activeObj.isFrozen) {
+                presets.firstOrNull { !it.isFrozen }?.id ?: currentActive
+            } else {
+                currentActive
+            }
+            persistPresetsInternal(context, presets, nextActive)
+        }
+        return changed
+    }
+
+    fun unfreezePresetsBatch(context: Context, presetIds: Set<String>): Int {
+        if (presetIds.isEmpty()) return 0
+        val presets = loadPresets(context)
+        var changed = 0
+        for (preset in presets) {
+            if (preset.id in presetIds && preset.isFrozen) {
+                preset.name = ClickPreset.unfreezeName(preset.name)
+                changed++
+            }
+        }
+        if (changed > 0) {
+            persistPresetsInternal(context, presets, getActivePresetId(context))
+        }
+        return changed
+    }
+
     fun switchToNextPreset(context: Context): Triple<Int, Int, ClickPreset> {
         val presets = loadPresets(context)
         val activeId = getActivePresetId(context)
-        val currentIdx = presets.indexOfFirst { it.id == activeId }.coerceAtLeast(0)
-        val nextIdx = (currentIdx + 1) % presets.size
-        val nextPreset = presets[nextIdx]
+        val switchable = presets.filter { !it.isFrozen }.ifEmpty { presets }
+        val currentSwitchIdx = switchable.indexOfFirst { it.id == activeId }
+        val nextPreset = if (currentSwitchIdx >= 0) {
+            switchable[(currentSwitchIdx + 1) % switchable.size]
+        } else {
+            switchable.first()
+        }
         persistPresetsInternal(context, presets, nextPreset.id)
-        return Triple(nextIdx, presets.size, nextPreset)
+        val fullIdx = presets.indexOfFirst { it.id == nextPreset.id }.coerceAtLeast(0)
+        return Triple(fullIdx, presets.size, nextPreset)
     }
 
     fun exportPresetToJson(preset: ClickPreset): String {
         val obj = JSONObject().apply {
-            put("schema", "zerointerrupt.preset.v2")
+            put("schema", "zerointerrupt.preset.v3")
             put("name", preset.name)
             put("executionMode", preset.executionMode.code)
-            put("presetLoopCount", preset.presetLoopCount.coerceIn(ClickPreset.MIN_LOOP_COUNT, ClickPreset.MAX_LOOP_COUNT))
-            put("presetDurationSec", preset.presetDurationSec.coerceIn(ClickPreset.MIN_DURATION_SEC, ClickPreset.MAX_DURATION_SEC))
             put("targets", targetsToJsonArray(preset.targets))
+        }
+        return obj.toString(2)
+    }
+
+    fun exportPresetsBundleToJson(presets: List<ClickPreset>, activePresetId: String): String {
+        val arr = JSONArray()
+        for (preset in presets) {
+            arr.put(JSONObject().apply {
+                put("id", preset.id)
+                put("name", preset.name)
+                put("executionMode", preset.executionMode.code)
+                put("targets", targetsToJsonArray(preset.targets))
+            })
+        }
+        val obj = JSONObject().apply {
+            put("schema", "zerointerrupt.presets.bundle.v1")
+            put("appVersion", BuildConfig.VERSION_NAME)
+            put("activePresetId", activePresetId)
+            put("presets", arr)
         }
         return obj.toString(2)
     }
@@ -726,24 +1216,19 @@ object ClickConfigStore {
             if (trimmed.isEmpty()) return null
             val name: String
             val execMode: ExecutionMode
-            val loopCount: Int
-            val durationSec: Int
             val targets: MutableList<ClickTarget>
             if (trimmed.startsWith("[")) {
                 name = "导入方案"
                 execMode = ExecutionMode.CONCURRENT
-                loopCount = 0
-                durationSec = 0
-                targets = jsonArrayToTargets(JSONArray(trimmed))
+                targets = jsonArrayToTargets(JSONArray(trimmed), defaultRepeat = 0)
             } else {
                 val obj = JSONObject(trimmed)
                 name = obj.optString("name", "").ifBlank { "导入方案" }
                 execMode = ExecutionMode.fromCode(obj.optInt("executionMode", 0))
-                loopCount = obj.optInt("presetLoopCount", 0)
-                    .coerceIn(ClickPreset.MIN_LOOP_COUNT, ClickPreset.MAX_LOOP_COUNT)
-                durationSec = obj.optInt("presetDurationSec", 0)
-                    .coerceIn(ClickPreset.MIN_DURATION_SEC, ClickPreset.MAX_DURATION_SEC)
-                targets = jsonArrayToTargets(obj.optJSONArray("targets"))
+                targets = jsonArrayToTargets(
+                    obj.optJSONArray("targets"),
+                    defaultRepeat = ClickTarget.defaultRepeatFor(execMode)
+                )
             }
             targets.forEach { it.remapToScreen(screenW, screenH) }
             createPreset(
@@ -751,13 +1236,256 @@ object ClickConfigStore {
                 name = name,
                 initialTargets = targets,
                 executionMode = execMode,
-                activate = true,
-                presetLoopCount = loopCount,
-                presetDurationSec = durationSec
+                activate = true
             )
         } catch (_: Throwable) {
             null
         }
+    }
+
+    fun importPresetsBatchFromJson(
+        context: Context,
+        rawJson: String,
+        screenW: Int,
+        screenH: Int
+    ): List<ClickPreset> {
+        val trimmed = rawJson.trim()
+        if (trimmed.isEmpty()) return emptyList()
+        return try {
+            val rawArray: JSONArray
+            var desiredActiveOldId = ""
+            if (trimmed.startsWith("{")) {
+                val obj = JSONObject(trimmed)
+                val presetsArr = obj.optJSONArray("presets")
+                if (presetsArr != null) {
+                    rawArray = presetsArr
+                    desiredActiveOldId = obj.optString("activePresetId", "")
+                } else {
+                    val single = importPresetFromJson(context, trimmed, screenW, screenH)
+                    return if (single != null) listOf(single) else emptyList()
+                }
+            } else if (trimmed.startsWith("[")) {
+                val arr = JSONArray(trimmed)
+                if (arr.length() == 0) return emptyList()
+                val firstObj = arr.optJSONObject(0)
+                val looksLikePresetList = firstObj != null && (firstObj.has("targets") || firstObj.has("executionMode"))
+                if (looksLikePresetList) {
+                    rawArray = arr
+                } else {
+                    val single = importPresetFromJson(context, trimmed, screenW, screenH)
+                    return if (single != null) listOf(single) else emptyList()
+                }
+            } else {
+                return emptyList()
+            }
+
+            if (rawArray.length() == 0) return emptyList()
+            val existingPresets = loadPresets(context)
+            val existingIds = existingPresets.map { it.id }.toMutableSet()
+            var seq = existingPresets.size + 1
+            fun allocId(): String {
+                while ("preset_$seq" in existingIds) seq++
+                val id = "preset_$seq"
+                existingIds += id
+                return id
+            }
+
+            data class StagedPreset(
+                val oldId: String,
+                val newId: String,
+                val name: String,
+                val mode: ExecutionMode,
+                val targets: MutableList<ClickTarget>
+            )
+
+            val staged = mutableListOf<StagedPreset>()
+            val oldToNewId = HashMap<String, String>()
+            for (i in 0 until rawArray.length()) {
+                val item = rawArray.optJSONObject(i) ?: continue
+                val oldId = item.optString("id", "").trim()
+                val newId = allocId()
+                if (oldId.isNotEmpty()) {
+                    oldToNewId[oldId] = newId
+                }
+                val execMode = ExecutionMode.fromCode(item.optInt("executionMode", 0))
+                val targets = jsonArrayToTargets(
+                    item.optJSONArray("targets"),
+                    defaultRepeat = ClickTarget.defaultRepeatFor(execMode)
+                )
+                targets.forEach { it.remapToScreen(screenW, screenH) }
+                val cleanName = item.optString("name", "").trim()
+                    .ifEmpty { "导入方案 ${existingPresets.size + staged.size + 1}" }
+                staged += StagedPreset(oldId, newId, cleanName, execMode, targets)
+            }
+            if (staged.isEmpty()) return emptyList()
+
+            val imported = staged.map { s ->
+                val remappedTargets = s.targets.mapIndexed { idx, t ->
+                    val resolvedRef = if (t.actionType == ActionType.SUB_PRESET && t.refPresetId.isNotBlank()) {
+                        oldToNewId[t.refPresetId] ?: t.refPresetId
+                    } else {
+                        t.refPresetId
+                    }
+                    t.copy(id = idx + 1, index = idx + 1, refPresetId = resolvedRef).apply {
+                        remapToScreen(screenW, screenH)
+                    }
+                }.toMutableList()
+                ClickPreset(
+                    id = s.newId,
+                    name = s.name,
+                    executionMode = s.mode,
+                    targets = remappedTargets
+                )
+            }
+
+            existingPresets += imported
+            val activeNewId = oldToNewId[desiredActiveOldId] ?: imported.last().id
+            persistPresetsInternal(context, existingPresets, activeNewId)
+            imported
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
+    const val SCRIPT_TEMPLATE_EXAMPLE = """# name: 脚本方案
+# mode: seq
+tap 540 1200 24 80 1
+hold 540 1500 600 40 1
+swipe 300 1600 800 1600 280 120 1"""
+
+    fun importPresetFromScript(
+        context: Context,
+        rawInput: String,
+        screenW: Int,
+        screenH: Int
+    ): ClickPreset? {
+        val trimmed = rawInput.trim()
+        if (trimmed.isEmpty()) return null
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            if (trimmed.contains("\"presets\"")) {
+                return importPresetsBatchFromJson(context, trimmed, screenW, screenH).lastOrNull()
+            }
+            return importPresetFromJson(context, trimmed, screenW, screenH)
+        }
+
+        val presets = loadPresets(context)
+        var name = "脚本方案 ${presets.size + 1}"
+        var execMode = ExecutionMode.SEQUENTIAL
+        val parsedTargets = mutableListOf<ClickTarget>()
+        var nextId = 1
+
+        for (rawLine in trimmed.lines()) {
+            val line = rawLine.trim()
+            if (line.isEmpty()) continue
+            if (line.startsWith("#") || line.startsWith("//")) {
+                val meta = line.removePrefix("#").removePrefix("//").trim()
+                when {
+                    meta.startsWith("name:", ignoreCase = true) -> {
+                        val candidate = meta.substringAfter(":").trim()
+                        if (candidate.isNotEmpty()) name = candidate.take(24)
+                    }
+                    meta.startsWith("mode:", ignoreCase = true) -> {
+                        val m = meta.substringAfter(":").trim().lowercase()
+                        execMode = if (m.startsWith("conc") || m == "并发") {
+                            ExecutionMode.CONCURRENT
+                        } else {
+                            ExecutionMode.SEQUENTIAL
+                        }
+                    }
+                }
+                continue
+            }
+
+            val parts = line.split(Regex("[\\s,;]+")).filter { it.isNotEmpty() }
+            if (parts.isEmpty()) continue
+            val cmd = parts[0].lowercase()
+            when (cmd) {
+                "wait", "pause", "sleep" -> {
+                    val waitMs = parts.getOrNull(1)?.toLongOrNull() ?: return null
+                    val prev = parsedTargets.lastOrNull() ?: continue
+                    prev.intervalMs = waitMs.coerceIn(ClickTarget.MIN_STAGE_GAP_MS, ClickTarget.MAX_INTERVAL_MS)
+                }
+                "click" -> {
+                    val x = parts.getOrNull(1)?.toFloatOrNull() ?: return null
+                    val y = parts.getOrNull(2)?.toFloatOrNull() ?: return null
+                    val rep = (parts.getOrNull(3)?.toIntOrNull() ?: ClickTarget.defaultRepeatFor(execMode))
+                        .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+                    val t = ClickTarget(
+                        id = nextId,
+                        index = nextId,
+                        x = x,
+                        y = y,
+                        intervalMs = ClickTarget.DEFAULT_INTERVAL_MS,
+                        pressDurationMs = ClickTarget.DEFAULT_PRESS_DURATION_MS,
+                        actionType = ActionType.TAP,
+                        repeatCount = rep
+                    ).apply { setStartPixel(x, y, screenW, screenH) }
+                    parsedTargets += t
+                    nextId++
+                }
+                "tap", "hold" -> {
+                    val x = parts.getOrNull(1)?.toFloatOrNull() ?: return null
+                    val y = parts.getOrNull(2)?.toFloatOrNull() ?: return null
+                    val defaultDur = if (cmd == "hold") 500L else ClickTarget.DEFAULT_PRESS_DURATION_MS
+                    val pressMs = (parts.getOrNull(3)?.toLongOrNull() ?: defaultDur)
+                        .coerceIn(ClickTarget.MIN_PRESS_MS, ClickTarget.MAX_PRESS_MS)
+                    val gapMs = (parts.getOrNull(4)?.toLongOrNull() ?: ClickTarget.DEFAULT_INTERVAL_MS)
+                        .coerceIn(ClickTarget.MIN_STAGE_GAP_MS, ClickTarget.MAX_INTERVAL_MS)
+                    val rep = (parts.getOrNull(5)?.toIntOrNull() ?: ClickTarget.defaultRepeatFor(execMode))
+                        .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+                    val t = ClickTarget(
+                        id = nextId,
+                        index = nextId,
+                        x = x,
+                        y = y,
+                        intervalMs = gapMs,
+                        pressDurationMs = pressMs,
+                        actionType = ActionType.HOLD,
+                        repeatCount = rep
+                    ).apply { setStartPixel(x, y, screenW, screenH) }
+                    parsedTargets += t
+                    nextId++
+                }
+                "swipe" -> {
+                    val x1 = parts.getOrNull(1)?.toFloatOrNull() ?: return null
+                    val y1 = parts.getOrNull(2)?.toFloatOrNull() ?: return null
+                    val x2 = parts.getOrNull(3)?.toFloatOrNull() ?: return null
+                    val y2 = parts.getOrNull(4)?.toFloatOrNull() ?: return null
+                    val durMs = (parts.getOrNull(5)?.toLongOrNull() ?: ClickTarget.DEFAULT_SWIPE_DURATION_MS)
+                        .coerceIn(ClickTarget.MIN_SWIPE_MS, ClickTarget.MAX_SWIPE_MS)
+                    val gapMs = (parts.getOrNull(6)?.toLongOrNull() ?: ClickTarget.DEFAULT_INTERVAL_MS)
+                        .coerceIn(ClickTarget.MIN_STAGE_GAP_MS, ClickTarget.MAX_INTERVAL_MS)
+                    val rep = (parts.getOrNull(7)?.toIntOrNull() ?: ClickTarget.defaultRepeatFor(execMode))
+                        .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+                    val t = ClickTarget(
+                        id = nextId,
+                        index = nextId,
+                        x = x1,
+                        y = y1,
+                        intervalMs = gapMs,
+                        actionType = ActionType.SWIPE,
+                        endX = x2,
+                        endY = y2,
+                        swipeDurationMs = durMs,
+                        repeatCount = rep
+                    ).apply {
+                        setStartPixel(x1, y1, screenW, screenH)
+                        setEndPixel(x2, y2, screenW, screenH)
+                    }
+                    parsedTargets += t
+                    nextId++
+                }
+                else -> return null
+            }
+        }
+        if (parsedTargets.isEmpty()) return null
+        return createPreset(
+            context = context,
+            name = name,
+            initialTargets = parsedTargets,
+            executionMode = execMode,
+            activate = true
+        )
     }
 
     fun loadTargets(context: Context): MutableList<ClickTarget> =

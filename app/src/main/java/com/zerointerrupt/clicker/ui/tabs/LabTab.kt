@@ -8,6 +8,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -94,15 +95,15 @@ fun LabTab(
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "深色模式",
+                        text = "应用外观",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold
                     )
                     ExpressiveConnectedGroup(
                         options = listOf(
                             ExpressiveOption(ClickGlobalSettings.THEME_SYSTEM, "跟随系统"),
-                            ExpressiveOption(ClickGlobalSettings.THEME_LIGHT, "浅色"),
-                            ExpressiveOption(ClickGlobalSettings.THEME_DARK, "深色")
+                            ExpressiveOption(ClickGlobalSettings.THEME_DARK, "深色"),
+                            ExpressiveOption(ClickGlobalSettings.THEME_LIGHT, "浅色")
                         ),
                         selectedValue = state.themeMode,
                         onSelect = callbacks.onThemeModeChange,
@@ -115,6 +116,26 @@ fun LabTab(
                     checked = state.dynamicColor,
                     onCheckedChange = callbacks.onDynamicColorChange
                 )
+
+                HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "桌面图标",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    ExpressiveConnectedGroup(
+                        options = listOf(
+                            ExpressiveOption(ClickGlobalSettings.LAUNCHER_SYSTEM, "跟随系统"),
+                            ExpressiveOption(ClickGlobalSettings.LAUNCHER_DARK, "深色"),
+                            ExpressiveOption(ClickGlobalSettings.LAUNCHER_LIGHT, "浅色")
+                        ),
+                        selectedValue = state.launcherIconMode,
+                        onSelect = callbacks.onLauncherIconModeChange,
+                        height = 42.dp
+                    )
+                }
 
                 HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
 
@@ -159,16 +180,14 @@ fun LabTab(
         ExpressiveCard(
             modifier = Modifier
                 .clip(RoundedCornerShape(24.dp))
-                .clickable {
+                .clickable(enabled = !state.proModeEnabled) {
                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    if (!state.proModeEnabled) {
-                        val next = versionTapCount + 1
-                        if (next >= 7) {
-                            versionTapCount = 0
-                            callbacks.onProModeChange(true)
-                        } else {
-                            versionTapCount = next
-                        }
+                    val next = versionTapCount + 1
+                    if (next >= 7) {
+                        versionTapCount = 0
+                        callbacks.onProModeChange(true)
+                    } else {
+                        versionTapCount = next
                     }
                 }
         ) {
@@ -192,7 +211,11 @@ fun LabTab(
                     )
                     Column {
                         Text(
-                            text = "版本 v${state.appVersionName} · 极客模式",
+                            text = if (state.proModeEnabled) {
+                                "版本 v${state.appVersionName} · 专业模式"
+                            } else {
+                                "版本 v${state.appVersionName}"
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Bold
                         )
@@ -206,13 +229,17 @@ fun LabTab(
                     }
                 }
 
-                CheckSwitch(
-                    checked = state.proModeEnabled,
-                    onCheckedChange = { enabled ->
-                        versionTapCount = 0
-                        callbacks.onProModeChange(enabled)
-                    }
-                )
+                if (state.proModeEnabled) {
+                    CheckSwitch(
+                        checked = true,
+                        onCheckedChange = { enabled ->
+                            if (!enabled) {
+                                versionTapCount = 0
+                                callbacks.onProModeChange(false)
+                            }
+                        }
+                    )
+                }
             }
         }
 

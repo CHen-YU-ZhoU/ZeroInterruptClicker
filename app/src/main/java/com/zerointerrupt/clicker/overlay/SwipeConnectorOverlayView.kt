@@ -6,28 +6,38 @@ import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Typeface
 import android.view.View
 import com.zerointerrupt.clicker.model.ActionType
 import com.zerointerrupt.clicker.model.ClickTarget
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 /**
- * Full-screen non-touchable overlay drawing dashed directional vectors for SWIPE gestures.
+ * Full-screen non-touchable overlay layer.
+ *
+ * When unlocked, draws dashed directional vectors for SWIPE gestures underneath draggable anchors.
+ * When locked (including during automated playback), renders BOTH SWIPE vectors and all gesture
+ * anchors in this single WindowManager surface so Android 12+ BLOCK_UNTRUSTED touch-occlusion
+ * opacity never compounds across stacked overlay windows or breaks cross-app / desktop touches.
  */
 class SwipeConnectorOverlayView(context: Context) : View(context) {
 
-    private data class SwipeSegment(
-        val x1: Float,
-        val y1: Float,
-        val x2: Float,
-        val y2: Float,
+    private data class DrawNode(
+        val indexNumber: Int,
+        val actionType: ActionType,
+        val x: Float,
+        val y: Float,
+        val endX: Float,
+        val endY: Float,
+        val intervalMs: Long,
         val enabled: Boolean
     )
 
-    private var segments: List<SwipeSegment> = emptyList()
+    private var nodes: List<DrawNode> = emptyList()
     private var running: Boolean = false
     private var locked: Boolean = false
 
@@ -38,46 +48,113 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
         strokeCap = Paint.Cap.ROUND
         pathEffect = DashPathEffect(floatArrayOf(8f * d, 5f * d), 0f)
     }
+    private val solidCurvePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.6f * d
+        strokeCap = Paint.Cap.ROUND
+    }
     private val arrowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
     }
     private val arrowPath = Path()
 
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val outerRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.2f * d
+    }
+    private val endRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.0f * d
+        pathEffect = DashPathEffect(floatArrayOf(4f * d, 3f * d), 0f)
+    }
+    private val secondaryRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.6f * d
+    }
+    private val crosshairPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.6f * d
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val centerDotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        textSize = 13f * d
+        setShadowLayer(2f * d, 0f, 1f, 0xCC000000.toInt())
+    }
+    private val endTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        textSize = 11f * d
+        setShadowLayer(2f * d, 0f, 1f, 0xCC000000.toInt())
+    }
+
     fun updateSwipes(targets: List<ClickTarget>, isRunning: Boolean, isLocked: Boolean) {
         running = isRunning
         locked = isLocked
-        segments = targets
-            .filter { it.actionType == ActionType.SWIPE }
-            .map { SwipeSegment(it.x, it.y, it.endX, it.endY, it.enabled) }
+        nodes = targets
+            .filter { it.actionType != ActionType.SUB_PRESET }
+            .map {
+                DrawNode(
+                    indexNumber = it.index,
+                    actionType = it.actionType,
+                    x = it.x,
+                    y = it.y,
+                    endX = it.endX,
+                    endY = it.endY,
+                    intervalMs = it.intervalMs,
+                    enabled = it.enabled
+                )
+            }
         invalidate()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (segments.isEmpty()) return
+        if (nodes.isEmpty()) return
 
-        for (seg in segments) {
-            val dist = hypot((seg.x2 - seg.x1).toDouble(), (seg.y2 - seg.y1).toDouble()).toFloat()
+        val denseMode = nodes.size > 12
+
+        // Layer 1: Draw SWIPE vector lines / arrows
+        for (i in nodes.indices) {
+            val node = nodes[i]
+            if (node.actionType != ActionType.SWIPE) continue
+            val dist = hypot((node.endX - node.x).toDouble(), (node.endY - node.y).toDouble()).toFloat()
             if (dist < 4f) continue
 
             val baseColor = when {
-                !seg.enabled -> Color.parseColor("#64748B")
+                !node.enabled -> Color.parseColor("#64748B")
                 running -> Color.parseColor("#00E676")
                 else -> Color.parseColor("#7C4DFF")
             }
-            val alpha = if (locked) 130 else 220
+            val vecAlpha = if (locked) 210 else 220
+
+            if (denseMode) {
+                solidCurvePaint.color = baseColor
+                solidCurvePaint.alpha = vecAlpha
+                canvas.drawLine(node.x, node.y, node.endX, node.endY, solidCurvePaint)
+                continue
+            }
 
             linePaint.color = baseColor
-            linePaint.alpha = alpha
+            linePaint.alpha = vecAlpha
             arrowPaint.color = baseColor
-            arrowPaint.alpha = alpha
+            arrowPaint.alpha = vecAlpha
 
-            canvas.drawLine(seg.x1, seg.y1, seg.x2, seg.y2, linePaint)
+            canvas.drawLine(node.x, node.y, node.endX, node.endY, linePaint)
 
-            val angle = atan2((seg.y2 - seg.y1).toDouble(), (seg.x2 - seg.x1).toDouble())
+            val angle = atan2((node.endY - node.y).toDouble(), (node.endX - node.x).toDouble())
             val tipBack = 14f * d
-            val tx = seg.x2 - (cos(angle) * tipBack).toFloat()
-            val ty = seg.y2 - (sin(angle) * tipBack).toFloat()
+            val tx = node.endX - (cos(angle) * tipBack).toFloat()
+            val ty = node.endY - (sin(angle) * tipBack).toFloat()
             val headLen = 10f * d
             val spread = Math.toRadians(28.0)
 
@@ -93,6 +170,94 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
             )
             arrowPath.close()
             canvas.drawPath(arrowPath, arrowPaint)
+        }
+
+        // When unlocked, individual draggable AnchorPointView windows draw all rings/handles above this layer
+        if (!locked) return
+
+        // Layer 2: Unified locked anchor rendering (single WindowManager window = zero alpha stacking)
+        val ringAlphaScale = if (running) 0.78f else 0.94f
+        val radius = 19f * d
+        val endRadius = 13.5f * d
+        val innerTick = radius + 1.5f * d
+        val outerTick = radius + 5.0f * d
+        val fontMetrics = textPaint.fontMetrics
+        val endFontMetrics = endTextPaint.fontMetrics
+
+        for (i in nodes.indices) {
+            val node = nodes[i]
+            val accentColor = when {
+                !node.enabled -> Color.parseColor("#64748B")
+                running -> Color.parseColor("#00E676")
+                node.actionType == ActionType.SWIPE -> Color.parseColor("#7C4DFF")
+                node.actionType == ActionType.HOLD -> Color.parseColor("#FF9100")
+                else -> Color.parseColor("#00E5FF")
+            }
+
+            // Skip redundant intermediate vertex rings for dense continuous curved trajectories
+            val prev = nodes.getOrNull(i - 1)
+            val isContinuousMidKnot = denseMode &&
+                node.actionType == ActionType.SWIPE &&
+                prev != null &&
+                prev.actionType == ActionType.SWIPE &&
+                prev.intervalMs <= 80L &&
+                hypot((node.x - prev.endX).toDouble(), (node.y - prev.endY).toDouble()) <= 20.0
+
+            if (isContinuousMidKnot) {
+                centerDotPaint.color = accentColor
+                centerDotPaint.alpha = (210 * ringAlphaScale).roundToInt()
+                canvas.drawCircle(node.x, node.y, 3.2f * d, centerDotPaint)
+            } else {
+                fillPaint.color = accentColor
+                fillPaint.alpha = 42
+                outerRingPaint.color = accentColor
+                outerRingPaint.alpha = (255 * ringAlphaScale).roundToInt()
+                crosshairPaint.color = accentColor
+                crosshairPaint.alpha = (210 * ringAlphaScale).roundToInt()
+
+                canvas.drawCircle(node.x, node.y, radius, fillPaint)
+                canvas.drawCircle(node.x, node.y, radius, outerRingPaint)
+
+                if (node.actionType == ActionType.HOLD && node.enabled) {
+                    secondaryRingPaint.color = accentColor
+                    secondaryRingPaint.alpha = (180 * ringAlphaScale).roundToInt()
+                    canvas.drawCircle(node.x, node.y, radius - 4.2f * d, secondaryRingPaint)
+                }
+
+                canvas.drawLine(node.x, node.y - outerTick, node.x, node.y - innerTick, crosshairPaint)
+                canvas.drawLine(node.x, node.y + innerTick, node.x, node.y + outerTick, crosshairPaint)
+                canvas.drawLine(node.x - outerTick, node.y, node.x - innerTick, node.y, crosshairPaint)
+                canvas.drawLine(node.x + innerTick, node.y, node.x + outerTick, node.y, crosshairPaint)
+
+                centerDotPaint.color = accentColor
+                centerDotPaint.alpha = 210
+                canvas.drawCircle(node.x, node.y, 2.2f * d, centerDotPaint)
+
+                textPaint.alpha = (255 * ringAlphaScale).roundToInt()
+                val textY = node.y - (fontMetrics.ascent + fontMetrics.descent) * 0.5f
+                canvas.drawText(node.indexNumber.toString(), node.x, textY, textPaint)
+            }
+
+            if (node.actionType == ActionType.SWIPE) {
+                val next = nodes.getOrNull(i + 1)
+                val seamlesslyContinues = node.intervalMs <= 80L &&
+                    next != null &&
+                    (next.actionType == ActionType.SWIPE || next.actionType == ActionType.HOLD) &&
+                    hypot((next.x - node.endX).toDouble(), (next.y - node.endY).toDouble()) <= 20.0
+                if (!seamlesslyContinues) {
+                    fillPaint.color = accentColor
+                    fillPaint.alpha = 36
+                    endRingPaint.color = accentColor
+                    endRingPaint.alpha = (255 * ringAlphaScale).roundToInt()
+
+                    canvas.drawCircle(node.endX, node.endY, endRadius, fillPaint)
+                    canvas.drawCircle(node.endX, node.endY, endRadius, endRingPaint)
+
+                    endTextPaint.alpha = (255 * ringAlphaScale).roundToInt()
+                    val ty = node.endY - (endFontMetrics.ascent + endFontMetrics.descent) * 0.5f
+                    canvas.drawText("终", node.endX, ty, endTextPaint)
+                }
+            }
         }
     }
 }

@@ -137,6 +137,9 @@ class OverlayService : Service(), ControlBarView.Listener {
 
     private var tunePanelView: View? = null
     private var tunePanelLp: WindowManager.LayoutParams? = null
+    private var macroRecordOverlay: MacroRecordOverlay? = null
+    private var normalOverlayAttached: Boolean = false
+    private var resumeOverlayAfterRecord: Boolean = false
 
     private val targets = mutableListOf<ClickTarget>()
     private val anchorViews = LinkedHashMap<Int, AnchorPointView>()
@@ -148,11 +151,11 @@ class OverlayService : Service(), ControlBarView.Listener {
     private var nextTargetId: Int = 1
     private var activePresetId: String = ""
     private var activeExecutionMode: ExecutionMode = ExecutionMode.CONCURRENT
-    private var activePresetLoopCount: Int = 0
-    private var activePresetDurationSec: Int = 0
     private var lockedAlpha: Float = ClickGlobalSettings.DEFAULT_LOCKED_ALPHA
     private var isLocked: Boolean = false
+    private var lastAutoLockOnStart: Boolean = true
     private var isClicking: Boolean = false
+    private var pendingAutoLockStartRunnable: Runnable? = null
     private var engineMode: Int = TouchMuxUserService.MODE_IDLE
 
     private var engineCollectJob: Job? = null
@@ -176,18 +179,13 @@ class OverlayService : Service(), ControlBarView.Listener {
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         themeColors = OverlayThemeColors.resolve(this)
         dockRight = ClickConfigStore.loadControlBarDockRight(this)
-        lockedAlpha = ClickConfigStore.loadSettings(this).lockedAnchorAlpha
+        val initialSettings = ClickConfigStore.loadSettings(this)
+        lockedAlpha = initialSettings.lockedAnchorAlpha
             .coerceIn(ClickGlobalSettings.MIN_LOCKED_ALPHA, ClickGlobalSettings.MAX_LOCKED_ALPHA)
+        lastAutoLockOnStart = initialSettings.autoLockOnStart
         ShizukuController.initialize(this)
         startForegroundWithNotification()
         displayManager.registerDisplayListener(displayListener, null)
-
-        loadInitialTargets()
-        syncSwipeConnectorLayer()
-        attachAllAnchors()
-        attachControlBar()
-        OverlayStateHub.setOverlayVisible(this, true)
-        scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
 
         engineCollectJob = serviceScope.launch {
             ShizukuController.engineSnapshot.collect { snap ->
@@ -240,19 +238,27 @@ class OverlayService : Service(), ControlBarView.Listener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP_OVERLAY -> {
+                macroRecordOverlay?.dismissAll()
+                macroRecordOverlay = null
                 stopClickingInternal()
                 stopSelf()
                 return START_NOT_STICKY
             }
+            ACTION_START_RECORDING -> {
+                enterRecordingMode()
+            }
             ACTION_STOP_CLICKING, ACTION_RPC_STOP -> {
+                ensureNormalOverlayAttached()
                 stopClickingInternal()
             }
             ACTION_RPC_START -> {
+                ensureNormalOverlayAttached()
                 if (!isClicking) {
                     onTogglePlayStop()
                 }
             }
             ACTION_RPC_SWITCH_PRESET -> {
+                ensureNormalOverlayAttached()
                 val targetId = intent.getStringExtra(EXTRA_PRESET_ID).orEmpty()
                 val targetName = intent.getStringExtra(EXTRA_PRESET_NAME).orEmpty()
                 val presets = ClickConfigStore.loadPresets(this)
@@ -272,21 +278,37 @@ class OverlayService : Service(), ControlBarView.Listener {
                 val settings = ClickConfigStore.loadSettings(this)
                 themeColors = OverlayThemeColors.resolve(this)
                 controlBarView?.applyThemeColors(themeColors)
+                macroRecordOverlay?.updateTheme(themeColors)
                 lockedAlpha = settings.lockedAnchorAlpha.coerceIn(
                     ClickGlobalSettings.MIN_LOCKED_ALPHA,
                     ClickGlobalSettings.MAX_LOCKED_ALPHA
                 )
-                reloadTargetSettingsFromStore()
-                if (tunePanelView != null) {
-                    showOrUpdateTunePanel(forceShow = true)
-                }
-                refreshLockedAlphasIfNeeded()
-                refreshControlBarState()
-                if (settings.autoCollapseBar) {
-                    scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+                if (normalOverlayAttached) {
+                    if (settings.autoLockOnStart && !lastAutoLockOnStart && !isLocked) {
+                        applyLockMode(true)
+                    }
+                    lastAutoLockOnStart = settings.autoLockOnStart
+                    reloadTargetSettingsFromStore()
+                    if (tunePanelView != null) {
+                        showOrUpdateTunePanel(forceShow = true)
+                    }
+                    refreshLockedAlphasIfNeeded()
+                    refreshControlBarState()
+                    if (settings.autoCollapseBar) {
+                        scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+                    } else {
+                        cancelAutoCollapse()
+                    }
                 } else {
-                    cancelAutoCollapse()
+                    lastAutoLockOnStart = settings.autoLockOnStart
                 }
+            }
+            else -> {
+                if (macroRecordOverlay?.isActive() == true) {
+                    macroRecordOverlay?.dismissAll()
+                    macroRecordOverlay = null
+                }
+                ensureNormalOverlayAttached()
             }
         }
         return START_STICKY
@@ -296,6 +318,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         super.onConfigurationChanged(newConfig)
         themeColors = OverlayThemeColors.resolve(this)
         controlBarView?.applyThemeColors(themeColors)
+        macroRecordOverlay?.updateTheme(themeColors)
         onScreenGeometryChanged()
         if (tunePanelView != null) {
             showOrUpdateTunePanel(forceShow = true)
@@ -304,6 +327,8 @@ class OverlayService : Service(), ControlBarView.Listener {
 
     override fun onDestroy() {
         mainHandler.removeCallbacksAndMessages(null)
+        macroRecordOverlay?.dismissAll()
+        macroRecordOverlay = null
         cancelBarSprings()
         displayManager.unregisterDisplayListener(displayListener)
         engineCollectJob?.cancel()
@@ -315,6 +340,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         removeAllAnchorWindows()
         removeSwipeConnectorLayer()
         removeControlBar()
+        normalOverlayAttached = false
         OverlayStateHub.setClickingRunning(this, false)
         OverlayStateHub.setOverlayVisible(this, false)
         serviceScope.cancel()
@@ -421,8 +447,6 @@ class OverlayService : Service(), ControlBarView.Listener {
         val preset = ClickConfigStore.getActivePreset(this)
         activePresetId = preset.id
         activeExecutionMode = preset.executionMode
-        activePresetLoopCount = preset.presetLoopCount
-        activePresetDurationSec = preset.presetDurationSec
         targets.clear()
         preset.targets.forEach { t ->
             val copy = t.copy()
@@ -439,7 +463,8 @@ class OverlayService : Service(), ControlBarView.Listener {
                 intervalMs = settings.defaultIntervalMs,
                 pressDurationMs = settings.defaultPressDurationMs,
                 microJitter = settings.defaultMicroJitter,
-                enabled = true
+                enabled = true,
+                repeatCount = ClickTarget.defaultRepeatFor(activeExecutionMode)
             )
             created.setStartPixel(metrics.widthPx * 0.5f, metrics.heightPx * 0.5f, metrics.widthPx, metrics.heightPx)
             targets += created
@@ -486,15 +511,13 @@ class OverlayService : Service(), ControlBarView.Listener {
         val metrics = ShizukuController.getDisplayScreenMetrics(this)
         val stored = preset.targets.map { t -> t.copy().also { it.remapToScreen(metrics.widthPx, metrics.heightPx) } }
         val currentSig = targets.map {
-            listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled, it.actionType, it.endX, it.endY, it.swipeDurationMs, it.repeatCount)
+            listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled, it.actionType, it.endX, it.endY, it.swipeDurationMs, it.repeatCount, it.refPresetId, it.subDurationMs)
         }
         val storedSig = stored.map {
-            listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled, it.actionType, it.endX, it.endY, it.swipeDurationMs, it.repeatCount)
+            listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled, it.actionType, it.endX, it.endY, it.swipeDurationMs, it.repeatCount, it.refPresetId, it.subDurationMs)
         }
         if (activePresetId != preset.id ||
             activeExecutionMode != preset.executionMode ||
-            activePresetLoopCount != preset.presetLoopCount ||
-            activePresetDurationSec != preset.presetDurationSec ||
             currentSig != storedSig
         ) {
             if (isClicking) {
@@ -509,8 +532,6 @@ class OverlayService : Service(), ControlBarView.Listener {
         val preset = ClickConfigStore.getActivePreset(this)
         activePresetId = preset.id
         activeExecutionMode = preset.executionMode
-        activePresetLoopCount = preset.presetLoopCount
-        activePresetDurationSec = preset.presetDurationSec
         dismissTunePanel()
         removeAllAnchorWindows()
         targets.clear()
@@ -520,7 +541,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             targets.add(copy)
         }
         nextTargetId = (targets.maxOfOrNull { it.id } ?: 0) + 1
-        selectedTargetId = targets.firstOrNull()?.id ?: -1
+        selectedTargetId = targets.firstOrNull { it.actionType != ActionType.SUB_PRESET }?.id ?: -1
         syncSwipeConnectorLayer()
         attachAllAnchors()
         refreshControlBarState()
@@ -842,10 +863,15 @@ class OverlayService : Service(), ControlBarView.Listener {
 
     private fun syncSwipeConnectorLayer() {
         val hasSwipes = targets.any { it.actionType == ActionType.SWIPE }
-        if (!hasSwipes) {
+        val hasVisibleTargets = targets.any { it.actionType != ActionType.SUB_PRESET }
+        if (!hasSwipes && !(isLocked && hasVisibleTargets)) {
             removeSwipeConnectorLayer()
             return
         }
+        val safeAlpha = lockedAlpha.coerceIn(
+            ClickGlobalSettings.MIN_LOCKED_ALPHA,
+            ClickGlobalSettings.MAX_LOCKED_ALPHA
+        )
         var view = swipeConnectorView
         if (view == null) {
             view = SwipeConnectorOverlayView(this)
@@ -854,16 +880,15 @@ class OverlayService : Service(), ControlBarView.Listener {
                 WindowManager.LayoutParams.MATCH_PARENT,
                 touchable = false
             ).apply {
-                alpha = if (isLocked) (lockedAlpha * 0.9f) else 0.95f
+                alpha = safeAlpha
             }
             windowManager.addView(view, lp)
             swipeConnectorView = view
             swipeConnectorLp = lp
         } else {
             swipeConnectorLp?.let { lp ->
-                val targetAlpha = if (isLocked) (lockedAlpha * 0.9f) else 0.95f
-                if (lp.alpha != targetAlpha) {
-                    lp.alpha = targetAlpha
+                if (lp.alpha != safeAlpha) {
+                    lp.alpha = safeAlpha
                     windowManager.updateViewLayout(view, lp)
                 }
             }
@@ -892,6 +917,7 @@ class OverlayService : Service(), ControlBarView.Listener {
     }
 
     private fun attachAllAnchors() {
+        if (isLocked) return
         for (t in targets) {
             attachSingleAnchor(t)
         }
@@ -899,6 +925,13 @@ class OverlayService : Service(), ControlBarView.Listener {
     }
 
     private fun attachSingleAnchor(target: ClickTarget) {
+        if (isLocked || target.actionType == ActionType.SUB_PRESET) {
+            anchorViews.remove(target.id)?.let { removeViewSafely(it) }
+            anchorLps.remove(target.id)
+            endAnchorViews.remove(target.id)?.let { removeViewSafely(it) }
+            endAnchorLps.remove(target.id)
+            return
+        }
         val metrics = ShizukuController.getDisplayScreenMetrics(this)
         target.remapToScreen(metrics.widthPx, metrics.heightPx)
 
@@ -1075,11 +1108,14 @@ class OverlayService : Service(), ControlBarView.Listener {
                 windowManager.updateViewLayout(view, lp)
             }
         }
+        val safeCanvasAlpha = lockedAlpha.coerceIn(
+            ClickGlobalSettings.MIN_LOCKED_ALPHA,
+            ClickGlobalSettings.MAX_LOCKED_ALPHA
+        )
         swipeConnectorView?.let { v ->
             swipeConnectorLp?.let { lp ->
-                val lineAlpha = if (isLocked) (lockedAlpha * 0.9f) else 0.95f
-                if (lp.alpha != lineAlpha) {
-                    lp.alpha = lineAlpha
+                if (lp.alpha != safeCanvasAlpha) {
+                    lp.alpha = safeCanvasAlpha
                     windowManager.updateViewLayout(v, lp)
                 }
             }
@@ -1087,34 +1123,20 @@ class OverlayService : Service(), ControlBarView.Listener {
     }
 
     /**
-     * Toggles FLAG_NOT_TOUCHABLE + Android 12+ safe window alpha on all anchors.
+     * Switches between draggable per-anchor windows (unlocked) and a single unified
+     * FLAG_NOT_TOUCHABLE overlay layer (locked) so Android 12+ BLOCK_UNTRUSTED touch-occlusion
+     * opacity never compounds across stacked overlay windows or drops cross-app / desktop touches.
      */
     private fun applyLockMode(locked: Boolean) {
         if (isLocked == locked) return
         isLocked = locked
         if (locked) {
             dismissTunePanel()
+            removeAllAnchorWindows()
+        } else {
+            syncSwipeConnectorLayer()
+            attachAllAnchors()
         }
-        val targetAlpha = if (locked) lockedAlpha else 1.0f
-
-        fun updateWindowMap(views: Map<Int, AnchorPointView>, lps: Map<Int, WindowManager.LayoutParams>) {
-            for ((id, view) in views) {
-                val lp = lps[id] ?: continue
-                val updatedFlags = if (locked) {
-                    lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                } else {
-                    lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                }
-                if (lp.flags != updatedFlags || lp.alpha != targetAlpha) {
-                    lp.flags = updatedFlags
-                    lp.alpha = targetAlpha
-                    windowManager.updateViewLayout(view, lp)
-                }
-            }
-        }
-
-        updateWindowMap(anchorViews, anchorLps)
-        updateWindowMap(endAnchorViews, endAnchorLps)
         refreshLockedAlphasIfNeeded()
         refreshAnchorVisuals()
         refreshControlBarState()
@@ -1247,13 +1269,25 @@ class OverlayService : Service(), ControlBarView.Listener {
 
     override fun onSwitchPreset() {
         val presets = ClickConfigStore.loadPresets(this)
-        if (presets.size <= 1) {
-            val only = presets.firstOrNull()
+        val switchable = presets.filter { !it.isFrozen }
+        val active = ClickConfigStore.getActivePreset(this)
+        if (switchable.isEmpty()) {
             Toast.makeText(
                 this,
-                "当前仅 1 个方案「${only?.name ?: "方案 1"}」，可在主界面新增方案",
+                "全部方案均已冻结（#开头），请在方案页解冻或去掉 # 前缀",
                 Toast.LENGTH_SHORT
             ).show()
+            scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+            return
+        }
+        if (switchable.size == 1 && switchable[0].id == active.id) {
+            val frozenCount = (presets.size - 1).coerceAtLeast(0)
+            val msg = if (frozenCount > 0) {
+                "当前仅 1 个未冻结方案「${active.name}」（其余 $frozenCount 个已冻结跳过）"
+            } else {
+                "当前仅 1 个方案「${active.name}」，可在主界面新增方案"
+            }
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
             scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
             return
         }
@@ -1330,6 +1364,15 @@ class OverlayService : Service(), ControlBarView.Listener {
     }
 
     override fun onTogglePlayStop() {
+        if (pendingAutoLockStartRunnable != null) {
+            pendingAutoLockStartRunnable?.let { mainHandler.removeCallbacks(it) }
+            pendingAutoLockStartRunnable = null
+            if (!isClicking) {
+                refreshControlBarState()
+                scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+                return
+            }
+        }
         if (isClicking) {
             stopClickingInternal()
             return
@@ -1346,13 +1389,18 @@ class OverlayService : Service(), ControlBarView.Listener {
             return
         }
 
-        // Fixed Bug 1: Respect settings.autoLockOnStart cleanly
         val settings = ClickConfigStore.loadSettings(this)
         if (!isLocked && settings.autoLockOnStart) {
             applyLockMode(true)
-            controlBarView?.postOnAnimation {
-                startClickingInternal()
-            } ?: startClickingInternal()
+            // Let WindowManager / InputDispatcher commit removal of per-anchor windows before injecting DOWN
+            val startTask = Runnable {
+                pendingAutoLockStartRunnable = null
+                if (!isClicking) {
+                    startClickingInternal()
+                }
+            }
+            pendingAutoLockStartRunnable = startTask
+            mainHandler.postDelayed(startTask, 40L)
         } else {
             startClickingInternal()
         }
@@ -1362,8 +1410,6 @@ class OverlayService : Service(), ControlBarView.Listener {
         cancelAutoCollapse()
         val snapshot = targets.map { it.copy() }
         val modeSnapshot = activeExecutionMode
-        val loopSnapshot = activePresetLoopCount
-        val durationSnapshot = activePresetDurationSec
         isClicking = true
         OverlayStateHub.setClickingRunning(this, true)
         refreshAnchorVisuals()
@@ -1372,9 +1418,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         serviceScope.launch(Dispatchers.IO) {
             val mode = ShizukuController.startClicking(
                 targets = snapshot,
-                executionMode = modeSnapshot,
-                presetLoopCount = loopSnapshot,
-                presetDurationSec = durationSnapshot
+                executionMode = modeSnapshot
             )
             withContext(Dispatchers.Main) {
                 if (mode < 0) {
@@ -1384,7 +1428,7 @@ class OverlayService : Service(), ControlBarView.Listener {
                     refreshControlBarState()
                     Toast.makeText(
                         this@OverlayService,
-                        "启动连点失败 (code=$mode)，请检查 Shizuku 状态",
+                        if (mode == -4) "当前方案没有可执行的手势节点" else "启动连点失败 (code=$mode)，请检查 Shizuku 状态",
                         Toast.LENGTH_SHORT
                     ).show()
                     scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
@@ -1398,6 +1442,8 @@ class OverlayService : Service(), ControlBarView.Listener {
     }
 
     private fun stopClickingInternal() {
+        pendingAutoLockStartRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingAutoLockStartRunnable = null
         if (!isClicking) return
         cancelAutoCollapse()
         isClicking = false
@@ -1434,7 +1480,8 @@ class OverlayService : Service(), ControlBarView.Listener {
             pressDurationMs = settings.defaultPressDurationMs,
             microJitter = settings.defaultMicroJitter,
             enabled = true,
-            actionType = ActionType.TAP
+            actionType = ActionType.TAP,
+            repeatCount = ClickTarget.defaultRepeatFor(activeExecutionMode)
         )
         newTarget.setStartPixel(sx, sy, metrics.widthPx, metrics.heightPx)
         targets += newTarget
@@ -1508,8 +1555,83 @@ class OverlayService : Service(), ControlBarView.Listener {
         }
     }
 
+    private fun ensureNormalOverlayAttached() {
+        if (normalOverlayAttached) return
+        normalOverlayAttached = true
+        val settings = ClickConfigStore.loadSettings(this)
+        isLocked = settings.autoLockOnStart
+        lastAutoLockOnStart = settings.autoLockOnStart
+        loadInitialTargets()
+        syncSwipeConnectorLayer()
+        attachAllAnchors()
+        attachControlBar()
+        OverlayStateHub.setOverlayVisible(this, true)
+        scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+    }
+
+    private fun enterRecordingMode() {
+        if (macroRecordOverlay?.isActive() == true) return
+        if (!ShizukuController.isServiceConnected()) {
+            ShizukuController.evaluateShizukuState()
+            Toast.makeText(this, "请先确保 Shizuku 服务已连接", Toast.LENGTH_SHORT).show()
+            if (!normalOverlayAttached) {
+                stopSelf()
+            }
+            return
+        }
+        if (isClicking) {
+            stopClickingInternal()
+        }
+        cancelAutoCollapse()
+        resumeOverlayAfterRecord = normalOverlayAttached
+        if (normalOverlayAttached) {
+            dismissTunePanel()
+            removeAllAnchorWindows()
+            removeSwipeConnectorLayer()
+            removeControlBar()
+            normalOverlayAttached = false
+        }
+
+        val controller = MacroRecordOverlay(
+            context = this,
+            windowManager = windowManager,
+            scope = serviceScope,
+            colors = themeColors,
+            onFinished = { savedPlan, openPresetsTab ->
+                macroRecordOverlay = null
+                if (savedPlan != null) {
+                    OverlayStateHub.bumpConfigVersion()
+                }
+                if (resumeOverlayAfterRecord) {
+                    resumeOverlayAfterRecord = false
+                    ensureNormalOverlayAttached()
+                    replaceTargetsWithActivePreset()
+                }
+                if (openPresetsTab) {
+                    startActivity(
+                        Intent(this, MainActivity::class.java).apply {
+                            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                            putExtra(MainActivity.EXTRA_OPEN_TAB, "PRESETS")
+                        }
+                    )
+                }
+                if (!normalOverlayAttached) {
+                    stopSelf()
+                }
+            }
+        )
+        macroRecordOverlay = controller
+        controller.start()
+    }
+
+    override fun onStartMacroRecord() {
+        enterRecordingMode()
+    }
+
     override fun onCloseOverlay() {
         cancelAutoCollapse()
+        macroRecordOverlay?.dismissAll()
+        macroRecordOverlay = null
         stopClickingInternal()
         stopSelf()
     }
@@ -1626,9 +1748,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             if (isClicking) {
                 ShizukuController.updateTargets(
                     targets = targets.map { it.copy() },
-                    executionMode = activeExecutionMode,
-                    presetLoopCount = activePresetLoopCount,
-                    presetDurationSec = activePresetDurationSec
+                    executionMode = activeExecutionMode
                 )
             }
         }
@@ -1637,14 +1757,10 @@ class OverlayService : Service(), ControlBarView.Listener {
     private fun pushTargetsToServiceAsync() {
         val snapshot = targets.map { it.copy() }
         val modeSnapshot = activeExecutionMode
-        val loopSnapshot = activePresetLoopCount
-        val durationSnapshot = activePresetDurationSec
         serviceScope.launch(Dispatchers.IO) {
             ShizukuController.updateTargets(
                 targets = snapshot,
-                executionMode = modeSnapshot,
-                presetLoopCount = loopSnapshot,
-                presetDurationSec = durationSnapshot
+                executionMode = modeSnapshot
             )
         }
     }
@@ -1662,8 +1778,8 @@ class OverlayService : Service(), ControlBarView.Listener {
 
     private fun showOrUpdateTunePanel(forceShow: Boolean) {
         if (!forceShow && tunePanelView == null) return
-        val target = targets.firstOrNull { it.id == selectedTargetId }
-            ?: targets.firstOrNull()?.also { selectedTargetId = it.id }
+        val target = targets.firstOrNull { it.id == selectedTargetId && it.actionType != ActionType.SUB_PRESET }
+            ?: targets.firstOrNull { it.actionType != ActionType.SUB_PRESET }?.also { selectedTargetId = it.id }
             ?: return
 
         cancelAutoCollapse()
@@ -1730,7 +1846,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         root.addView(gestureLabel)
 
         val gestureRow = LinearLayout(themedCtx).apply { orientation = LinearLayout.HORIZONTAL }
-        ActionType.entries.forEach { act ->
+        listOf(ActionType.TAP, ActionType.SWIPE, ActionType.HOLD).forEach { act ->
             gestureRow.addView(createChipButton(themedCtx, act.label, target.actionType == act, colors) {
                 if (target.actionType != act) {
                     target.actionType = act
@@ -1759,6 +1875,11 @@ class OverlayService : Service(), ControlBarView.Listener {
                 if (activeExecutionMode != mode) {
                     activeExecutionMode = mode
                     ClickConfigStore.setPresetExecutionMode(this, activePresetId, mode)
+                    if (mode == ExecutionMode.SEQUENTIAL) {
+                        for (t in targets) if (t.repeatCount == 0) t.repeatCount = 1
+                    } else {
+                        for (t in targets) if (t.actionType != ActionType.SUB_PRESET && t.repeatCount == 1) t.repeatCount = 0
+                    }
                     OverlayStateHub.bumpConfigVersion()
                     if (isClicking) pushTargetsToServiceAsync()
                     showOrUpdateTunePanel(forceShow = true)
@@ -1792,11 +1913,16 @@ class OverlayService : Service(), ControlBarView.Listener {
                 }
             }
 
+            val minIntervalForMode = if (activeExecutionMode == ExecutionMode.SEQUENTIAL) {
+                ClickTarget.MIN_STAGE_GAP_MS
+            } else {
+                ClickTarget.MIN_INTERVAL_MS
+            }
             val intervalBtnRow = LinearLayout(themedCtx).apply { orientation = LinearLayout.HORIZONTAL }
             listOf(-50L to "-50", -10L to "-10", 10L to "+10", 50L to "+50").forEach { (delta, label) ->
                 intervalBtnRow.addView(createChipButton(themedCtx, label, false, colors) {
                     target.intervalMs = (target.intervalMs + delta)
-                        .coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS)
+                        .coerceIn(minIntervalForMode, ClickTarget.MAX_INTERVAL_MS)
                     intervalValueTv.text = "循环间隔: ${target.intervalMs} ms"
                     refreshIntervalPresetHighlight()
                     persistCurrentTargets()
@@ -1809,8 +1935,14 @@ class OverlayService : Service(), ControlBarView.Listener {
                 orientation = LinearLayout.HORIZONTAL
                 setPadding(0, (5f * d).roundToInt(), 0, 0)
             }
-            listOf(10L, 30L, 80L, 200L).forEach { preset ->
-                val chip = createChipButton(themedCtx, "${preset}ms", target.intervalMs == preset, colors) {
+            val presetOptions = if (activeExecutionMode == ExecutionMode.SEQUENTIAL) {
+                listOf(0L, 30L, 80L, 200L)
+            } else {
+                listOf(10L, 30L, 80L, 200L)
+            }
+            presetOptions.forEach { preset ->
+                val label = if (preset == 0L) "无缝(0)" else "${preset}ms"
+                val chip = createChipButton(themedCtx, label, target.intervalMs == preset, colors) {
                     target.intervalMs = preset
                     intervalValueTv.text = "循环间隔: ${target.intervalMs} ms"
                     refreshIntervalPresetHighlight()
@@ -1871,9 +2003,12 @@ class OverlayService : Service(), ControlBarView.Listener {
             }
         }
 
+        fun formatRepeatLabel(count: Int): String =
+            if (count <= 0) "循环次数: 无限 (0)" else "循环次数: $count 次"
+
         // Per-node repeatCount section
         val repeatValueTv = TextView(themedCtx).apply {
-            text = "循环次数(单轮): ${target.repeatCount} 次"
+            text = formatRepeatLabel(target.repeatCount)
             setTextColor(colors.onSurfaceVariant)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             setPadding(0, (9f * d).roundToInt(), 0, (4f * d).roundToInt())
@@ -1892,7 +2027,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             repeatStepRow.addView(createChipButton(themedCtx, label, false, colors) {
                 target.repeatCount = (target.repeatCount + delta)
                     .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
-                repeatValueTv.text = "循环次数(单轮): ${target.repeatCount} 次"
+                repeatValueTv.text = formatRepeatLabel(target.repeatCount)
                 refreshRepeatPresetHighlight()
                 persistCurrentTargets()
                 if (isClicking) pushTargetsToServiceAsync()
@@ -1904,10 +2039,10 @@ class OverlayService : Service(), ControlBarView.Listener {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, (5f * d).roundToInt(), 0, 0)
         }
-        listOf(1, 3, 5, 10).forEach { presetVal ->
-            val chip = createChipButton(themedCtx, "${presetVal}次", target.repeatCount == presetVal, colors) {
+        listOf(0 to "无限", 1 to "1次", 3 to "3次", 5 to "5次").forEach { (presetVal, chipLabel) ->
+            val chip = createChipButton(themedCtx, chipLabel, target.repeatCount == presetVal, colors) {
                 target.repeatCount = presetVal
-                repeatValueTv.text = "循环次数(单轮): ${target.repeatCount} 次"
+                repeatValueTv.text = formatRepeatLabel(target.repeatCount)
                 refreshRepeatPresetHighlight()
                 persistCurrentTargets()
                 if (isClicking) pushTargetsToServiceAsync()
@@ -2033,6 +2168,7 @@ class OverlayService : Service(), ControlBarView.Listener {
 
     companion object {
         const val ACTION_START_OVERLAY = "com.zerointerrupt.clicker.ACTION_START_OVERLAY"
+        const val ACTION_START_RECORDING = "com.zerointerrupt.clicker.ACTION_START_RECORDING"
         const val ACTION_STOP_OVERLAY = "com.zerointerrupt.clicker.ACTION_STOP_OVERLAY"
         const val ACTION_STOP_CLICKING = "com.zerointerrupt.clicker.ACTION_STOP_CLICKING"
         const val ACTION_REFRESH_SETTINGS = "com.zerointerrupt.clicker.ACTION_REFRESH_SETTINGS"

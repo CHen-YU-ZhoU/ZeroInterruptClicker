@@ -51,6 +51,7 @@ class ControlBarView(
         fun onRemoveTarget()
         fun onToggleLockEdit()
         fun onToggleTunePanel()
+        fun onStartMacroRecord()
         fun onCloseOverlay()
         fun onCollapseRequested()
         fun onExpandRequested()
@@ -72,8 +73,8 @@ class ControlBarView(
 
     // Top cap + Play + Switch + Bottom cap + 3 gaps + outer vertical padding
     private val compactBarHeightPx = padPx * 2 + capHeightPx * 2 + btnSizePx * 2 + gapPx * 3
-    // Unfolded height includes 5 secondary tool buttons (+, -, lock, tune, close) each + gapPx
-    private val fullBarHeightPx = compactBarHeightPx + (btnSizePx + gapPx) * 5
+    // Unfolded height includes 6 secondary tool buttons (+, -, lock, tune, record, close) each + gapPx
+    private val fullBarHeightPx = compactBarHeightPx + (btnSizePx + gapPx) * 6
 
     private val collapsedWidthPx = (20f * density).roundToInt()
     private val collapsedHeightPx = (80f * density).roundToInt()
@@ -104,6 +105,8 @@ class ControlBarView(
     private val lockBg = ovalGradient()
     private val tuneBtn: ImageView
     private val tuneBg = ovalGradient()
+    private val recordBtn: ImageView
+    private val recordBg = ovalGradient()
     private val closeBtn: ImageView
     private val closeBg = ovalGradient()
     private val footerExpandView: ExpandToolsFooterView
@@ -165,9 +168,10 @@ class ControlBarView(
         removeBtn = createActionButton(R.drawable.ic_remove, removeBg) { listener.onRemoveTarget() }
         lockBtn = createActionButton(R.drawable.ic_lock_open, lockBg) { listener.onToggleLockEdit() }
         tuneBtn = createActionButton(R.drawable.ic_tune, tuneBg) { listener.onToggleTunePanel() }
+        recordBtn = createActionButton(R.drawable.ic_record, recordBg) { listener.onStartMacroRecord() }
         closeBtn = createActionButton(R.drawable.ic_close, closeBg) { listener.onCloseOverlay() }
 
-        listOf(addBtn, removeBtn, lockBtn, tuneBtn, closeBtn).forEach { btn ->
+        listOf(addBtn, removeBtn, lockBtn, tuneBtn, recordBtn, closeBtn).forEach { btn ->
             secondaryToolsContainer.addView(
                 btn,
                 LinearLayout.LayoutParams(btnSizePx, btnSizePx).apply {
@@ -268,7 +272,7 @@ class ControlBarView(
         }
 
         val rippleTint = ColorStateList.valueOf(newColors.ripple)
-        listOf(playStopBtn, switchPresetBtn, addBtn, removeBtn, lockBtn, tuneBtn, closeBtn).forEach { btn ->
+        listOf(playStopBtn, switchPresetBtn, addBtn, removeBtn, lockBtn, tuneBtn, recordBtn, closeBtn).forEach { btn ->
             (btn.background as? RippleDrawable)?.setColor(rippleTint)
         }
 
@@ -500,6 +504,9 @@ class ControlBarView(
             tuneBtn.setColorFilter(neutralFg)
             tuneBg.setColor(neutralBg)
         }
+
+        recordBg.setColor(ColorUtils.setAlphaComponent(colors.tertiaryContainer, 220))
+        recordBtn.setColorFilter(colors.onTertiaryContainer)
 
         closeBg.setColor(ColorUtils.setAlphaComponent(colors.errorContainer, 110))
         closeBtn.setColorFilter(colors.error)
@@ -738,11 +745,11 @@ class ControlBarView(
 
             val sign = if (dockRightState) -1f else 1f
             val wallX = if (dockRightState) w else 0f
-            val visibleW = w * (0.72f + 0.28f * expandMorph)
+            val visibleW = w
             val innerX = wallX + sign * visibleW
-            val outerCornerR = (9f + 4f * expandMorph) * density
+            val outerCornerR = 14f * density
             val wallCornerR = (4f * expandMorph) * density
-            val vPad = 1.5f * density
+            val vPad = 0f
 
             val leftX = minOf(wallX, innerX)
             val rightX = maxOf(wallX, innerX)

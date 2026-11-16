@@ -226,16 +226,10 @@ object LocalRpcServer {
                     )
                     resp.put("ok", true)
                 } else {
-                    val metrics = ShizukuController.getDisplayScreenMetrics(context)
                     val preset = ClickConfigStore.getActivePreset(context)
-                    val targets = preset.targets.map { t ->
-                        t.copy().also { it.remapToScreen(metrics.widthPx, metrics.heightPx) }
-                    }
                     val mode = ShizukuController.startClicking(
-                        targets = targets,
-                        executionMode = preset.executionMode,
-                        presetLoopCount = preset.presetLoopCount,
-                        presetDurationSec = preset.presetDurationSec
+                        targets = preset.targets,
+                        executionMode = preset.executionMode
                     )
                     resp.put("ok", mode >= 0).put("engineMode", mode)
                 }

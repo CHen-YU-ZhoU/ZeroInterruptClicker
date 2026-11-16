@@ -56,6 +56,7 @@ class MainActivity : ComponentActivity() {
     private var selfCheckTimer: CountDownTimer? = null
     private lateinit var snackbarHostState: SnackbarHostState
     private var currentActiveTab by mutableStateOf(MainTab.HOME)
+    private var requestedTab by mutableStateOf<MainTab?>(null)
 
     private var uiModel by mutableStateOf(
         MainUiState(
@@ -109,6 +110,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        handleOpenTabIntent(intent)
+        reconcileLauncherIconMode()
         ShizukuController.initialize(this)
         LocalRpcServer.syncWithSettings(this)
         syncFromStorageAndSystem()
@@ -191,10 +194,25 @@ class MainActivity : ComponentActivity() {
                     state = mergedState,
                     callbacks = callbacks,
                     snackbarHostState = snackbarHostState,
+                    requestedTab = requestedTab,
+                    onConsumeRequestedTab = { requestedTab = null },
                     onCurrentTabChanged = { currentActiveTab = it }
                 )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleOpenTabIntent(intent)
+    }
+
+    private fun handleOpenTabIntent(intent: Intent?) {
+        val tabName = intent?.getStringExtra(EXTRA_OPEN_TAB) ?: return
+        val match = MainTab.entries.firstOrNull { it.name == tabName } ?: return
+        requestedTab = match
+        intent.removeExtra(EXTRA_OPEN_TAB)
     }
 
     override fun onResume() {
@@ -253,6 +271,7 @@ class MainActivity : ComponentActivity() {
             screenHeightPx = metrics.heightPx,
             themeMode = settings.themeMode,
             dynamicColor = settings.dynamicColor,
+            launcherIconMode = settings.launcherIconMode,
             volumeKeyToggleEnabled = settings.volumeKeyToggleEnabled,
             proModeEnabled = settings.proModeEnabled,
             preferredBackend = settings.preferredBackend,
@@ -564,6 +583,23 @@ class MainActivity : ComponentActivity() {
                 notifyOverlayRefresh()
                 syncFromStorageAndSystem()
             },
+            onStartMacroRecording = {
+                if (!Settings.canDrawOverlays(this)) {
+                    openOverlayPermissionSettings()
+                    showMessage(scope, "请先授予悬浮窗权限以启用录制控件")
+                } else if (!ShizukuController.isServiceConnected()) {
+                    ShizukuController.evaluateShizukuState()
+                    showMessage(scope, "请先在主页或设置向导中授权并连接 Shizuku")
+                } else {
+                    ContextCompat.startForegroundService(
+                        this,
+                        Intent(this, OverlayService::class.java).apply {
+                            action = OverlayService.ACTION_START_RECORDING
+                        }
+                    )
+                    showMessage(scope, "录制控件已开启，切到目标画面后点「就绪」")
+                }
+            },
             onRenamePreset = { presetId, newName ->
                 ClickConfigStore.renamePreset(this, presetId, newName)
                 notifyOverlayRefresh()
@@ -577,11 +613,6 @@ class MainActivity : ComponentActivity() {
             },
             onSetPresetExecutionMode = { presetId, mode ->
                 ClickConfigStore.setPresetExecutionMode(this, presetId, mode)
-                notifyOverlayRefresh()
-                syncFromStorageAndSystem()
-            },
-            onSetPresetLoopCondition = { presetId, loopCount, durationSec ->
-                ClickConfigStore.setPresetLoopCondition(this, presetId, loopCount, durationSec)
                 notifyOverlayRefresh()
                 syncFromStorageAndSystem()
             },
@@ -605,7 +636,79 @@ class MainActivity : ComponentActivity() {
                     showMessage(scope, "JSON 解析失败，请检查内容格式")
                 }
             },
-            onSavePresetTarget = { targetId, x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount ->
+            onImportPresetScript = { rawScript ->
+                val metrics = ShizukuController.getDisplayScreenMetrics(this)
+                val imported = ClickConfigStore.importPresetFromScript(
+                    this,
+                    rawScript,
+                    metrics.widthPx,
+                    metrics.heightPx
+                )
+                if (imported != null) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "已通过脚本创建方案「${imported.name}」")
+                } else {
+                    showMessage(scope, "脚本语法或 JSON 格式无效，请检查后重试")
+                }
+            },
+            onExportAllPresetsJson = {
+                val presets = ClickConfigStore.loadPresets(this)
+                val activeId = ClickConfigStore.getActivePresetId(this)
+                val json = ClickConfigStore.exportPresetsBundleToJson(presets, activeId)
+                copyToClipboard(scope, "全部 ${presets.size} 个方案 JSON", json)
+            },
+            onBatchImportPresetsJson = { rawJson ->
+                val metrics = ShizukuController.getDisplayScreenMetrics(this)
+                val imported = ClickConfigStore.importPresetsBatchFromJson(
+                    this,
+                    rawJson,
+                    metrics.widthPx,
+                    metrics.heightPx
+                )
+                if (imported.isNotEmpty()) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "成功批量导入 ${imported.size} 个方案")
+                } else {
+                    showMessage(scope, "批量 JSON 解析失败，请检查内容格式")
+                }
+            },
+            onBatchDeletePresets = { presetIds ->
+                val deleted = ClickConfigStore.deletePresetsBatch(this, presetIds)
+                if (deleted > 0) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "已删除选中的 $deleted 个方案")
+                } else {
+                    showMessage(scope, "至少需要保留 1 个方案")
+                }
+            },
+            onBatchFreezePresets = { presetIds ->
+                val count = ClickConfigStore.freezePresetsBatch(this, presetIds)
+                if (count > 0) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "已冻结 $count 个方案（已加 # 前缀，悬浮窗切换时跳过）")
+                }
+            },
+            onBatchUnfreezePresets = { presetIds ->
+                val count = ClickConfigStore.unfreezePresetsBatch(this, presetIds)
+                if (count > 0) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "已解冻 $count 个方案（已移除 # 前缀）")
+                }
+            },
+            onBatchCreateEmptyPresets = { count, mode ->
+                val created = ClickConfigStore.createEmptyPresetsBatch(this, count, mode)
+                if (created.isNotEmpty()) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "已批量添加 ${created.size} 个空方案")
+                }
+            },
+            onSavePresetTarget = { targetId, x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs ->
                 val metrics = ShizukuController.getDisplayScreenMetrics(this)
                 val settings = ClickConfigStore.loadSettings(this)
                 val current = ClickConfigStore.loadTargetsForScreen(this, metrics.widthPx, metrics.heightPx)
@@ -613,6 +716,7 @@ class MainActivity : ComponentActivity() {
                 val resolvedInterval = if (actionType == ActionType.TAP) settings.defaultIntervalMs else intervalMs
                 val resolvedPress = if (actionType == ActionType.TAP) settings.defaultPressDurationMs else pressMs
                 val safeRepeat = repeatCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+                val safeSubDur = subDurationMs.coerceIn(ClickTarget.MIN_SUB_DURATION_MS, ClickTarget.MAX_SUB_DURATION_MS)
                 if (targetId == null) {
                     val t = ClickTarget(
                         id = nextId,
@@ -627,10 +731,14 @@ class MainActivity : ComponentActivity() {
                         endX = endX,
                         endY = endY,
                         swipeDurationMs = swipeDur,
-                        repeatCount = safeRepeat
+                        repeatCount = safeRepeat,
+                        refPresetId = refPresetId,
+                        subDurationMs = safeSubDur
                     ).apply {
-                        setStartPixel(x, y, metrics.widthPx, metrics.heightPx)
-                        setEndPixel(endX, endY, metrics.widthPx, metrics.heightPx)
+                        if (actionType != ActionType.SUB_PRESET) {
+                            setStartPixel(x, y, metrics.widthPx, metrics.heightPx)
+                            setEndPixel(endX, endY, metrics.widthPx, metrics.heightPx)
+                        }
                     }
                     current += t
                 } else {
@@ -643,10 +751,14 @@ class MainActivity : ComponentActivity() {
                             enabled = enabled,
                             actionType = actionType,
                             swipeDurationMs = swipeDur,
-                            repeatCount = safeRepeat
+                            repeatCount = safeRepeat,
+                            refPresetId = refPresetId,
+                            subDurationMs = safeSubDur
                         ).apply {
-                            setStartPixel(x, y, metrics.widthPx, metrics.heightPx)
-                            setEndPixel(endX, endY, metrics.widthPx, metrics.heightPx)
+                            if (actionType != ActionType.SUB_PRESET) {
+                                setStartPixel(x, y, metrics.widthPx, metrics.heightPx)
+                                setEndPixel(endX, endY, metrics.widthPx, metrics.heightPx)
+                            }
                         }
                         current[idx] = updated
                     }
@@ -681,6 +793,9 @@ class MainActivity : ComponentActivity() {
             onDynamicColorChange = { enabled ->
                 saveCurrentSettings({ it.copy(dynamicColor = enabled) }, notifyOverlay = true)
             },
+            onLauncherIconModeChange = { mode ->
+                switchLauncherIcon(scope, mode)
+            },
             onVolumeKeyToggleChange = { enabled ->
                 saveCurrentSettings({ it.copy(volumeKeyToggleEnabled = enabled) }, notifyOverlay = false)
                 scope.launch(Dispatchers.IO) {
@@ -700,7 +815,7 @@ class MainActivity : ComponentActivity() {
                     syncRpc = true
                 )
                 if (enabled) {
-                    showMessage(scope, "已解锁极客专业模式")
+                    showMessage(scope, "已开启专业模式")
                 }
             },
             onPreferredBackendChange = { backend ->
@@ -735,6 +850,86 @@ class MainActivity : ComponentActivity() {
                 copyToClipboard(scope, label, text)
             }
         )
+    }
+
+    private fun resolveActiveAliasFromPackageManager(): Int {
+        return try {
+            val lightState = packageManager.getComponentEnabledSetting(
+                ComponentName(this, "$packageName.LauncherLightAlias")
+            )
+            if (lightState == PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
+                return ClickGlobalSettings.LAUNCHER_LIGHT
+            }
+            val darkState = packageManager.getComponentEnabledSetting(
+                ComponentName(this, "$packageName.LauncherDarkAlias")
+            )
+            if (darkState == PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
+                return ClickGlobalSettings.LAUNCHER_DARK
+            }
+            ClickGlobalSettings.LAUNCHER_SYSTEM
+        } catch (_: Throwable) {
+            ClickGlobalSettings.LAUNCHER_SYSTEM
+        }
+    }
+
+    private fun reconcileLauncherIconMode() {
+        val currentSettings = ClickConfigStore.loadSettings(this)
+        val resolvedMode = if (ClickConfigStore.hasLauncherIconModePref(this)) {
+            currentSettings.launcherIconMode
+        } else {
+            val detected = resolveActiveAliasFromPackageManager()
+            ClickConfigStore.saveSettings(this, currentSettings.copy(launcherIconMode = detected))
+            detected
+        }
+        applyLauncherIconComponents(resolvedMode)
+    }
+
+    private fun applyLauncherIconComponents(mode: Int) {
+        val systemAlias = ComponentName(this, "$packageName.LauncherSystemAlias")
+        val darkAlias = ComponentName(this, "$packageName.LauncherDarkAlias")
+        val lightAlias = ComponentName(this, "$packageName.LauncherLightAlias")
+        val entries = listOf(
+            ClickGlobalSettings.LAUNCHER_SYSTEM to systemAlias,
+            ClickGlobalSettings.LAUNCHER_DARK to darkAlias,
+            ClickGlobalSettings.LAUNCHER_LIGHT to lightAlias
+        )
+        val safeMode = mode.coerceIn(
+            ClickGlobalSettings.LAUNCHER_SYSTEM,
+            ClickGlobalSettings.LAUNCHER_LIGHT
+        )
+        for ((entryMode, component) in entries) {
+            val desiredState = if (entryMode == safeMode) {
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+            } else {
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+            }
+            if (packageManager.getComponentEnabledSetting(component) != desiredState) {
+                packageManager.setComponentEnabledSetting(
+                    component,
+                    desiredState,
+                    PackageManager.DONT_KILL_APP
+                )
+            }
+        }
+    }
+
+    private fun switchLauncherIcon(scope: kotlinx.coroutines.CoroutineScope, mode: Int) {
+        val safeMode = mode.coerceIn(
+            ClickGlobalSettings.LAUNCHER_SYSTEM,
+            ClickGlobalSettings.LAUNCHER_LIGHT
+        )
+        try {
+            applyLauncherIconComponents(safeMode)
+            saveCurrentSettings({ it.copy(launcherIconMode = safeMode) }, notifyOverlay = false)
+            val modeLabel = when (safeMode) {
+                ClickGlobalSettings.LAUNCHER_DARK -> "深色"
+                ClickGlobalSettings.LAUNCHER_LIGHT -> "浅色"
+                else -> "跟随系统"
+            }
+            showMessage(scope, "桌面图标已设为「$modeLabel」，返回桌面后生效")
+        } catch (t: Throwable) {
+            showMessage(scope, "切换图标失败: ${t.message ?: "未知错误"}")
+        }
     }
 
     private fun openOverlayPermissionSettings() {
@@ -776,6 +971,7 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
+        const val EXTRA_OPEN_TAB = "open_tab"
         private const val SELF_CHECK_TIMEOUT_MS = 5000L
     }
 }

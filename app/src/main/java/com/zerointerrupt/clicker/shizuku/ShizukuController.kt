@@ -489,10 +489,8 @@ object ShizukuController {
     }
 
     fun startClicking(
-        targets: List<ClickTarget>,
-        executionMode: ExecutionMode = ExecutionMode.CONCURRENT,
-        presetLoopCount: Int = 0,
-        presetDurationSec: Int = 0
+        targets: List<ClickTarget>? = null,
+        executionMode: ExecutionMode? = null
     ): Int {
         val ctx = appContext ?: return -1
         val svc = service ?: return -2
@@ -507,19 +505,28 @@ object ShizukuController {
                 ensureNativeIfVerified()
             }
             val metrics = getDisplayScreenMetrics(ctx)
-            val resolved = ClickConfigStore.resolveTargetsForExecution(targets, settings)
-            val parceled = resolved.map { it.toParceled() }
+            val presets = ClickConfigStore.loadPresets(ctx)
+            val activePreset = ClickConfigStore.getActivePreset(ctx)
+            val effectiveMode = executionMode ?: activePreset.executionMode
+            val parceled = ClickConfigStore.compileTargetsForExecution(
+                presets = presets,
+                activePreset = activePreset,
+                liveOverrideTargets = targets,
+                executionMode = effectiveMode,
+                settings = settings,
+                screenW = metrics.widthPx,
+                screenH = metrics.heightPx
+            )
+            if (parceled.isEmpty()) return -4
             val mode = svc.startClicking(
                 parceled,
                 metrics.widthPx,
                 metrics.heightPx,
                 metrics.rotation,
                 true,
-                executionMode.code,
+                effectiveMode.code,
                 settings.jitterRadiusPx,
-                settings.preferredBackend,
-                presetLoopCount.coerceAtLeast(0),
-                presetDurationSec.coerceIn(0, ClickPreset.MAX_DURATION_SEC)
+                settings.preferredBackend
             )
             _engineSnapshot.value = _engineSnapshot.value.copy(
                 engineMode = if (mode > 0) mode else TouchMuxUserService.MODE_IDLE,
@@ -534,26 +541,33 @@ object ShizukuController {
     }
 
     fun updateTargets(
-        targets: List<ClickTarget>,
-        executionMode: ExecutionMode = ExecutionMode.CONCURRENT,
-        presetLoopCount: Int = 0,
-        presetDurationSec: Int = 0
+        targets: List<ClickTarget>? = null,
+        executionMode: ExecutionMode? = null
     ) {
         val ctx = appContext ?: return
         val svc = service ?: return
         try {
             val settings = ClickConfigStore.loadSettings(ctx)
             val metrics = getDisplayScreenMetrics(ctx)
-            val resolved = ClickConfigStore.resolveTargetsForExecution(targets, settings)
+            val presets = ClickConfigStore.loadPresets(ctx)
+            val activePreset = ClickConfigStore.getActivePreset(ctx)
+            val effectiveMode = executionMode ?: activePreset.executionMode
+            val parceled = ClickConfigStore.compileTargetsForExecution(
+                presets = presets,
+                activePreset = activePreset,
+                liveOverrideTargets = targets,
+                executionMode = effectiveMode,
+                settings = settings,
+                screenW = metrics.widthPx,
+                screenH = metrics.heightPx
+            )
             svc.updateTargets(
-                resolved.map { it.toParceled() },
+                parceled,
                 metrics.widthPx,
                 metrics.heightPx,
                 metrics.rotation,
-                executionMode.code,
-                settings.jitterRadiusPx,
-                presetLoopCount.coerceAtLeast(0),
-                presetDurationSec.coerceIn(0, ClickPreset.MAX_DURATION_SEC)
+                effectiveMode.code,
+                settings.jitterRadiusPx
             )
         } catch (t: Throwable) {
             Log.w(TAG, "updateTargets failed", t)
@@ -620,6 +634,65 @@ object ShizukuController {
             true
         } catch (_: Throwable) {
             false
+        }
+    }
+
+    fun startTouchRecording(excludeLeft: Int, excludeTop: Int, excludeRight: Int, excludeBottom: Int): Boolean {
+        val ctx = appContext ?: return false
+        val svc = service ?: return false
+        return try {
+            // Ensure libtouch_mux.so is loaded inside UserService before recording
+            if (_engineSnapshot.value.touchDeviceInfo.isEmpty()) {
+                svc.probeCapabilities(ctx.applicationInfo.nativeLibraryDir)
+            }
+            val metrics = getDisplayScreenMetrics(ctx)
+            svc.startTouchRecording(
+                metrics.widthPx,
+                metrics.heightPx,
+                metrics.rotation,
+                excludeLeft,
+                excludeTop,
+                excludeRight,
+                excludeBottom
+            )
+        } catch (t: Throwable) {
+            Log.e(TAG, "startTouchRecording failed", t)
+            false
+        }
+    }
+
+    fun updateRecordingExcludeRect(excludeLeft: Int, excludeTop: Int, excludeRight: Int, excludeBottom: Int) {
+        val svc = service ?: return
+        try {
+            svc.updateRecordingExcludeRect(excludeLeft, excludeTop, excludeRight, excludeBottom)
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun getTouchRecordingStats(): LongArray {
+        val svc = service ?: return longArrayOf(0L, 0L, 0L, 0L)
+        return try {
+            svc.touchRecordingStats ?: longArrayOf(0L, 0L, 0L, 0L)
+        } catch (_: Throwable) {
+            longArrayOf(0L, 0L, 0L, 0L)
+        }
+    }
+
+    fun stopTouchRecording(): String {
+        val svc = service ?: return ""
+        return try {
+            svc.stopTouchRecording().orEmpty()
+        } catch (t: Throwable) {
+            Log.e(TAG, "stopTouchRecording failed", t)
+            ""
+        }
+    }
+
+    fun cancelTouchRecording() {
+        val svc = service ?: return
+        try {
+            svc.cancelTouchRecording()
+        } catch (_: Throwable) {
         }
     }
 

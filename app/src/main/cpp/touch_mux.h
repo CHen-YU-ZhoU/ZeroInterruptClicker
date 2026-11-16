@@ -8,6 +8,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <linux/input.h>
@@ -55,7 +56,13 @@ struct NativeClickTarget {
     float endX = 0.0f;
     float endY = 0.0f;
     int64_t swipeDurationMs = 300;
-    int32_t repeatCount = 1;
+    int32_t repeatCount = 0;       // 0 = infinite, >=1 = finite repeat cycles
+    int32_t stageIndex = 0;        // Sequential stage index (for ExecutionMode::SEQUENTIAL)
+    int64_t stageDurationMs = 0;   // >0 for timed concurrent sub-preset stage
+    int64_t stageGapMs = 50;       // Wait interval after stage completes
+    int32_t stageRepeatCount = 1;  // 0 = infinite stay on stage, >=1 = stage cycles
+    int32_t holdInId = 0;          // >0 to continue holding slot carried from previous stage
+    int32_t holdOutId = 0;         // >0 to hand off held slot cleanly into next stage without release
 };
 
 struct ProbeResult {
@@ -128,15 +135,25 @@ public:
                               int displayH,
                               int rotation,
                               float jitterRadiusPx,
-                              int executionMode = 0,
-                              int32_t presetLoopCount = 0,
-                              int32_t presetDurationSec = 0);
+                              int executionMode = 0);
     void stopClicking();
 
     // Direct RPC gesture injection (runs multiplexed seamlessly inside engineLoop)
     void enqueueRpcTap(float x, float y, int64_t durationMs);
     void enqueueRpcSwipe(float x1, float y1, float x2, float y2, int64_t durationMs);
     void setRpcHold(int32_t holdId, bool down, float x, float y);
+
+    // Physical touch recording (non-grabbed evdev reader for macro capture)
+    bool startRecording(int displayW,
+                        int displayH,
+                        int rotation,
+                        int excludeLeft,
+                        int excludeTop,
+                        int excludeRight,
+                        int excludeBottom);
+    void updateRecordingExcludeRect(int excludeLeft, int excludeTop, int excludeRight, int excludeBottom);
+    void getRecordingStats(int64_t outStats[4]) const;
+    std::string stopRecording(bool cancel);
 
     EngineState getState() const;
     MuxBackendMode getBackendMode() const;
@@ -182,6 +199,19 @@ private:
         int32_t sampledPressure = 64;
         int32_t completedCycles = 0;
         bool finishedRounds = false;
+    };
+
+    struct StageRuntime {
+        int32_t stageIndex = 0;
+        int64_t durationMs = 0;
+        int64_t gapMs = 50;
+        int32_t repeatCount = 1;
+        int32_t completedRepeats = 0;
+        int64_t startDelayUntilNs = 0;
+        int64_t stageDeadlineNs = 0;
+        bool inGap = false;
+        int64_t gapDeadlineNs = 0;
+        std::vector<VirtualTargetRuntime> targets;
     };
 
     struct RpcCommand {
@@ -281,10 +311,19 @@ private:
     void publishSlotSnapshotIfChanged(int64_t now);
 
     void releaseAllVirtualTargetSlots();
+    void releaseCarriedHoldSlots();
     void releaseAllRpcHoldSlots();
     void forceReleaseAllSlotsAndSync();
     void finishClickingRun();
 
+    static void rawToLogicalDesc(const DeviceDesc& desc,
+                                 int dispW,
+                                 int dispH,
+                                 int rotation,
+                                 int32_t rx,
+                                 int32_t ry,
+                                 float& outLx,
+                                 float& outLy);
     void logicalToRaw(float lx, float ly, int32_t& outRx, int32_t& outRy) const;
     void rawToLogical(int32_t rx, int32_t ry, float& outLx, float& outLy) const;
     int32_t sampleAbsRatio(const struct input_absinfo& abs, double meanRatio, double spreadHalfRatio, int32_t fallbackVal);
@@ -329,8 +368,6 @@ private:
     float cfgJitterRadiusPx_ = 4.0f;
     bool cfgClickingRunning_ = false;
     ExecutionMode cfgExecutionMode_ = ExecutionMode::CONCURRENT;
-    int32_t cfgPresetLoopCount_ = 0;
-    int32_t cfgPresetDurationSec_ = 0;
     std::vector<NativeClickTarget> cfgTargets_;
     std::vector<RpcCommand> cfgRpcCommands_;
     int64_t cfgSelfCheckDeadlineNs_ = 0;
@@ -345,12 +382,7 @@ private:
     float activeJitterRadiusPx_ = 4.0f;
     bool activeClickingRunning_ = false;
     ExecutionMode activeExecutionMode_ = ExecutionMode::CONCURRENT;
-    int32_t activePresetLoopCount_ = 0;
-    int32_t activePresetDurationSec_ = 0;
-    int32_t completedRounds_ = 0;
-    int64_t clickingDeadlineNs_ = 0;
-    size_t seqIndex_ = 0;
-    bool seqWaitingToPress_ = true;
+    size_t activeStageIdx_ = 0;
     int64_t selfCheckDeadlineNs_ = 0;
 
     int physCurrentSlot_ = 0;
@@ -398,10 +430,45 @@ private:
     float hybridTmpSizes_[kMaxUinputSlots]{};
 
     std::vector<VirtualTargetRuntime> virtualTargets_;
+    std::vector<StageRuntime> stages_;
+    std::unordered_map<int32_t, int> carriedHoldSlots_;
     std::vector<RpcGestureRuntime> rpcGestures_;
     int32_t rpcSeqCounter_ = 1000;
     std::vector<struct input_event> pendingWrites_;
     std::mt19937 rng_;
+
+    // Physical touch macro recorder state (O_RDONLY without EVIOCGRAB)
+    struct RecordedPoint {
+        int64_t tMs = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+    };
+    struct RecordedStroke {
+        int32_t id = 0;
+        int64_t downMs = 0;
+        int64_t upMs = 0;
+        std::vector<RecordedPoint> points;
+    };
+    void recordLoop();
+
+    mutable std::mutex recMutex_;
+    std::thread recThread_;
+    std::atomic<bool> recRunning_{false};
+    std::atomic<bool> recStarted_{false};
+    int recWakeFd_ = -1;
+    int recPhysFd_ = -1;
+    DeviceDesc recDesc_{};
+    int recDisplayW_ = 1080;
+    int recDisplayH_ = 2400;
+    int recRotation_ = 0;
+    int recExL_ = 0;
+    int recExT_ = 0;
+    int recExR_ = 0;
+    int recExB_ = 0;
+    int64_t recFirstTouchNs_ = 0;
+    int32_t recActiveFingers_ = 0;
+    int32_t recStrokeSeq_ = 0;
+    std::vector<RecordedStroke> recStrokes_;
 };
 
 }  // namespace touchmux
