@@ -272,11 +272,14 @@ class MacroRecordOverlay(
         val d = context.resources.displayMetrics.density
         val dialogWidth = minOf(metrics.widthPx - (32f * d).roundToInt(), (368f * d).roundToInt())
             .coerceAtLeast((260f * d).roundToInt())
+        val maxModalHeightPx = (metrics.heightPx * 0.80f).roundToInt()
+            .coerceAtLeast((280f * d).roundToInt())
 
         val modal = RecordPreviewOverlayView(
             context = context,
             themeColors = colors,
             plan = plan,
+            maxModalHeightPx = maxModalHeightPx,
             onRetake = {
                 activePlan = null
                 removePreview()
@@ -288,8 +291,8 @@ class MacroRecordOverlay(
                 removePreview()
                 onFinished(null, false)
             },
-            onSave = { customName, openPresets ->
-                val finalPlan = plan.withCustomMainName(customName)
+            onSave = { customName, loopCount, openPresets ->
+                val finalPlan = plan.withCustomMainName(customName).withLoopCount(loopCount)
                 val savedMain = ClickConfigStore.createPresetBatchAndActivate(
                     context = context,
                     subPresets = finalPlan.subPresets,
@@ -557,17 +560,46 @@ private class RecordControlBarView(
     }
 }
 
+private class MaxHeightScrollView(
+    context: Context,
+    var maxHeightPx: Int
+) : ScrollView(context) {
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val mode = MeasureSpec.getMode(heightMeasureSpec)
+        val size = MeasureSpec.getSize(heightMeasureSpec)
+        val cappedSpec = when (mode) {
+            MeasureSpec.UNSPECIFIED -> MeasureSpec.makeMeasureSpec(maxHeightPx, MeasureSpec.AT_MOST)
+            else -> MeasureSpec.makeMeasureSpec(minOf(size, maxHeightPx), MeasureSpec.AT_MOST)
+        }
+        super.onMeasure(widthMeasureSpec, cappedSpec)
+    }
+}
+
 @SuppressLint("ViewConstructor")
 private class RecordPreviewOverlayView(
     context: Context,
     private val themeColors: OverlayThemeColors,
     private val plan: MacroCompiledPlan,
+    private val maxModalHeightPx: Int,
     private val onRetake: () -> Unit,
     private val onCancel: () -> Unit,
-    private val onSave: (customName: String, openPresetsTab: Boolean) -> Unit
+    private val onSave: (customName: String, loopCount: Int, openPresetsTab: Boolean) -> Unit
 ) : LinearLayout(context) {
 
     private val d = resources.displayMetrics.density
+    private val headerHeightReservePx = (132f * d).roundToInt()
+    private val bodyScroll: MaxHeightScrollView
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val availH = if (MeasureSpec.getMode(heightMeasureSpec) == MeasureSpec.UNSPECIFIED) {
+            maxModalHeightPx
+        } else {
+            minOf(MeasureSpec.getSize(heightMeasureSpec), maxModalHeightPx)
+        }
+        bodyScroll.maxHeightPx = (availH - headerHeightReservePx).coerceAtLeast((110f * d).roundToInt())
+        val cappedHeightSpec = MeasureSpec.makeMeasureSpec(availH, MeasureSpec.AT_MOST)
+        super.onMeasure(widthMeasureSpec, cappedHeightSpec)
+    }
 
     init {
         orientation = VERTICAL
@@ -579,7 +611,7 @@ private class RecordPreviewOverlayView(
             setStroke((1f * d).roundToInt().coerceAtLeast(1), themeColors.outlineVariant)
         }
 
-        // Top header row
+        // Top header row (pinned outside scroll body)
         val header = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -605,6 +637,16 @@ private class RecordPreviewOverlayView(
         header.addView(closeIv)
         addView(header)
 
+        bodyScroll = MaxHeightScrollView(
+            context,
+            (maxModalHeightPx - headerHeightReservePx).coerceAtLeast((140f * d).roundToInt())
+        ).apply {
+            isVerticalScrollBarEnabled = true
+        }
+        val bodyContent = LinearLayout(context).apply {
+            orientation = VERTICAL
+        }
+
         // Summary line
         val durStr = formatDurationShort(plan.totalDurationMs)
         val subCount = plan.subPresets.size
@@ -616,7 +658,7 @@ private class RecordPreviewOverlayView(
             setTextColor(themeColors.onSurfaceVariant)
             setPadding(0, (4f * d).roundToInt(), 0, (4f * d).roundToInt())
         }
-        addView(summaryTv)
+        bodyContent.addView(summaryTv)
 
         if (plan.mergedContinuousHolds > 0) {
             val mergeTv = TextView(context).apply {
@@ -626,7 +668,7 @@ private class RecordPreviewOverlayView(
                 setTextColor(themeColors.activeRunningGreen)
                 setPadding(0, 0, 0, (8f * d).roundToInt())
             }
-            addView(mergeTv)
+            bodyContent.addView(mergeTv)
         }
 
         // Scheme name EditText + child scheme hint
@@ -646,7 +688,7 @@ private class RecordPreviewOverlayView(
                 setStroke(1, themeColors.outlineVariant)
             }
         }
-        addView(
+        bodyContent.addView(
             nameInput,
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
                 topMargin = (4f * d).roundToInt()
@@ -657,12 +699,17 @@ private class RecordPreviewOverlayView(
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             setTextColor(themeColors.onSurfaceVariant)
             setPadding((2f * d).roundToInt(), (6f * d).roundToInt(), 0, (8f * d).roundToInt())
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
         }
         fun refreshHint(baseName: String) {
             val clean = baseName.trim().ifEmpty { plan.mainPreset.name }
-            val subBase = com.zerointerrupt.clicker.model.ClickPreset.unfreezeName(clean).ifEmpty { clean }
             structureHint.text = if (subCount > 0) {
-                val children = (1..subCount).joinToString("、") { "#$subBase.$it" }
+                val children = if (subCount <= 3) {
+                    (1..subCount).joinToString("、") { "$clean.$it" }
+                } else {
+                    "$clean.1 ~ $clean.$subCount（共 $subCount 个）"
+                }
                 "将保存：主方案「$clean」（顺序连招）+ 子方案「$children」（并发·默认冻结）"
             } else {
                 "将保存：主方案「$clean」（顺序连招）"
@@ -676,9 +723,57 @@ private class RecordPreviewOverlayView(
             }
             override fun afterTextChanged(s: Editable?) = Unit
         })
-        addView(structureHint)
+        bodyContent.addView(structureHint)
 
-        // Scrollable step breakdown list
+        var selectedLoopCount = plan.mainPreset.presetLoopCount
+        val loopRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, (8f * d).roundToInt())
+        }
+        val loopLabel = TextView(context).apply {
+            text = "执行遍数"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(themeColors.onSurfaceVariant)
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+        }
+        loopRow.addView(loopLabel)
+        val loopChips = mutableListOf<Pair<Int, TextView>>()
+        fun styleLoopChip(tv: TextView, selected: Boolean) {
+            tv.setTextColor(if (selected) themeColors.onPrimaryContainer else themeColors.onSecondaryContainer)
+            tv.typeface = if (selected) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+            tv.background = themeColors.createRippleDrawable(
+                GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = 14f * d
+                    setColor(if (selected) themeColors.primaryContainer else themeColors.surfaceContainer)
+                    if (!selected) setStroke(1, themeColors.outlineVariant)
+                }
+            )
+        }
+        listOf(0 to "无限循环", 1 to "执行 1 遍").forEach { (cnt, label) ->
+            val chip = TextView(context).apply {
+                text = label
+                gravity = Gravity.CENTER
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                setPadding((10f * d).roundToInt(), (5f * d).roundToInt(), (10f * d).roundToInt(), (5f * d).roundToInt())
+                setOnClickListener {
+                    selectedLoopCount = cnt
+                    loopChips.forEach { (v, c) -> styleLoopChip(c, v == selectedLoopCount) }
+                }
+            }
+            styleLoopChip(chip, cnt == selectedLoopCount)
+            loopChips += cnt to chip
+            loopRow.addView(
+                chip,
+                LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+                    marginStart = (6f * d).roundToInt()
+                }
+            )
+        }
+        bodyContent.addView(loopRow)
+
+        // Scrollable step breakdown list (capped to keep preview snappy on long macros)
         val allTemp = plan.subPresets + plan.mainPreset
         val seamlessIds = ClickConfigStore.findSeamlessMergeStepIds(
             presets = allTemp,
@@ -699,7 +794,9 @@ private class RecordPreviewOverlayView(
             val p = (10f * d).roundToInt()
             setPadding(p, p, p, p)
         }
-        plan.mainPreset.targets.forEach { step ->
+        val maxPreviewSteps = 80
+        val totalSteps = plan.mainPreset.targets.size
+        plan.mainPreset.targets.take(maxPreviewSteps).forEach { step ->
             val row = LinearLayout(context).apply {
                 orientation = VERTICAL
                 setPadding((8f * d).roundToInt(), (6f * d).roundToInt(), (8f * d).roundToInt(), (6f * d).roundToInt())
@@ -759,19 +856,38 @@ private class RecordPreviewOverlayView(
                 }
             )
         }
+        if (totalSteps > maxPreviewSteps) {
+            stepsList.addView(
+                TextView(context).apply {
+                    text = "… 其余 ${totalSteps - maxPreviewSteps} 步已折叠预览，保存后将完整保留全部 $totalSteps 步"
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    setTextColor(themeColors.onSurfaceVariant)
+                    gravity = Gravity.CENTER
+                    setPadding((8f * d).roundToInt(), (6f * d).roundToInt(), (8f * d).roundToInt(), (4f * d).roundToInt())
+                }
+            )
+        }
         stepsBox.addView(stepsList)
-        val maxListHeight = (220f * d).roundToInt()
-        addView(
+        val maxListHeight = minOf((200f * d).roundToInt(), (maxModalHeightPx * 0.34f).roundToInt())
+            .coerceAtLeast((110f * d).roundToInt())
+        bodyContent.addView(
             stepsBox,
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
-                if (plan.mainPreset.targets.size > 3) {
+                if (totalSteps > 3) {
                     height = maxListHeight
                 }
-                bottomMargin = (14f * d).roundToInt()
+                bottomMargin = (10f * d).roundToInt()
+            }
+        )
+        bodyScroll.addView(bodyContent)
+        addView(
+            bodyScroll,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = (6f * d).roundToInt()
             }
         )
 
-        // Footer actions
+        // Footer actions (pinned outside scroll body, always reachable)
         val btnRow = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.END or Gravity.CENTER_VERTICAL
@@ -804,7 +920,7 @@ private class RecordPreviewOverlayView(
         )
         btnRow.addView(
             makeActionBtn("进方案页", themeColors.primaryContainer, themeColors.onPrimaryContainer) {
-                onSave(nameInput.text.toString(), true)
+                onSave(nameInput.text.toString(), selectedLoopCount, true)
             },
             LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
                 marginEnd = (6f * d).roundToInt()
@@ -812,7 +928,7 @@ private class RecordPreviewOverlayView(
         )
         btnRow.addView(
             makeActionBtn("保存并使用", themeColors.primary, themeColors.onPrimary) {
-                onSave(nameInput.text.toString(), false)
+                onSave(nameInput.text.toString(), selectedLoopCount, false)
             }
         )
         addView(btnRow)

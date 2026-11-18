@@ -1182,6 +1182,7 @@ int TouchMuxEngine::initAndGrab(int displayW,
         cfgRotation_ = rotation;
         cfgClickingRunning_ = false;
         cfgExecutionMode_ = ExecutionMode::CONCURRENT;
+        cfgPresetLoopCount_ = 0;
         cfgTargets_.clear();
         cfgRpcCommands_.clear();
         cfgCancelSelfCheckRequested_ = false;
@@ -1229,6 +1230,8 @@ int TouchMuxEngine::initAndGrab(int displayW,
     stages_.clear();
     rpcGestures_.clear();
     pendingWrites_.clear();
+    activePresetLoopCount_ = 0;
+    seqCompletedLoops_ = 0;
     activeStageIdx_ = 0;
 
     threadRunning_.store(true);
@@ -1289,7 +1292,8 @@ void TouchMuxEngine::setTargetsAndRunning(const std::vector<NativeClickTarget>& 
                                           int displayH,
                                           int rotation,
                                           float jitterRadiusPx,
-                                          int executionMode) {
+                                          int executionMode,
+                                          int presetLoopCount) {
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         cfgTargets_ = targets;
@@ -1301,6 +1305,7 @@ void TouchMuxEngine::setTargetsAndRunning(const std::vector<NativeClickTarget>& 
         cfgExecutionMode_ = (executionMode == static_cast<int>(ExecutionMode::SEQUENTIAL))
                                 ? ExecutionMode::SEQUENTIAL
                                 : ExecutionMode::CONCURRENT;
+        cfgPresetLoopCount_ = std::clamp(presetLoopCount, 0, 9999);
     }
     signalWake();
 }
@@ -1400,7 +1405,8 @@ int TouchMuxEngine::countActiveSlots() const {
 }
 
 int TouchMuxEngine::allocatePhysicalSlot(int physSlot) {
-    if (physSlot >= 0 && physSlot < kMaxUinputSlots && muxSlots_[physSlot].owner == SlotOwner::FREE) {
+    const int maxSlots = (workerBackend_ == MuxBackendMode::UHID) ? kMaxUhidSlots : kMaxUinputSlots;
+    if (physSlot >= 0 && physSlot < maxSlots && muxSlots_[physSlot].owner == SlotOwner::FREE) {
         muxSlots_[physSlot] = MuxSlotState{};
         muxSlots_[physSlot].owner = SlotOwner::PHYSICAL;
         muxSlots_[physSlot].trackingId = nextTrackingId();
@@ -1409,7 +1415,7 @@ int TouchMuxEngine::allocatePhysicalSlot(int physSlot) {
         muxSlots_[physSlot].major = deviceDesc_.hasTouchMajor ? std::max(1, deviceDesc_.absTouchMajor.maximum / 6) : 8;
         return physSlot;
     }
-    for (int i = 0; i < kMaxUinputSlots; ++i) {
+    for (int i = 0; i < maxSlots; ++i) {
         if (muxSlots_[i].owner == SlotOwner::FREE) {
             muxSlots_[i] = MuxSlotState{};
             muxSlots_[i].owner = SlotOwner::PHYSICAL;
@@ -1424,8 +1430,9 @@ int TouchMuxEngine::allocatePhysicalSlot(int physSlot) {
 }
 
 int TouchMuxEngine::allocateVirtualSlot(int32_t targetId) {
-    // Allocate from high slots downwards (15..0) to avoid physical slot indices (0..9)
-    for (int i = kMaxUinputSlots - 1; i >= 0; --i) {
+    const int maxSlots = (workerBackend_ == MuxBackendMode::UHID) ? kMaxUhidSlots : kMaxUinputSlots;
+    // Allocate from high slots downwards within backend limit to avoid physical slot indices (0..N)
+    for (int i = maxSlots - 1; i >= 0; --i) {
         if (muxSlots_[i].owner == SlotOwner::FREE) {
             muxSlots_[i] = MuxSlotState{};
             muxSlots_[i].owner = SlotOwner::VIRTUAL;
@@ -1591,12 +1598,15 @@ void TouchMuxEngine::flushUhidFrame() {
     std::memset(data, 0, reportLen);
     data[0] = 0x01;  // Report ID 1
 
-    int packedCount = 0;
-    for (int s = 0; s < kMaxUinputSlots && packedCount < kMaxUhidSlots; ++s) {
-        if (muxSlots_[s].owner == SlotOwner::FREE) continue;
-        uint8_t* slotPtr = data + 1 + static_cast<size_t>(packedCount) * contactStride;
+    int activeCount = 0;
+    for (int s = 0; s < kMaxUhidSlots; ++s) {
+        uint8_t* slotPtr = data + 1 + static_cast<size_t>(s) * contactStride;
+        slotPtr[1] = static_cast<uint8_t>(s & 0x0F);  // Fixed ContactID = s (0..9)
+        if (muxSlots_[s].owner == SlotOwner::FREE) {
+            slotPtr[0] = 0x00;  // Tip Switch = 0 (released/idle)
+            continue;
+        }
         slotPtr[0] = 0x01;  // Tip Switch = 1
-        slotPtr[1] = static_cast<uint8_t>(s & 0x0F);
 
         int32_t rx = std::clamp(muxSlots_[s].rawX, deviceDesc_.absX.minimum, deviceDesc_.absX.maximum);
         int32_t ry = std::clamp(muxSlots_[s].rawY, deviceDesc_.absY.minimum, deviceDesc_.absY.maximum);
@@ -1620,14 +1630,14 @@ void TouchMuxEngine::flushUhidFrame() {
             }
         }
         slotPtr[2 + 2 * xyBytes] = pByte;
-        packedCount++;
+        activeCount++;
     }
 
-    if (packedCount == 0 && !uhidHadActiveContacts_) {
+    if (activeCount == 0 && !uhidHadActiveContacts_) {
         return;
     }
-    uhidHadActiveContacts_ = (packedCount > 0);
-    data[1 + static_cast<size_t>(kMaxUhidSlots) * contactStride] = static_cast<uint8_t>(packedCount);
+    uhidHadActiveContacts_ = (activeCount > 0);
+    data[1 + static_cast<size_t>(kMaxUhidSlots) * contactStride] = static_cast<uint8_t>(activeCount);
 
     ssize_t ignored = write(uhidFd_, &ev, sizeof(ev));
     (void)ignored;
@@ -1927,6 +1937,7 @@ void TouchMuxEngine::finishClickingRun() {
     releaseAllVirtualTargetSlots();
     activeClickingRunning_ = false;
     activeStageIdx_ = 0;
+    seqCompletedLoops_ = 0;
     for (auto& vt : virtualTargets_) {
         vt.completedCycles = 0;
         vt.finishedRounds = false;
@@ -2090,6 +2101,7 @@ void TouchMuxEngine::handleWakeSignal() {
     std::vector<RpcCommand> pendingRpc;
     bool nextRunning = false;
     ExecutionMode nextExecMode = ExecutionMode::CONCURRENT;
+    int32_t nextPresetLoopCount = 0;
     bool stopThread = false;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -2099,6 +2111,7 @@ void TouchMuxEngine::handleWakeSignal() {
         activeJitterRadiusPx_ = cfgJitterRadiusPx_;
         nextRunning = cfgClickingRunning_;
         nextExecMode = cfgExecutionMode_;
+        nextPresetLoopCount = cfgPresetLoopCount_;
         nextTargets = cfgTargets_;
         pendingRpc.swap(cfgRpcCommands_);
         stopThread = cfgStopThreadRequested_;
@@ -2223,6 +2236,8 @@ void TouchMuxEngine::handleWakeSignal() {
     if (!nextRunning) {
         activeClickingRunning_ = false;
         activeExecutionMode_ = nextExecMode;
+        activePresetLoopCount_ = nextPresetLoopCount;
+        seqCompletedLoops_ = 0;
         releaseAllVirtualTargetSlots();
         virtualTargets_.clear();
         stages_.clear();
@@ -2244,10 +2259,12 @@ void TouchMuxEngine::handleWakeSignal() {
     const bool freshStart = !activeClickingRunning_;
     const bool execModeChanged = (activeExecutionMode_ != nextExecMode) || freshStart;
     activeExecutionMode_ = nextExecMode;
+    activePresetLoopCount_ = nextPresetLoopCount;
 
     if (nextExecMode == ExecutionMode::SEQUENTIAL) {
         releaseAllVirtualTargetSlots();
         virtualTargets_.clear();
+        seqCompletedLoops_ = 0;
         buildSequentialStages(nextTargets, now);
     } else {
         stages_.clear();
@@ -2322,7 +2339,8 @@ void TouchMuxEngine::handleWakeSignal() {
 }
 
 void TouchMuxEngine::handleTypeAFrameEnd() {
-    const size_t newCount = std::min(typeAFrameContacts_.size(), static_cast<size_t>(kMaxUinputSlots));
+    const int maxSlots = (workerBackend_ == MuxBackendMode::UHID) ? kMaxUhidSlots : kMaxUinputSlots;
+    const size_t newCount = std::min(typeAFrameContacts_.size(), static_cast<size_t>(maxSlots));
     while (typeAActiveMuxSlots_.size() > newCount) {
         int slot = typeAActiveMuxSlots_.back();
         typeAActiveMuxSlots_.pop_back();
@@ -2538,6 +2556,7 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
         }
 
         const ActionType act = static_cast<ActionType>(vt.config.actionType);
+        const bool useTapJitter = (act == ActionType::TAP) && vt.config.microJitter;
 
         if (!vt.isPressed) {
             int slot = -1;
@@ -2567,18 +2586,13 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
             if (!carriedIn) {
                 float sx = vt.config.x;
                 float sy = vt.config.y;
-                applySpatialJitter(sx, sy, vt.config.microJitter);
+                applySpatialJitter(sx, sy, useTapJitter);
 
                 vt.startX = sx;
                 vt.startY = sy;
                 if (act == ActionType::SWIPE) {
-                    float ex = vt.config.endX;
-                    float ey = vt.config.endY;
-                    if (vt.config.holdOutId <= 0) {
-                        applySpatialJitter(ex, ey, vt.config.microJitter);
-                    }
-                    vt.endX = ex;
-                    vt.endY = ey;
+                    vt.endX = vt.config.endX;
+                    vt.endY = vt.config.endY;
                 }
 
                 int32_t rx = 0, ry = 0;
@@ -2589,13 +2603,8 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
                 vt.startX = vt.config.x;
                 vt.startY = vt.config.y;
                 if (act == ActionType::SWIPE) {
-                    float ex = vt.config.endX;
-                    float ey = vt.config.endY;
-                    if (vt.config.holdOutId <= 0) {
-                        applySpatialJitter(ex, ey, vt.config.microJitter);
-                    }
-                    vt.endX = ex;
-                    vt.endY = ey;
+                    vt.endX = vt.config.endX;
+                    vt.endY = vt.config.endY;
                 }
             }
 
@@ -2604,7 +2613,7 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
             vt.swipeFinalReached = false;
 
             if (act == ActionType::SWIPE) {
-                int64_t durMs = sampleDurationMs(vt.config.swipeDurationMs, vt.config.microJitter, 8, 15000);
+                int64_t durMs = sampleDurationMs(vt.config.swipeDurationMs, false, 8, 15000);
                 vt.swipeStartNs = now;
                 vt.swipeEndNs = now + durMs * 1000000LL;
                 vt.nextDeadlineNs = std::min(vt.swipeEndNs, now + kSwipeStepNs);
@@ -2614,7 +2623,7 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
             } else {
                 int64_t pressMs = sampleDurationMs(
                     vt.config.pressDurationMs,
-                    vt.config.microJitter,
+                    useTapJitter,
                     8,
                     act == ActionType::HOLD ? 30000 : 5000
                 );
@@ -2691,7 +2700,7 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
         vt.isPressed = false;
         vt.swipeFinalReached = false;
 
-        int64_t intervalMs = handoffOut ? 0 : sampleDurationMs(vt.config.intervalMs, vt.config.microJitter, 5, 60000);
+        int64_t intervalMs = handoffOut ? 0 : sampleDurationMs(vt.config.intervalMs, useTapJitter, 5, 60000);
         vt.nextDeadlineNs = now + intervalMs * 1000000LL;
         return true;
     };
@@ -2733,7 +2742,16 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
                     break;
                 }
                 st.inGap = false;
-                activeStageIdx_ = (activeStageIdx_ + 1) % stages_.size();
+                const size_t nextStageIdx = (activeStageIdx_ + 1) % stages_.size();
+                if (nextStageIdx == 0) {
+                    seqCompletedLoops_++;
+                    if (activePresetLoopCount_ >= 1 && seqCompletedLoops_ >= activePresetLoopCount_) {
+                        if (anyEmitted) emitSyncAndFlush();
+                        finishClickingRun();
+                        return;
+                    }
+                }
+                activeStageIdx_ = nextStageIdx;
                 resetStageTargets(stages_[activeStageIdx_], now, false);
                 continue;
             }
@@ -2791,8 +2809,16 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
                         }
                     } else {
                         st.completedRepeats = 0;
+                        const size_t nextStageIdx = (activeStageIdx_ + 1) % stages_.size();
+                        if (nextStageIdx == 0 && activePresetLoopCount_ >= 1 &&
+                            (seqCompletedLoops_ + 1) >= activePresetLoopCount_) {
+                            seqCompletedLoops_++;
+                            if (anyEmitted) emitSyncAndFlush();
+                            finishClickingRun();
+                            return;
+                        }
                         if (gapMs == 0) {
-                            activeStageIdx_ = (activeStageIdx_ + 1) % stages_.size();
+                            activeStageIdx_ = nextStageIdx;
                             resetStageTargets(stages_[activeStageIdx_], now, false);
                             if (stages_.size() > 1) {
                                 continue;
@@ -2822,13 +2848,33 @@ void TouchMuxEngine::stepVirtualTargets(int64_t now) {
                 bool completed = handleSingleTargetTick(vt);
                 if (completed && st.repeatCount >= 1) {
                     st.completedRepeats++;
+                    const bool isTapStage = (static_cast<ActionType>(vt.config.actionType) == ActionType::TAP);
                     if (st.completedRepeats < st.repeatCount) {
-                        int64_t waitMs = sampleDurationMs(vt.config.intervalMs, vt.config.microJitter, 5, 60000);
+                        int64_t waitMs = sampleDurationMs(
+                            vt.config.intervalMs,
+                            isTapStage && vt.config.microJitter,
+                            5,
+                            60000
+                        );
                         vt.nextDeadlineNs = now + waitMs * 1000000LL;
                     } else {
-                        int64_t waitMs = sampleDurationMs(st.gapMs, vt.config.microJitter && st.gapMs >= 5, 0, 60000);
                         st.completedRepeats = 0;
-                        activeStageIdx_ = (activeStageIdx_ + 1) % stages_.size();
+                        const size_t nextStageIdx = (activeStageIdx_ + 1) % stages_.size();
+                        if (nextStageIdx == 0) {
+                            seqCompletedLoops_++;
+                            if (activePresetLoopCount_ >= 1 && seqCompletedLoops_ >= activePresetLoopCount_) {
+                                if (anyEmitted) emitSyncAndFlush();
+                                finishClickingRun();
+                                return;
+                            }
+                        }
+                        int64_t waitMs = sampleDurationMs(
+                            st.gapMs,
+                            isTapStage && vt.config.microJitter && st.gapMs >= 5,
+                            0,
+                            60000
+                        );
+                        activeStageIdx_ = nextStageIdx;
                         resetStageTargets(stages_[activeStageIdx_], now + waitMs * 1000000LL, false);
                         if (waitMs == 0 && stages_.size() > 1) {
                             continue;
@@ -3302,7 +3348,7 @@ void TouchMuxEngine::recordLoop() {
                 float dx = lx - st.lastX;
                 float dy = ly - st.lastY;
                 float dist = std::hypot(dx, dy);
-                if (dist >= 2.0f || (frameNs - st.lastSampleNs) >= 8000000LL) {
+                if (dist >= 0.75f || (frameNs - st.lastSampleNs) >= 4000000LL) {
                     int64_t tMs = std::max<int64_t>(st.stroke.downMs, (frameNs - recFirstTouchNs_) / 1000000LL);
                     st.stroke.points.push_back(RecordedPoint{tMs, lx, ly});
                     st.lastX = lx;
@@ -3316,7 +3362,7 @@ void TouchMuxEngine::recordLoop() {
                 if (st.down && !st.excluded) {
                     int64_t tMs = std::max<int64_t>(st.stroke.downMs, (frameNs - recFirstTouchNs_) / 1000000LL);
                     if (st.stroke.points.empty() ||
-                        std::hypot(lx - st.lastX, ly - st.lastY) >= 1.5f ||
+                        std::hypot(lx - st.lastX, ly - st.lastY) >= 0.5f ||
                         st.stroke.points.back().tMs != tMs) {
                         st.stroke.points.push_back(RecordedPoint{tMs, lx, ly});
                     }

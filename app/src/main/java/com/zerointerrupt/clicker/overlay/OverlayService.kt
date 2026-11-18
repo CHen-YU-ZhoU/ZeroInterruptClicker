@@ -28,6 +28,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewTreeObserver
 import android.view.WindowManager
+import android.view.animation.LinearInterpolator
 import android.view.animation.PathInterpolator
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -130,7 +131,11 @@ class OverlayService : Service(), ControlBarView.Listener {
     private var pendingCommitBar: ControlBarView? = null
     private var pendingCommitRunnable: Runnable? = null
     private var handoffGeneration: Long = 0L
-    private val morphInterpolator = PathInterpolator(0.22f, 0f, 0.12f, 1f)
+    // M3 Emphasized Decelerate: crisp launch with zero hesitation and silky coasting deceleration
+    private val morphInterpolator = PathInterpolator(0.05f, 0.7f, 0.1f, 1f)
+    private val glidePosInterpolator = PathInterpolator(0.05f, 0.84f, 0.14f, 1f)
+    private val collapseFoldInterpolator = PathInterpolator(0.16f, 0.62f, 0.14f, 1f)
+    private val linearInterpolator = LinearInterpolator()
 
     private var swipeConnectorView: SwipeConnectorOverlayView? = null
     private var swipeConnectorLp: WindowManager.LayoutParams? = null
@@ -151,6 +156,7 @@ class OverlayService : Service(), ControlBarView.Listener {
     private var nextTargetId: Int = 1
     private var activePresetId: String = ""
     private var activeExecutionMode: ExecutionMode = ExecutionMode.CONCURRENT
+    private var activePresetLoopCount: Int = 0
     private var lockedAlpha: Float = ClickGlobalSettings.DEFAULT_LOCKED_ALPHA
     private var isLocked: Boolean = false
     private var lastAutoLockOnStart: Boolean = true
@@ -447,6 +453,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         val preset = ClickConfigStore.getActivePreset(this)
         activePresetId = preset.id
         activeExecutionMode = preset.executionMode
+        activePresetLoopCount = preset.presetLoopCount
         targets.clear()
         preset.targets.forEach { t ->
             val copy = t.copy()
@@ -518,6 +525,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         }
         if (activePresetId != preset.id ||
             activeExecutionMode != preset.executionMode ||
+            activePresetLoopCount != preset.presetLoopCount ||
             currentSig != storedSig
         ) {
             if (isClicking) {
@@ -532,6 +540,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         val preset = ClickConfigStore.getActivePreset(this)
         activePresetId = preset.id
         activeExecutionMode = preset.executionMode
+        activePresetLoopCount = preset.presetLoopCount
         dismissTunePanel()
         removeAllAnchorWindows()
         targets.clear()
@@ -661,11 +670,7 @@ class OverlayService : Service(), ControlBarView.Listener {
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && vto.isAlive) {
                     vto.registerFrameCommitCallback {
-                        if (handoffGeneration == expectedGen && newBar.isAttachedToWindow) {
-                            newBar.postOnAnimation(finalizeCommit)
-                        } else {
-                            finalizeCommit.run()
-                        }
+                        finalizeCommit.run()
                     }
                 } else {
                     newBar.postOnAnimation(finalizeCommit)
@@ -707,8 +712,9 @@ class OverlayService : Service(), ControlBarView.Listener {
             onEnd?.invoke()
             return
         }
+        val snapDist = kotlin.math.abs(targetX - lp.x)
         val anim = ValueAnimator.ofInt(lp.x, targetX).apply {
-            duration = 220L
+            duration = (140f + snapDist * 0.16f).toLong().coerceIn(150L, 240L)
             interpolator = morphInterpolator
             addUpdateListener { va ->
                 if (controlBarView === bar && bar.isAttachedToWindow) {
@@ -748,7 +754,9 @@ class OverlayService : Service(), ControlBarView.Listener {
     private fun startBarMorphAnimation(
         targetProgress: Float,
         screenWidthPx: Int,
-        screenHeightPx: Int
+        screenHeightPx: Int,
+        startHostX: Int? = null,
+        endHostX: Int? = null
     ) {
         val bar = controlBarView ?: return
         val lp = controlBarLp ?: return
@@ -760,35 +768,84 @@ class OverlayService : Service(), ControlBarView.Listener {
         morphScreenWidthPx = screenWidthPx
         morphScreenHeightPx = screenHeightPx
 
-        if (kotlin.math.abs(clampedTarget - startProgress) < 0.001f) {
+        val fromHostX = startHostX ?: lp.x
+        val toHostX = endHostX ?: lp.x
+        val glideDist = kotlin.math.abs(toHostX - fromHostX)
+        val hasGlide = glideDist > 2
+
+        if (kotlin.math.abs(clampedTarget - startProgress) < 0.001f && !hasGlide) {
             finalizeBarMorphState(bar, lp, clampedTarget, screenWidthPx, screenHeightPx)
             return
         }
 
-        val anim = ValueAnimator.ofFloat(startProgress, clampedTarget).apply {
-            duration = 280L
-            interpolator = morphInterpolator
-            addUpdateListener { va ->
-                if (controlBarView !== bar || !bar.isAttachedToWindow) return@addUpdateListener
-                val progress = (va.animatedValue as Float).coerceIn(0f, 1f)
-                currentMorphProgress = progress
-                // Zero WindowManager IPC during morph: all motion stays local inside locked morphHostWidthPx.
-                bar.applyMorphProgress(progress, dockRight, morphPillTopOffsetPx)
+        val anim = if (hasGlide) {
+            val isCollapsing = clampedTarget < startProgress
+            ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = if (isCollapsing) {
+                    (240f + glideDist * 0.14f).toLong().coerceIn(250L, 340L)
+                } else {
+                    240L
+                }
+                interpolator = if (isCollapsing) linearInterpolator else morphInterpolator
+                addUpdateListener { va ->
+                    if (controlBarView !== bar || !bar.isAttachedToWindow) return@addUpdateListener
+                    val rawT = (va.animatedValue as Float).coerceIn(0f, 1f)
+                    val glideT = if (isCollapsing) glidePosInterpolator.getInterpolation(rawT) else rawT
+                    val foldT = if (isCollapsing) collapseFoldInterpolator.getInterpolation(rawT) else rawT
+                    val nextX = Math.round(fromHostX + (toHostX - fromHostX) * glideT)
+                    if (nextX != lp.x) {
+                        lp.x = nextX
+                        bar.syncWindowPosition(lp.x, lp.y)
+                        try {
+                            windowManager.updateViewLayout(bar, lp)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                    val progress = (startProgress + (clampedTarget - startProgress) * foldT).coerceIn(0f, 1f)
+                    currentMorphProgress = progress
+                    bar.applyMorphProgress(progress, dockRight, morphPillTopOffsetPx)
+                }
+                addListener(object : AnimatorListenerAdapter() {
+                    private var canceled = false
+                    override fun onAnimationCancel(animation: Animator) {
+                        canceled = true
+                    }
+                    override fun onAnimationEnd(animation: Animator) {
+                        if (barMorphAnimator === animation) {
+                            barMorphAnimator = null
+                        }
+                        if (!canceled && controlBarView === bar && bar.isAttachedToWindow) {
+                            finalizeBarMorphState(bar, lp, clampedTarget, screenWidthPx, screenHeightPx)
+                        }
+                    }
+                })
             }
-            addListener(object : AnimatorListenerAdapter() {
-                private var canceled = false
-                override fun onAnimationCancel(animation: Animator) {
-                    canceled = true
+        } else {
+            ValueAnimator.ofFloat(startProgress, clampedTarget).apply {
+                duration = 240L
+                interpolator = morphInterpolator
+                addUpdateListener { va ->
+                    if (controlBarView !== bar || !bar.isAttachedToWindow) return@addUpdateListener
+                    val progress = (va.animatedValue as Float).coerceIn(0f, 1f)
+                    currentMorphProgress = progress
+                    // Zero WindowManager IPC during morph: all motion stays local inside locked morphHostWidthPx.
+                    bar.applyMorphProgress(progress, dockRight, morphPillTopOffsetPx)
                 }
-                override fun onAnimationEnd(animation: Animator) {
-                    if (barMorphAnimator === animation) {
-                        barMorphAnimator = null
+                addListener(object : AnimatorListenerAdapter() {
+                    private var canceled = false
+                    override fun onAnimationCancel(animation: Animator) {
+                        canceled = true
                     }
-                    if (!canceled && controlBarView === bar && bar.isAttachedToWindow) {
-                        finalizeBarMorphState(bar, lp, clampedTarget, screenWidthPx, screenHeightPx)
+                    override fun onAnimationEnd(animation: Animator) {
+                        if (barMorphAnimator === animation) {
+                            barMorphAnimator = null
+                        }
+                        if (!canceled && controlBarView === bar && bar.isAttachedToWindow) {
+                            finalizeBarMorphState(bar, lp, clampedTarget, screenWidthPx, screenHeightPx)
+                        }
                     }
-                }
-            })
+                })
+            }
         }
         barMorphAnimator = anim
         anim.start()
@@ -1182,9 +1239,22 @@ class OverlayService : Service(), ControlBarView.Listener {
         val expandedH = bar.getExpandedBarHeightPx()
         val collapsedH = bar.getCollapsedHeightPx()
         val hostW = bar.getMorphHostWidthPx().coerceAtMost(metrics.widthPx)
-        dockRight = (lp.x + expandedW / 2) >= (metrics.widthPx / 2)
+        val alreadyMorphHost = lp.width == hostW
+        val edgeMargin = bar.getEdgeMarginPx().coerceAtMost(((metrics.widthPx - expandedW) / 2).coerceAtLeast(0))
+        if (!alreadyMorphHost) {
+            dockRight = (lp.x + expandedW / 2) >= (metrics.widthPx / 2)
+        }
+        bar.setDockRight(dockRight)
+        val dockEdgeX = if (dockRight) {
+            (metrics.widthPx - expandedW - edgeMargin).coerceAtLeast(0)
+        } else {
+            edgeMargin
+        }
+        val dockHostX = if (dockRight) (metrics.widthPx - hostW).coerceAtLeast(0) else 0
+        // Translate host window proportionally so the expanded card inside morphBar starts pixel-exact at lp.x.
+        val startHostX = if (alreadyMorphHost) lp.x else dockHostX + (lp.x - dockEdgeX)
 
-        morphEdgeMarginPx = bar.getEdgeMarginPx().coerceAtMost(((metrics.widthPx - expandedW) / 2).coerceAtLeast(0))
+        morphEdgeMarginPx = edgeMargin
         morphExpandedTopY = lp.y.coerceIn(0, (metrics.heightPx - expandedH).coerceAtLeast(0))
         val targetCollapsedY = (morphExpandedTopY + (expandedH - collapsedH) / 2)
             .coerceIn(0, (metrics.heightPx - collapsedH).coerceAtLeast(0))
@@ -1193,18 +1263,28 @@ class OverlayService : Service(), ControlBarView.Listener {
         morphScreenWidthPx = metrics.widthPx
         morphScreenHeightPx = metrics.heightPx
 
-        currentMorphProgress = 1f
+        val startProgress = if (alreadyMorphHost) currentMorphProgress.coerceIn(0f, 1f) else 1f
+        currentMorphProgress = startProgress
         morphTargetProgress = 0f
 
         val morphBar = createSyncedControlBar(bar.isToolsExpanded())
         morphBar.prepareMorphLayout(dockRight, morphPillTopOffsetPx, initiallyCollapsed = false)
+        if (startProgress < 1f) {
+            morphBar.applyMorphProgress(startProgress, dockRight, morphPillTopOffsetPx)
+        }
         val morphLp = createBaseOverlayParams(hostW, expandedH, touchable = true).apply {
-            x = if (dockRight) (metrics.widthPx - hostW).coerceAtLeast(0) else 0
+            x = startHostX
             y = morphExpandedTopY
         }
         swapToNewControlBarWindow(morphBar, morphLp) {
             if (controlBarView === morphBar && morphTargetProgress <= 0f && barMorphAnimator == null) {
-                startBarMorphAnimation(0f, metrics.widthPx, metrics.heightPx)
+                startBarMorphAnimation(
+                    targetProgress = 0f,
+                    screenWidthPx = metrics.widthPx,
+                    screenHeightPx = metrics.heightPx,
+                    startHostX = startHostX,
+                    endHostX = dockHostX
+                )
             }
         }
     }
@@ -1217,13 +1297,21 @@ class OverlayService : Service(), ControlBarView.Listener {
 
         if (barMorphAnimator != null) {
             if (morphTargetProgress >= 1f) return
+            val hostW = bar.getMorphHostWidthPx().coerceAtMost(metrics.widthPx)
+            val dockHostX = if (dockRight) (metrics.widthPx - hostW).coerceAtLeast(0) else 0
             morphEdgeMarginPx = bar.getEdgeMarginPx()
                 .coerceAtMost(((metrics.widthPx - bar.getExpandedWidthPx()) / 2).coerceAtLeast(0))
             isBarCollapsed = false
             morphTargetProgress = 1f
             barMorphAnimator?.cancel()
             barMorphAnimator = null
-            startBarMorphAnimation(1f, metrics.widthPx, metrics.heightPx)
+            startBarMorphAnimation(
+                targetProgress = 1f,
+                screenWidthPx = metrics.widthPx,
+                screenHeightPx = metrics.heightPx,
+                startHostX = lp.x,
+                endHostX = dockHostX
+            )
             return
         }
         if (pendingPreDrawListener != null) {
@@ -1274,7 +1362,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         if (switchable.isEmpty()) {
             Toast.makeText(
                 this,
-                "全部方案均已冻结（#开头），请在方案页解冻或去掉 # 前缀",
+                "全部方案均已冻结，请在方案页右上角 ⋮ 菜单中解冻",
                 Toast.LENGTH_SHORT
             ).show()
             scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
@@ -1349,11 +1437,19 @@ class OverlayService : Service(), ControlBarView.Listener {
                 bar.setCollapsed(false, dockRight)
                 val expandedW = bar.getExpandedWidthPx()
                 val expandedH = bar.getExpandedBarHeightPx()
+                val hostW = lp.width
+                val edgeMargin = bar.getEdgeMarginPx()
+                    .coerceAtMost(((metrics.widthPx - expandedW) / 2).coerceAtLeast(0))
+                val dockHostX = if (dockRight) (metrics.widthPx - hostW).coerceAtLeast(0) else 0
+                val dockEdgeX = if (dockRight) {
+                    (metrics.widthPx - expandedW - edgeMargin).coerceAtLeast(0)
+                } else {
+                    edgeMargin
+                }
                 lp.width = expandedW
                 lp.height = expandedH
-                if (!dockRight) {
-                    lp.x = (lp.x + bar.getEdgeMarginPx()).coerceAtMost((metrics.widthPx - expandedW).coerceAtLeast(0))
-                }
+                lp.x = (lp.x - dockHostX + dockEdgeX)
+                    .coerceIn(0, (metrics.widthPx - expandedW).coerceAtLeast(0))
                 bar.syncWindowPosition(lp.x, lp.y)
                 try {
                     windowManager.updateViewLayout(bar, lp)
@@ -1410,6 +1506,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         cancelAutoCollapse()
         val snapshot = targets.map { it.copy() }
         val modeSnapshot = activeExecutionMode
+        val loopSnapshot = activePresetLoopCount
         isClicking = true
         OverlayStateHub.setClickingRunning(this, true)
         refreshAnchorVisuals()
@@ -1418,7 +1515,8 @@ class OverlayService : Service(), ControlBarView.Listener {
         serviceScope.launch(Dispatchers.IO) {
             val mode = ShizukuController.startClicking(
                 targets = snapshot,
-                executionMode = modeSnapshot
+                executionMode = modeSnapshot,
+                presetLoopCount = loopSnapshot
             )
             withContext(Dispatchers.Main) {
                 if (mode < 0) {
@@ -1665,28 +1763,19 @@ class OverlayService : Service(), ControlBarView.Listener {
         dragScreenWidthPx = 0
         dragScreenHeightPx = 0
         val w = bar.getCurrentWidthPx()
-        val edgeMarginPx = bar.getEdgeMarginPx()
         dockRight = (lp.x + w / 2) >= (screenW / 2)
         bar.setDockRight(dockRight)
 
-        val targetX = if (isBarCollapsed) {
-            if (dockRight) (screenW - w).coerceAtLeast(0) else 0
-        } else {
-            if (dockRight) {
-                (screenW - w - edgeMarginPx).coerceAtLeast(0)
-            } else {
-                edgeMarginPx.coerceAtMost((screenW - w).coerceAtLeast(0))
-            }
-        }
-
-        animateControlBarPosX(targetX) {
-            if (isBarCollapsed) {
+        if (isBarCollapsed) {
+            val targetX = if (dockRight) (screenW - w).coerceAtLeast(0) else 0
+            animateControlBarPosX(targetX) {
                 ClickConfigStore.saveControlBarCollapseState(this, true, dockRight)
-            } else {
-                ClickConfigStore.saveControlBarPosition(this, lp.x, lp.y)
-                ClickConfigStore.saveControlBarCollapseState(this, false, dockRight)
-                scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
             }
+        } else {
+            bar.syncWindowPosition(lp.x, lp.y)
+            ClickConfigStore.saveControlBarPosition(this, lp.x, lp.y)
+            ClickConfigStore.saveControlBarCollapseState(this, false, dockRight)
+            scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
         }
     }
 
@@ -1707,15 +1796,14 @@ class OverlayService : Service(), ControlBarView.Listener {
             val h = bar.getCurrentHeightPx()
             barLp.width = w
             barLp.height = h
-            val edgeMarginPx = bar.getEdgeMarginPx()
             barLp.x = if (isBarCollapsed) {
                 if (dockRight) (metrics.widthPx - w).coerceAtLeast(0) else 0
             } else {
-                if (dockRight) {
-                    (metrics.widthPx - w - edgeMarginPx).coerceAtLeast(0)
-                } else {
-                    barLp.x.coerceIn(0, (metrics.widthPx - w).coerceAtLeast(0))
-                }
+                barLp.x.coerceIn(0, (metrics.widthPx - w).coerceAtLeast(0))
+            }
+            if (!isBarCollapsed) {
+                dockRight = (barLp.x + w / 2) >= (metrics.widthPx / 2)
+                bar.setDockRight(dockRight)
             }
             barLp.y = barLp.y.coerceIn(0, (metrics.heightPx - h).coerceAtLeast(0))
             bar.syncWindowPosition(barLp.x, barLp.y)
@@ -1748,7 +1836,8 @@ class OverlayService : Service(), ControlBarView.Listener {
             if (isClicking) {
                 ShizukuController.updateTargets(
                     targets = targets.map { it.copy() },
-                    executionMode = activeExecutionMode
+                    executionMode = activeExecutionMode,
+                    presetLoopCount = activePresetLoopCount
                 )
             }
         }
@@ -1757,10 +1846,12 @@ class OverlayService : Service(), ControlBarView.Listener {
     private fun pushTargetsToServiceAsync() {
         val snapshot = targets.map { it.copy() }
         val modeSnapshot = activeExecutionMode
+        val loopSnapshot = activePresetLoopCount
         serviceScope.launch(Dispatchers.IO) {
             ShizukuController.updateTargets(
                 targets = snapshot,
-                executionMode = modeSnapshot
+                executionMode = modeSnapshot,
+                presetLoopCount = loopSnapshot
             )
         }
     }
@@ -2061,22 +2152,24 @@ class OverlayService : Service(), ControlBarView.Listener {
             intArrayOf(colors.primary, colors.surfaceContainerHighest)
         )
 
-        val jitterSwitch = SwitchMaterial(themedCtx).apply {
-            text = "拟人高斯抖动 (±${settings.jitterRadiusPx.roundToInt()}px)"
-            setTextColor(colors.onSurface)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setPadding(0, (6f * d).roundToInt(), 0, 0)
-            thumbTintList = thumbTint
-            trackTintList = trackTint
-            isChecked = target.microJitter
-            setOnCheckedChangeListener { _, checked ->
-                target.microJitter = checked
-                persistCurrentTargets()
-                refreshAnchorVisuals()
-                if (isClicking) pushTargetsToServiceAsync()
+        if (target.actionType == ActionType.TAP) {
+            val jitterSwitch = SwitchMaterial(themedCtx).apply {
+                text = "拟人高斯抖动 (±${settings.jitterRadiusPx.roundToInt()}px)"
+                setTextColor(colors.onSurface)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                setPadding(0, (6f * d).roundToInt(), 0, 0)
+                thumbTintList = thumbTint
+                trackTintList = trackTint
+                isChecked = target.microJitter
+                setOnCheckedChangeListener { _, checked ->
+                    target.microJitter = checked
+                    persistCurrentTargets()
+                    refreshAnchorVisuals()
+                    if (isClicking) pushTargetsToServiceAsync()
+                }
             }
+            root.addView(jitterSwitch)
         }
-        root.addView(jitterSwitch)
 
         val enabledSwitch = SwitchMaterial(themedCtx).apply {
             text = "启用该锚点"

@@ -229,25 +229,11 @@ data class ClickPreset(
     val id: String,
     var name: String,
     var executionMode: ExecutionMode = ExecutionMode.CONCURRENT,
+    var presetLoopCount: Int = 0,
+    var isFrozen: Boolean = false,
+    var parentPresetId: String = "",
     val targets: MutableList<ClickTarget> = mutableListOf()
-) {
-    val isFrozen: Boolean
-        get() = name.trimStart().startsWith(FROZEN_PREFIX)
-
-    companion object {
-        const val FROZEN_PREFIX = "#"
-
-        fun freezeName(rawName: String): String {
-            val trimmed = rawName.trimStart()
-            return if (trimmed.startsWith(FROZEN_PREFIX)) trimmed else "$FROZEN_PREFIX$trimmed"
-        }
-
-        fun unfreezeName(rawName: String): String {
-            val stripped = rawName.trimStart().dropWhile { it == '#' }.trimStart()
-            return stripped.ifEmpty { "方案" }
-        }
-    }
-}
+)
 
 data class ClickGlobalSettings(
     val defaultIntervalMs: Long = ClickTarget.DEFAULT_INTERVAL_MS,
@@ -530,6 +516,7 @@ object ClickConfigStore {
     fun loadPresets(context: Context): MutableList<ClickPreset> {
         val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
         val raw = prefs.getString(KEY_PRESETS_JSON, null)
+        var migratedLegacyFrozen = false
         val parsed = if (!raw.isNullOrBlank()) {
             try {
                 val arr = JSONArray(raw)
@@ -537,8 +524,17 @@ object ClickConfigStore {
                 for (i in 0 until arr.length()) {
                     val obj = arr.optJSONObject(i) ?: continue
                     val id = obj.optString("id", "").ifBlank { "preset_${i + 1}" }
-                    val name = obj.optString("name", "").ifBlank { "方案 ${i + 1}" }
+                    var name = obj.optString("name", "").ifBlank { "方案 ${i + 1}" }
                     val execMode = ExecutionMode.fromCode(obj.optInt("executionMode", 0))
+                    val loopCount = obj.optInt("presetLoopCount", 0)
+                        .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+                    var frozen = if (obj.has("isFrozen")) obj.optBoolean("isFrozen", false) else false
+                    if (!obj.has("isFrozen") && name.trimStart().startsWith("#")) {
+                        name = name.trimStart().dropWhile { it == '#' }.trimStart().ifEmpty { "方案 ${i + 1}" }
+                        frozen = true
+                        migratedLegacyFrozen = true
+                    }
+                    val parentId = obj.optString("parentPresetId", "")
                     val targets = jsonArrayToTargets(
                         obj.optJSONArray("targets"),
                         defaultRepeat = ClickTarget.defaultRepeatFor(execMode)
@@ -547,6 +543,9 @@ object ClickConfigStore {
                         id = id,
                         name = name,
                         executionMode = execMode,
+                        presetLoopCount = loopCount,
+                        isFrozen = frozen,
+                        parentPresetId = parentId,
                         targets = targets
                     )
                 }
@@ -559,8 +558,8 @@ object ClickConfigStore {
         }
 
         if (parsed.isNotEmpty()) {
+            var changed = migratedLegacyFrozen
             if (!prefs.getBoolean(KEY_MIGRATED_CONCURRENT_ZERO, false)) {
-                var changed = false
                 for (p in parsed) {
                     if (p.executionMode == ExecutionMode.CONCURRENT) {
                         for (t in p.targets) {
@@ -572,10 +571,10 @@ object ClickConfigStore {
                     }
                 }
                 prefs.edit().putBoolean(KEY_MIGRATED_CONCURRENT_ZERO, true).apply()
-                if (changed) {
-                    val savedId = prefs.getString(KEY_ACTIVE_PRESET_ID, parsed.first().id) ?: parsed.first().id
-                    persistPresetsInternal(context, parsed, savedId)
-                }
+            }
+            if (changed) {
+                val savedId = prefs.getString(KEY_ACTIVE_PRESET_ID, parsed.first().id) ?: parsed.first().id
+                persistPresetsInternal(context, parsed, savedId)
             }
             return parsed
         }
@@ -609,6 +608,11 @@ object ClickConfigStore {
                 put("id", preset.id)
                 put("name", preset.name)
                 put("executionMode", preset.executionMode.code)
+                put("presetLoopCount", preset.presetLoopCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT))
+                put("isFrozen", preset.isFrozen)
+                if (preset.parentPresetId.isNotBlank()) {
+                    put("parentPresetId", preset.parentPresetId)
+                }
                 put("targets", targetsToJsonArray(preset.targets))
             })
         }
@@ -623,7 +627,10 @@ object ClickConfigStore {
         val presets = loadPresets(context)
         val savedId = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             .getString(KEY_ACTIVE_PRESET_ID, DEFAULT_PRESET_ID)
-        val resolved = presets.firstOrNull { it.id == savedId } ?: presets.first()
+        val resolved = presets.firstOrNull { it.id == savedId && !it.isFrozen }
+            ?: presets.firstOrNull { !it.isFrozen }
+            ?: presets.firstOrNull { it.id == savedId }
+            ?: presets.first()
         if (resolved.id != savedId) {
             context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit()
                 .putString(KEY_ACTIVE_PRESET_ID, resolved.id)
@@ -640,9 +647,25 @@ object ClickConfigStore {
 
     fun getActivePresetIndexAndTotal(context: Context): Pair<Int, Int> {
         val presets = loadPresets(context)
+        val switchable = presets.filter { !it.isFrozen }
+        if (switchable.isEmpty()) return Pair(0, 1)
         val activeId = getActivePresetId(context)
-        val idx = presets.indexOfFirst { it.id == activeId }.coerceAtLeast(0)
-        return Pair(idx, presets.size.coerceAtLeast(1))
+        val idx = switchable.indexOfFirst { it.id == activeId }.coerceAtLeast(0)
+        return Pair(idx, switchable.size)
+    }
+
+    fun nextMainPresetNumber(presets: List<ClickPreset>): Int {
+        val regex = Regex("^方案\\s*(\\d+)$")
+        var maxNum = 0
+        for (p in presets) {
+            val m = regex.find(p.name.trim())
+            if (m != null) {
+                val n = m.groupValues[1].toIntOrNull() ?: 0
+                if (n > maxNum) maxNum = n
+            }
+        }
+        val topLevelCount = presets.count { it.parentPresetId.isBlank() && !it.isFrozen }
+        return max(maxNum + 1, topLevelCount + 1)
     }
 
     fun setActivePresetId(context: Context, presetId: String): ClickPreset {
@@ -657,6 +680,9 @@ object ClickConfigStore {
         name: String,
         initialTargets: List<ClickTarget> = emptyList(),
         executionMode: ExecutionMode = ExecutionMode.CONCURRENT,
+        presetLoopCount: Int = 0,
+        isFrozen: Boolean = false,
+        parentPresetId: String = "",
         activate: Boolean = true
     ): ClickPreset {
         val presets = loadPresets(context)
@@ -667,7 +693,7 @@ object ClickConfigStore {
             seq++
             newId = "preset_$seq"
         }
-        val cleanName = name.trim().ifEmpty { "方案 ${presets.size + 1}" }
+        val cleanName = name.trim().ifEmpty { "方案 ${nextMainPresetNumber(presets)}" }
         val copiedTargets = initialTargets.mapIndexed { idx, t ->
             t.copy(id = idx + 1, index = idx + 1)
         }.toMutableList()
@@ -675,10 +701,13 @@ object ClickConfigStore {
             id = newId,
             name = cleanName,
             executionMode = executionMode,
+            presetLoopCount = presetLoopCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT),
+            isFrozen = isFrozen,
+            parentPresetId = parentPresetId,
             targets = copiedTargets
         )
         presets += created
-        val nextActiveId = if (activate) created.id else getActivePresetId(context)
+        val nextActiveId = if (activate && !isFrozen) created.id else getActivePresetId(context)
         persistPresetsInternal(context, presets, nextActiveId)
         return created
     }
@@ -698,6 +727,7 @@ object ClickConfigStore {
             return id
         }
 
+        val mainId = allocId()
         val idRemap = HashMap<String, String>()
         val finalSubs = subPresets.map { sub ->
             val newId = allocId()
@@ -709,11 +739,13 @@ object ClickConfigStore {
                 id = newId,
                 name = sub.name.trim().ifEmpty { newId },
                 executionMode = sub.executionMode,
+                presetLoopCount = sub.presetLoopCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT),
+                isFrozen = true,
+                parentPresetId = mainId,
                 targets = copiedTargets
             )
         }
 
-        val mainId = allocId()
         val finalMainTargets = mainPreset.targets.mapIndexed { idx, t ->
             val remappedRef = if (t.actionType == ActionType.SUB_PRESET) {
                 idRemap[t.refPresetId] ?: t.refPresetId
@@ -722,8 +754,11 @@ object ClickConfigStore {
         }.toMutableList()
         val finalMain = ClickPreset(
             id = mainId,
-            name = mainPreset.name.trim().ifEmpty { "方案 ${presets.size + 1}" },
+            name = mainPreset.name.trim().ifEmpty { "方案 ${nextMainPresetNumber(presets)}" },
             executionMode = mainPreset.executionMode,
+            presetLoopCount = mainPreset.presetLoopCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT),
+            isFrozen = false,
+            parentPresetId = "",
             targets = finalMainTargets
         )
 
@@ -738,15 +773,29 @@ object ClickConfigStore {
         if (clean.isEmpty()) return false
         val presets = loadPresets(context)
         val target = presets.firstOrNull { it.id == presetId } ?: return false
+        val oldName = target.name
         target.name = clean
-        val currentActive = getActivePresetId(context)
-        val activeObj = presets.firstOrNull { it.id == currentActive }
-        val nextActive = if (activeObj == null || activeObj.isFrozen) {
-            presets.firstOrNull { !it.isFrozen }?.id ?: currentActive
-        } else {
-            currentActive
+        if (oldName != clean) {
+            for (child in presets) {
+                if (child.parentPresetId == target.id && child.name.startsWith("$oldName.")) {
+                    val suffix = child.name.removePrefix("$oldName.")
+                    child.name = "$clean.$suffix"
+                }
+            }
         }
-        persistPresetsInternal(context, presets, nextActive)
+        val currentActive = getActivePresetId(context)
+        persistPresetsInternal(context, presets, currentActive)
+        return true
+    }
+
+    fun setPresetLoopCount(context: Context, presetId: String, loopCount: Int): Boolean {
+        val presets = loadPresets(context)
+        val target = presets.firstOrNull { it.id == presetId } ?: return false
+        val safe = loopCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+        if (target.presetLoopCount != safe) {
+            target.presetLoopCount = safe
+            persistPresetsInternal(context, presets, getActivePresetId(context))
+        }
         return true
     }
 
@@ -1052,31 +1101,64 @@ object ClickConfigStore {
         }
     }
 
+    fun collectCascadeDeleteIds(
+        presets: List<ClickPreset>,
+        initialIds: Set<String>
+    ): Set<String> {
+        val toDelete = initialIds.toMutableSet()
+        val byId = presets.associateBy { it.id }
+        var expanded = true
+        while (expanded) {
+            expanded = false
+            for (p in presets) {
+                if (p.parentPresetId.isNotBlank() && p.parentPresetId in toDelete && p.id !in toDelete) {
+                    toDelete += p.id
+                    expanded = true
+                }
+            }
+            for (pid in toDelete.toList()) {
+                val p = byId[pid] ?: continue
+                for (t in p.targets) {
+                    if (t.actionType == ActionType.SUB_PRESET && t.refPresetId.isNotBlank()) {
+                        val childId = t.refPresetId
+                        val child = byId[childId] ?: continue
+                        if (childId in toDelete) continue
+                        val referencedBySurviving = presets.any { other ->
+                            other.id !in toDelete &&
+                                other.targets.any { it.actionType == ActionType.SUB_PRESET && it.refPresetId == childId }
+                        }
+                        if ((child.parentPresetId == p.id || child.isFrozen) && !referencedBySurviving) {
+                            toDelete += childId
+                            expanded = true
+                        }
+                    }
+                }
+            }
+        }
+        return toDelete
+    }
+
     fun deletePreset(context: Context, presetId: String): Boolean {
         val presets = loadPresets(context)
-        if (presets.size <= 1) return false
-        val idx = presets.indexOfFirst { it.id == presetId }
-        if (idx < 0) return false
+        if (presets.none { it.id == presetId }) return false
+        val cascadeIds = collectCascadeDeleteIds(presets, setOf(presetId))
+        val remaining = presets.filter { it.id !in cascadeIds }
+        if (remaining.isEmpty()) return false
         val currentActive = getActivePresetId(context)
-        presets.removeAt(idx)
-        val nextActive = if (currentActive == presetId) {
-            val idxCandidate = presets[idx.coerceAtMost(presets.lastIndex)]
-            if (!idxCandidate.isFrozen) {
-                idxCandidate.id
-            } else {
-                presets.firstOrNull { !it.isFrozen }?.id ?: idxCandidate.id
-            }
-        } else {
+        val nextActive = if (remaining.any { it.id == currentActive && !it.isFrozen }) {
             currentActive
+        } else {
+            remaining.firstOrNull { !it.isFrozen }?.id ?: remaining.first().id
         }
-        persistPresetsInternal(context, presets, nextActive)
+        persistPresetsInternal(context, remaining, nextActive)
         return true
     }
 
     fun deletePresetsBatch(context: Context, presetIds: Set<String>): Int {
         if (presetIds.isEmpty()) return 0
         val presets = loadPresets(context)
-        val remaining = presets.filter { it.id !in presetIds }
+        val cascadeIds = collectCascadeDeleteIds(presets, presetIds)
+        val remaining = presets.filter { it.id !in cascadeIds }
         if (remaining.isEmpty()) return 0
         val deletedCount = presets.size - remaining.size
         if (deletedCount <= 0) return 0
@@ -1100,7 +1182,7 @@ object ClickConfigStore {
         val existingIds = presets.map { it.id }.toMutableSet()
         val existingNames = presets.map { it.name }.toMutableSet()
         var seq = presets.size + 1
-        var nameNum = presets.size + 1
+        var nameNum = nextMainPresetNumber(presets)
         val created = mutableListOf<ClickPreset>()
         repeat(safeCount) {
             while ("preset_$seq" in existingIds) seq++
@@ -1122,13 +1204,36 @@ object ClickConfigStore {
         return created
     }
 
+    fun applyPresetFreezeStates(context: Context, frozenIds: Set<String>): Int {
+        val presets = loadPresets(context)
+        var changed = 0
+        for (preset in presets) {
+            val wantFrozen = preset.id in frozenIds
+            if (preset.isFrozen != wantFrozen) {
+                preset.isFrozen = wantFrozen
+                changed++
+            }
+        }
+        if (changed > 0) {
+            val currentActive = getActivePresetId(context)
+            val activeObj = presets.firstOrNull { it.id == currentActive }
+            val nextActive = if (activeObj == null || activeObj.isFrozen) {
+                presets.firstOrNull { !it.isFrozen }?.id ?: currentActive
+            } else {
+                currentActive
+            }
+            persistPresetsInternal(context, presets, nextActive)
+        }
+        return changed
+    }
+
     fun freezePresetsBatch(context: Context, presetIds: Set<String>): Int {
         if (presetIds.isEmpty()) return 0
         val presets = loadPresets(context)
         var changed = 0
         for (preset in presets) {
             if (preset.id in presetIds && !preset.isFrozen) {
-                preset.name = ClickPreset.freezeName(preset.name)
+                preset.isFrozen = true
                 changed++
             }
         }
@@ -1151,7 +1256,7 @@ object ClickConfigStore {
         var changed = 0
         for (preset in presets) {
             if (preset.id in presetIds && preset.isFrozen) {
-                preset.name = ClickPreset.unfreezeName(preset.name)
+                preset.isFrozen = false
                 changed++
             }
         }
@@ -1172,8 +1277,8 @@ object ClickConfigStore {
             switchable.first()
         }
         persistPresetsInternal(context, presets, nextPreset.id)
-        val fullIdx = presets.indexOfFirst { it.id == nextPreset.id }.coerceAtLeast(0)
-        return Triple(fullIdx, presets.size, nextPreset)
+        val switchIdx = switchable.indexOfFirst { it.id == nextPreset.id }.coerceAtLeast(0)
+        return Triple(switchIdx, switchable.size, nextPreset)
     }
 
     fun exportPresetToJson(preset: ClickPreset): String {
@@ -1181,6 +1286,7 @@ object ClickConfigStore {
             put("schema", "zerointerrupt.preset.v3")
             put("name", preset.name)
             put("executionMode", preset.executionMode.code)
+            put("presetLoopCount", preset.presetLoopCount)
             put("targets", targetsToJsonArray(preset.targets))
         }
         return obj.toString(2)
@@ -1193,6 +1299,11 @@ object ClickConfigStore {
                 put("id", preset.id)
                 put("name", preset.name)
                 put("executionMode", preset.executionMode.code)
+                put("presetLoopCount", preset.presetLoopCount)
+                put("isFrozen", preset.isFrozen)
+                if (preset.parentPresetId.isNotBlank()) {
+                    put("parentPresetId", preset.parentPresetId)
+                }
                 put("targets", targetsToJsonArray(preset.targets))
             })
         }
@@ -1216,15 +1327,19 @@ object ClickConfigStore {
             if (trimmed.isEmpty()) return null
             val name: String
             val execMode: ExecutionMode
+            val loopCount: Int
             val targets: MutableList<ClickTarget>
             if (trimmed.startsWith("[")) {
                 name = "导入方案"
                 execMode = ExecutionMode.CONCURRENT
+                loopCount = 0
                 targets = jsonArrayToTargets(JSONArray(trimmed), defaultRepeat = 0)
             } else {
                 val obj = JSONObject(trimmed)
                 name = obj.optString("name", "").ifBlank { "导入方案" }
                 execMode = ExecutionMode.fromCode(obj.optInt("executionMode", 0))
+                loopCount = obj.optInt("presetLoopCount", 0)
+                    .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
                 targets = jsonArrayToTargets(
                     obj.optJSONArray("targets"),
                     defaultRepeat = ClickTarget.defaultRepeatFor(execMode)
@@ -1236,6 +1351,7 @@ object ClickConfigStore {
                 name = name,
                 initialTargets = targets,
                 executionMode = execMode,
+                presetLoopCount = loopCount,
                 activate = true
             )
         } catch (_: Throwable) {
@@ -1295,6 +1411,9 @@ object ClickConfigStore {
                 val newId: String,
                 val name: String,
                 val mode: ExecutionMode,
+                val loopCount: Int,
+                val isFrozen: Boolean,
+                val oldParentId: String,
                 val targets: MutableList<ClickTarget>
             )
 
@@ -1308,14 +1427,22 @@ object ClickConfigStore {
                     oldToNewId[oldId] = newId
                 }
                 val execMode = ExecutionMode.fromCode(item.optInt("executionMode", 0))
+                val loopCount = item.optInt("presetLoopCount", 0)
+                    .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+                var rawName = item.optString("name", "").trim()
+                var isFrozen = item.optBoolean("isFrozen", false)
+                if (!item.has("isFrozen") && rawName.startsWith("#")) {
+                    rawName = rawName.dropWhile { it == '#' }.trimStart()
+                    isFrozen = true
+                }
+                val oldParentId = item.optString("parentPresetId", "").trim()
                 val targets = jsonArrayToTargets(
                     item.optJSONArray("targets"),
                     defaultRepeat = ClickTarget.defaultRepeatFor(execMode)
                 )
                 targets.forEach { it.remapToScreen(screenW, screenH) }
-                val cleanName = item.optString("name", "").trim()
-                    .ifEmpty { "导入方案 ${existingPresets.size + staged.size + 1}" }
-                staged += StagedPreset(oldId, newId, cleanName, execMode, targets)
+                val cleanName = rawName.ifEmpty { "导入方案 ${existingPresets.size + staged.size + 1}" }
+                staged += StagedPreset(oldId, newId, cleanName, execMode, loopCount, isFrozen, oldParentId, targets)
             }
             if (staged.isEmpty()) return emptyList()
 
@@ -1330,16 +1457,24 @@ object ClickConfigStore {
                         remapToScreen(screenW, screenH)
                     }
                 }.toMutableList()
+                val resolvedParentId = if (s.oldParentId.isNotBlank()) {
+                    oldToNewId[s.oldParentId] ?: ""
+                } else ""
                 ClickPreset(
                     id = s.newId,
                     name = s.name,
                     executionMode = s.mode,
+                    presetLoopCount = s.loopCount,
+                    isFrozen = s.isFrozen,
+                    parentPresetId = resolvedParentId,
                     targets = remappedTargets
                 )
             }
 
             existingPresets += imported
-            val activeNewId = oldToNewId[desiredActiveOldId] ?: imported.last().id
+            val activeNewId = oldToNewId[desiredActiveOldId]
+                ?: imported.lastOrNull { !it.isFrozen }?.id
+                ?: imported.last().id
             persistPresetsInternal(context, existingPresets, activeNewId)
             imported
         } catch (_: Throwable) {
@@ -1349,6 +1484,7 @@ object ClickConfigStore {
 
     const val SCRIPT_TEMPLATE_EXAMPLE = """# name: 脚本方案
 # mode: seq
+# loop: 1
 tap 540 1200 24 80 1
 hold 540 1500 600 40 1
 swipe 300 1600 800 1600 280 120 1"""
@@ -1369,8 +1505,9 @@ swipe 300 1600 800 1600 280 120 1"""
         }
 
         val presets = loadPresets(context)
-        var name = "脚本方案 ${presets.size + 1}"
+        var name = "脚本方案 ${nextMainPresetNumber(presets)}"
         var execMode = ExecutionMode.SEQUENTIAL
+        var loopCount = 0
         val parsedTargets = mutableListOf<ClickTarget>()
         var nextId = 1
 
@@ -1390,6 +1527,12 @@ swipe 300 1600 800 1600 280 120 1"""
                             ExecutionMode.CONCURRENT
                         } else {
                             ExecutionMode.SEQUENTIAL
+                        }
+                    }
+                    meta.startsWith("loop:", ignoreCase = true) -> {
+                        val parsed = meta.substringAfter(":").trim().toIntOrNull()
+                        if (parsed != null) {
+                            loopCount = parsed.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
                         }
                     }
                 }
@@ -1484,6 +1627,7 @@ swipe 300 1600 800 1600 280 120 1"""
             name = name,
             initialTargets = parsedTargets,
             executionMode = execMode,
+            presetLoopCount = loopCount,
             activate = true
         )
     }

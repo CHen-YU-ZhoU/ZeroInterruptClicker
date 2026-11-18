@@ -490,7 +490,8 @@ object ShizukuController {
 
     fun startClicking(
         targets: List<ClickTarget>? = null,
-        executionMode: ExecutionMode? = null
+        executionMode: ExecutionMode? = null,
+        presetLoopCount: Int? = null
     ): Int {
         val ctx = appContext ?: return -1
         val svc = service ?: return -2
@@ -508,6 +509,7 @@ object ShizukuController {
             val presets = ClickConfigStore.loadPresets(ctx)
             val activePreset = ClickConfigStore.getActivePreset(ctx)
             val effectiveMode = executionMode ?: activePreset.executionMode
+            val effectiveLoopCount = (presetLoopCount ?: activePreset.presetLoopCount).coerceIn(0, 9999)
             val parceled = ClickConfigStore.compileTargetsForExecution(
                 presets = presets,
                 activePreset = activePreset,
@@ -525,6 +527,7 @@ object ShizukuController {
                 metrics.rotation,
                 true,
                 effectiveMode.code,
+                effectiveLoopCount,
                 settings.jitterRadiusPx,
                 settings.preferredBackend
             )
@@ -542,7 +545,8 @@ object ShizukuController {
 
     fun updateTargets(
         targets: List<ClickTarget>? = null,
-        executionMode: ExecutionMode? = null
+        executionMode: ExecutionMode? = null,
+        presetLoopCount: Int? = null
     ) {
         val ctx = appContext ?: return
         val svc = service ?: return
@@ -552,6 +556,7 @@ object ShizukuController {
             val presets = ClickConfigStore.loadPresets(ctx)
             val activePreset = ClickConfigStore.getActivePreset(ctx)
             val effectiveMode = executionMode ?: activePreset.executionMode
+            val effectiveLoopCount = (presetLoopCount ?: activePreset.presetLoopCount).coerceIn(0, 9999)
             val parceled = ClickConfigStore.compileTargetsForExecution(
                 presets = presets,
                 activePreset = activePreset,
@@ -567,6 +572,7 @@ object ShizukuController {
                 metrics.heightPx,
                 metrics.rotation,
                 effectiveMode.code,
+                effectiveLoopCount,
                 settings.jitterRadiusPx
             )
         } catch (t: Throwable) {

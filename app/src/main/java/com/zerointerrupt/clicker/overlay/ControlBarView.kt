@@ -343,10 +343,8 @@ class ControlBarView(
         footerExpandView.invalidate()
     }
 
-    private fun smoothStep(value: Float, edge0: Float, edge1: Float): Float {
-        val t = ((value - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
-        return t * t * (3f - 2f * t)
-    }
+    private fun linearRamp(value: Float, edge0: Float, edge1: Float): Float =
+        ((value - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
 
     fun prepareMorphLayout(
         dockRight: Boolean,
@@ -379,27 +377,26 @@ class ControlBarView(
         val pillCenterY = (pillTopMarginPx + collapsedHeightPx * 0.5f).coerceIn(0f, expandedH)
         val sign = if (dockRight) -1f else 1f
 
-        val glideT = smoothStep(p, 0.04f, 0.92f)
+        // Direct linear-in-progress mapping so outer M3 velocity curve is never double-eased or stalled mid-flight.
         expandedContainer.translationX = if (dockRight) {
-            edgeMarginPx * (1f - glideT)
+            edgeMarginPx * (1f - p)
         } else {
-            edgeMarginPx * glideT
+            edgeMarginPx * p
         }
         expandedContainer.pivotX = if (dockRight) expandedWidthPx.toFloat() else 0f
         expandedContainer.pivotY = pillCenterY
 
-        val morphT = smoothStep(p, 0.05f, 1.0f)
-        expandedContainer.scaleX = 0.38f + 0.62f * morphT
-        expandedContainer.scaleY = 0.50f + 0.50f * morphT
-        expandedContainer.alpha = smoothStep(p, 0.08f, 0.48f)
+        expandedContainer.scaleX = 0.42f + 0.58f * p
+        expandedContainer.scaleY = 0.52f + 0.48f * p
+        expandedContainer.alpha = linearRamp(p, 0.06f, 0.52f)
 
-        val peelT = smoothStep(p, 0.0f, 0.42f)
+        val peelT = linearRamp(p, 0.0f, 0.45f)
         collapsedPillView.pivotX = if (dockRight) collapsedWidthPx.toFloat() else 0f
         collapsedPillView.pivotY = collapsedHeightPx * 0.5f
         collapsedPillView.translationX = sign * (edgeMarginPx * 0.36f) * peelT
         collapsedPillView.scaleX = 1f
         collapsedPillView.scaleY = 1f
-        collapsedPillView.alpha = 1f - smoothStep(p, 0.14f, 0.44f)
+        collapsedPillView.alpha = 1f - linearRamp(p, 0.12f, 0.48f)
         collapsedPillView.setExpandMorph(peelT)
     }
 

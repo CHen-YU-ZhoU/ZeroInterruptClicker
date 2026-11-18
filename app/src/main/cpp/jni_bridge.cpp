@@ -341,7 +341,8 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeSetTargetsAndRu
     jint displayH,
     jint rotation,
     jfloat jitterRadiusPx,
-    jint executionMode) {
+    jint executionMode,
+    jint presetLoopCount) {
     const jsize count = ids ? env->GetArrayLength(ids) : 0;
     std::vector<touchmux::NativeClickTarget> targets;
     if (count > 0) {
@@ -415,7 +416,8 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeSetTargetsAndRu
         displayH,
         rotation,
         jitterRadiusPx,
-        executionMode
+        executionMode,
+        presetLoopCount
     );
 }
 

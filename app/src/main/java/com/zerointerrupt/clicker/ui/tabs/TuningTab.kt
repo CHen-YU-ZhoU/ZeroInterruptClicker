@@ -154,22 +154,9 @@ fun TuningTab(
                         callbacks.onPressChange(state.pressDurationMs, true)
                     }
                 )
-            }
-        }
-
-        ExpressiveCard {
-            Column(
-                modifier = Modifier.padding(18.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                Text(
-                    text = "防检测与交互",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
 
                 SliderBlock(
-                    label = "高斯微抖动半径",
+                    label = "高斯微抖动半径（仅连点）",
                     valueBadge = "${state.jitterRadiusPx.roundToInt()} px",
                     value = state.jitterRadiusPx.coerceIn(0f, 16f),
                     valueRange = 0f..16f,
@@ -184,6 +171,24 @@ fun TuningTab(
                     onValueChangeFinished = {
                         callbacks.onJitterRadiusChange(state.jitterRadiusPx, true)
                     }
+                )
+                Text(
+                    text = "仅对「连点」生效，不影响滑动、长按与录制连招精度",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.onSurfaceVariant
+                )
+            }
+        }
+
+        ExpressiveCard {
+            Column(
+                modifier = Modifier.padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text(
+                    text = "交互设置",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
                 )
 
                 SliderBlock(

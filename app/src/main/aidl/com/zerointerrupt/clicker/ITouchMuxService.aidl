@@ -16,6 +16,7 @@ interface ITouchMuxService {
         int rotation,
         boolean allowFallback,
         int executionMode,
+        int presetLoopCount,
         float jitterRadiusPx,
         int preferredBackend
     );
@@ -25,6 +26,7 @@ interface ITouchMuxService {
         int displayHeight,
         int rotation,
         int executionMode,
+        int presetLoopCount,
         float jitterRadiusPx
     );
     void updateDisplayMetrics(int displayWidth, int displayHeight, int rotation);

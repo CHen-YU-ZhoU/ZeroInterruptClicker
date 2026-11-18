@@ -82,6 +82,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
     private var fallbackDisplayW: Int = 1080
     private var fallbackDisplayH: Int = 2400
     private var fallbackExecutionMode: Int = 0
+    private var fallbackPresetLoopCount: Int = 0
     private var fallbackJitterRadiusPx: Float = 4.0f
     private var fallbackConfigVersion: Long = 0L
     private var fallbackThread: Thread? = null
@@ -135,7 +136,8 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         displayH: Int,
         rotation: Int,
         jitterRadiusPx: Float,
-        executionMode: Int
+        executionMode: Int,
+        presetLoopCount: Int
     )
     private external fun nativeUpdateDisplayMetrics(displayW: Int, displayH: Int, rotation: Int)
     private external fun nativeStopClicking()
@@ -559,6 +561,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         rotation: Int,
         allowFallback: Boolean,
         executionMode: Int,
+        presetLoopCount: Int,
         jitterRadiusPx: Float,
         prefBackend: Int
     ): Int {
@@ -572,6 +575,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 displayWidth = displayWidth,
                 displayHeight = displayHeight,
                 executionMode = executionMode,
+                presetLoopCount = presetLoopCount,
                 jitterRadiusPx = jitterRadiusPx
             )
         }
@@ -587,7 +591,8 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 displayH = displayHeight,
                 rotation = rotation,
                 jitterRadiusPx = jitterRadiusPx,
-                executionMode = executionMode
+                executionMode = executionMode,
+                presetLoopCount = presetLoopCount
             )
             currentMode.set(mode)
             clickingActive.set(true)
@@ -605,6 +610,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             displayWidth = displayWidth,
             displayHeight = displayHeight,
             executionMode = executionMode,
+            presetLoopCount = presetLoopCount,
             jitterRadiusPx = jitterRadiusPx
         )
     }
@@ -614,6 +620,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         displayWidth: Int,
         displayHeight: Int,
         executionMode: Int,
+        presetLoopCount: Int,
         jitterRadiusPx: Float
     ): Int {
         if (!ensureFallbackInjectorReady()) {
@@ -625,6 +632,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             fallbackDisplayW = displayWidth.coerceAtLeast(1)
             fallbackDisplayH = displayHeight.coerceAtLeast(1)
             fallbackExecutionMode = executionMode
+            fallbackPresetLoopCount = presetLoopCount.coerceIn(0, 9999)
             fallbackJitterRadiusPx = jitterRadiusPx.coerceIn(0f, 16f)
             fallbackConfigVersion++
         }
@@ -641,6 +649,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         displayHeight: Int,
         rotation: Int,
         executionMode: Int,
+        presetLoopCount: Int,
         jitterRadiusPx: Float
     ) {
         val list = targets ?: emptyList()
@@ -653,7 +662,8 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 displayH = displayHeight,
                 rotation = rotation,
                 jitterRadiusPx = jitterRadiusPx,
-                executionMode = executionMode
+                executionMode = executionMode,
+                presetLoopCount = presetLoopCount
             )
         } else {
             synchronized(fallbackLock) {
@@ -661,6 +671,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 fallbackDisplayW = displayWidth.coerceAtLeast(1)
                 fallbackDisplayH = displayHeight.coerceAtLeast(1)
                 fallbackExecutionMode = executionMode
+                fallbackPresetLoopCount = presetLoopCount.coerceIn(0, 9999)
                 fallbackJitterRadiusPx = jitterRadiusPx.coerceIn(0f, 16f)
                 fallbackConfigVersion++
             }
@@ -910,7 +921,8 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         displayH: Int,
         rotation: Int,
         jitterRadiusPx: Float,
-        executionMode: Int
+        executionMode: Int,
+        presetLoopCount: Int
     ) {
         val n = list.size
         val ids = IntArray(n)
@@ -976,7 +988,8 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             displayH,
             rotation,
             jitterRadiusPx.coerceIn(0f, 16f),
-            executionMode
+            executionMode,
+            presetLoopCount.coerceIn(0, 9999)
         )
     }
 
@@ -1069,6 +1082,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         val fbSizes = FloatArray(MAX_SLOTS)
         var downTimeMs = 0L
         var activeStageIdx = 0
+        var seqCompletedLoops = 0
         var lastConfigVersion = -1L
         var lastExecMode = -1
         var completedNaturally = false
@@ -1140,6 +1154,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 val dispW: Int
                 val dispH: Int
                 val execMode: Int
+                val loopCount: Int
                 val jitterRad: Float
                 val configVersion: Long
                 synchronized(fallbackLock) {
@@ -1147,6 +1162,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                     dispW = fallbackDisplayW
                     dispH = fallbackDisplayH
                     execMode = fallbackExecutionMode
+                    loopCount = fallbackPresetLoopCount
                     jitterRad = fallbackJitterRadiusPx
                     configVersion = fallbackConfigVersion
                 }
@@ -1165,6 +1181,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                         }
                         stagesList.clear()
                         activeStageIdx = 0
+                        seqCompletedLoops = 0
                         for (t in snapshot) {
                             if (!t.enabled) continue
                             if (stagesList.isEmpty() || stagesList.last().stageIndex != t.stageIndex) {
@@ -1236,6 +1253,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                     val maxX = (dispW - 1).coerceAtLeast(1).toFloat()
                     val maxY = (dispH - 1).coerceAtLeast(1).toFloat()
                     val act = st.config.actionType
+                    val useTapJitter = (act == ACTION_TAP) && st.config.microJitter
 
                     if (!st.pressed) {
                         val carriedPtr = if (st.config.holdInId > 0) {
@@ -1247,22 +1265,18 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                             st.startX = carriedPtr.x
                             st.startY = carriedPtr.y
                             if (act == ACTION_SWIPE) {
-                                val exJitter = if (st.config.microJitter && st.config.holdOutId <= 0) sampleGaussianOffset(jitterRad) else 0f
-                                val eyJitter = if (st.config.microJitter && st.config.holdOutId <= 0) sampleGaussianOffset(jitterRad) else 0f
-                                st.endX = (st.config.endX + exJitter).coerceIn(0f, maxX)
-                                st.endY = (st.config.endY + eyJitter).coerceIn(0f, maxY)
+                                st.endX = st.config.endX.coerceIn(0f, maxX)
+                                st.endY = st.config.endY.coerceIn(0f, maxY)
                             }
                             carriedPtr.pointerId
                         } else {
-                            val sx = (st.config.x + if (st.config.microJitter) sampleGaussianOffset(jitterRad) else 0f).coerceIn(0f, maxX)
-                            val sy = (st.config.y + if (st.config.microJitter) sampleGaussianOffset(jitterRad) else 0f).coerceIn(0f, maxY)
+                            val sx = (st.config.x + if (useTapJitter) sampleGaussianOffset(jitterRad) else 0f).coerceIn(0f, maxX)
+                            val sy = (st.config.y + if (useTapJitter) sampleGaussianOffset(jitterRad) else 0f).coerceIn(0f, maxY)
                             st.startX = sx
                             st.startY = sy
                             if (act == ACTION_SWIPE) {
-                                val exJitter = if (st.config.microJitter && st.config.holdOutId <= 0) sampleGaussianOffset(jitterRad) else 0f
-                                val eyJitter = if (st.config.microJitter && st.config.holdOutId <= 0) sampleGaussianOffset(jitterRad) else 0f
-                                st.endX = (st.config.endX + exJitter).coerceIn(0f, maxX)
-                                st.endY = (st.config.endY + eyJitter).coerceIn(0f, maxY)
+                                st.endX = st.config.endX.coerceIn(0f, maxX)
+                                st.endY = st.config.endY.coerceIn(0f, maxY)
                             }
                             pressPointer(st.config.id, sx, sy)
                         }
@@ -1272,7 +1286,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                             st.swipeFinalReached = false
                             when {
                                 act == ACTION_SWIPE -> {
-                                    val durMs = sampleGaussianMs(st.config.swipeDurationMs, st.config.microJitter, 8L, 15_000L)
+                                    val durMs = sampleGaussianMs(st.config.swipeDurationMs, false, 8L, 15_000L)
                                     st.swipeStartNs = nowNs
                                     st.swipeEndNs = nowNs + durMs * 1_000_000L
                                     st.nextDeadlineNs = minOf(st.swipeEndNs, nowNs + 4_000_000L)
@@ -1284,7 +1298,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                                 else -> {
                                     val pressMs = sampleGaussianMs(
                                         st.config.pressDurationMs,
-                                        st.config.microJitter,
+                                        useTapJitter,
                                         8L,
                                         if (act == ACTION_HOLD) 30_000L else 5_000L
                                     )
@@ -1359,7 +1373,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                     st.pressed = false
                     st.swipeFinalReached = false
                     st.pointerId = -1
-                    val intervalMs = if (handoffOut) 0L else sampleGaussianMs(st.config.intervalMs, st.config.microJitter, 5L, 60_000L)
+                    val intervalMs = if (handoffOut) 0L else sampleGaussianMs(st.config.intervalMs, useTapJitter, 5L, 60_000L)
                     st.nextDeadlineNs = nowNs + intervalMs * 1_000_000L
                     return true
                 }
@@ -1396,7 +1410,15 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                                 break
                             }
                             stage.inGap = false
-                            activeStageIdx = (activeStageIdx + 1) % stagesList.size
+                            val nextStageIdx = (activeStageIdx + 1) % stagesList.size
+                            if (nextStageIdx == 0) {
+                                seqCompletedLoops++
+                                if (loopCount >= 1 && seqCompletedLoops >= loopCount) {
+                                    completedNaturally = true
+                                    break
+                                }
+                            }
+                            activeStageIdx = nextStageIdx
                             resetStageTargets(stagesList[activeStageIdx], nowNs, preserveHeld = false)
                             continue
                         }
@@ -1456,8 +1478,14 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                                     earliestNs = minOf(earliestNs, stage.startDelayUntilNs)
                                 } else {
                                     stage.completedRepeats = 0
+                                    val nextStageIdx = (activeStageIdx + 1) % stagesList.size
+                                    if (nextStageIdx == 0 && loopCount >= 1 && (seqCompletedLoops + 1) >= loopCount) {
+                                        seqCompletedLoops++
+                                        completedNaturally = true
+                                        break
+                                    }
                                     if (gapMs == 0L) {
-                                        activeStageIdx = (activeStageIdx + 1) % stagesList.size
+                                        activeStageIdx = nextStageIdx
                                         resetStageTargets(stagesList[activeStageIdx], nowNs, preserveHeld = false)
                                         if (stagesList.size > 1) {
                                             continue
@@ -1494,13 +1522,22 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                             val completed = stepState(vt)
                             if (completed && stage.repeatCount >= 1) {
                                 stage.completedRepeats++
+                                val isTapStage = vt.config.actionType == ACTION_TAP
                                 if (stage.completedRepeats < stage.repeatCount) {
-                                    val waitMs = sampleGaussianMs(vt.config.intervalMs, vt.config.microJitter, 5L, 60_000L)
+                                    val waitMs = sampleGaussianMs(vt.config.intervalMs, isTapStage && vt.config.microJitter, 5L, 60_000L)
                                     vt.nextDeadlineNs = nowNs + waitMs * 1_000_000L
                                 } else {
-                                    val waitMs = sampleGaussianMs(stage.gapMs, vt.config.microJitter && stage.gapMs >= 5L, 0L, 60_000L)
                                     stage.completedRepeats = 0
-                                    activeStageIdx = (activeStageIdx + 1) % stagesList.size
+                                    val nextStageIdx = (activeStageIdx + 1) % stagesList.size
+                                    if (nextStageIdx == 0) {
+                                        seqCompletedLoops++
+                                        if (loopCount >= 1 && seqCompletedLoops >= loopCount) {
+                                            completedNaturally = true
+                                            break
+                                        }
+                                    }
+                                    val waitMs = sampleGaussianMs(stage.gapMs, isTapStage && vt.config.microJitter && stage.gapMs >= 5L, 0L, 60_000L)
+                                    activeStageIdx = nextStageIdx
                                     resetStageTargets(stagesList[activeStageIdx], nowNs + waitMs * 1_000_000L, preserveHeld = false)
                                     if (waitMs == 0L && stagesList.size > 1) {
                                         continue
@@ -1515,6 +1552,9 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                             }
                             break
                         }
+                    }
+                    if (completedNaturally) {
+                        break
                     }
                 } else if (!isSeq && runtimeMap.isNotEmpty()) {
                     var allFinite = true
@@ -1626,6 +1666,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         private const val VIRTUAL_INJECT_DEVICE_ID = -1
         private const val NATIVE_STATE_RUNNING_GRABBED = 2
 
+        private const val ACTION_TAP = 0
         private const val ACTION_SWIPE = 1
         private const val ACTION_HOLD = 2
 

@@ -188,7 +188,7 @@ class AnchorPointView(
             secondaryRingPaint.color = accentColor
             secondaryRingPaint.alpha = (180 * alphaScale).roundToInt()
             canvas.drawCircle(cx, cy, radius - 4.2f * d, secondaryRingPaint)
-        } else if (microJitter && targetEnabled && !locked) {
+        } else if (actionType == ActionType.TAP && microJitter && targetEnabled && !locked) {
             jitterRingPaint.color = accentColor
             jitterRingPaint.alpha = 150
             canvas.drawCircle(cx, cy, 8f * d, jitterRingPaint)

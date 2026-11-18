@@ -32,12 +32,16 @@ data class MacroCompiledPlan(
 ) {
     fun withCustomMainName(newName: String): MacroCompiledPlan {
         val clean = newName.trim().ifEmpty { mainPreset.name }
-        val cleanBase = ClickPreset.unfreezeName(clean).ifEmpty { clean }
         val updatedSubs = subPresets.mapIndexed { idx, sub ->
-            sub.copy(name = ClickPreset.freezeName("$cleanBase.${idx + 1}"))
+            sub.copy(name = "$clean.${idx + 1}", isFrozen = true)
         }
-        val updatedMain = mainPreset.copy(name = clean)
+        val updatedMain = mainPreset.copy(name = clean, isFrozen = false)
         return copy(mainPreset = updatedMain, subPresets = updatedSubs)
+    }
+
+    fun withLoopCount(loopCount: Int): MacroCompiledPlan {
+        val safe = loopCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+        return copy(mainPreset = mainPreset.copy(presetLoopCount = safe))
     }
 }
 
@@ -52,13 +56,13 @@ data class MacroCompiledPlan(
  */
 object MacroCompiler {
 
-    private const val TAP_MAX_NET_DIST_PX = 28f
-    private const val SWIPE_MIN_NET_DIST_PX = 14f
-    private const val SWIPE_MIN_PATH_LEN_PX = 22f
-    private const val CURVE_SPATIOTEMPORAL_EPS_PX = 5.0f
-    private const val MAX_SWIPE_VERTICES = 128
-    private const val COINCIDENT_ALIGN_MS = 16L
-    private const val MIN_SLICE_MS = 12L
+    private const val TAP_MAX_NET_DIST_PX = 18f
+    private const val SWIPE_MIN_NET_DIST_PX = 8f
+    private const val SWIPE_MIN_PATH_LEN_PX = 14f
+    private const val CURVE_SPATIOTEMPORAL_EPS_PX = 1.8f
+    private const val MAX_SWIPE_VERTICES = 256
+    private const val COINCIDENT_ALIGN_MS = 8L
+    private const val MIN_SLICE_MS = 8L
     private const val DEFAULT_TAIL_GAP_MS = 120L
 
     private data class PrimitiveSeg(
@@ -172,18 +176,8 @@ object MacroCompiler {
         )
     }
 
-    private fun nextPresetNumber(existingPresets: List<ClickPreset>): Int {
-        val regex = Regex("^#?方案\\s*(\\d+)")
-        var maxNum = 0
-        for (p in existingPresets) {
-            val m = regex.find(p.name.trim())
-            if (m != null) {
-                val n = m.groupValues[1].toIntOrNull() ?: 0
-                if (n > maxNum) maxNum = n
-            }
-        }
-        return max(maxNum + 1, existingPresets.size + 1)
-    }
+    private fun nextPresetNumber(existingPresets: List<ClickPreset>): Int =
+        ClickConfigStore.nextMainPresetNumber(existingPresets)
 
     private fun compileStrokes(
         strokes: List<MacroRecordedStroke>,
@@ -238,7 +232,6 @@ object MacroCompiler {
             when (block) {
                 is TimelineBlock.Single -> {
                     val gap = block.gapAfterMs.coerceIn(ClickTarget.MIN_STAGE_GAP_MS, ClickTarget.MAX_INTERVAL_MS)
-                    val targetJitter = if (block.disableJitter) false else microJitter
                     val target = if (block.actionType == ActionType.SWIPE) {
                         ClickTarget(
                             id = targetIdSeq++,
@@ -247,7 +240,7 @@ object MacroCompiler {
                             y = block.y1,
                             intervalMs = gap,
                             pressDurationMs = ClickTarget.DEFAULT_PRESS_DURATION_MS,
-                            microJitter = targetJitter,
+                            microJitter = false,
                             enabled = true,
                             actionType = ActionType.SWIPE,
                             endX = block.x2,
@@ -263,7 +256,7 @@ object MacroCompiler {
                             y = block.y1,
                             intervalMs = gap,
                             pressDurationMs = block.durationMs.coerceIn(ClickTarget.MIN_PRESS_MS, ClickTarget.MAX_PRESS_MS),
-                            microJitter = targetJitter,
+                            microJitter = false,
                             enabled = true,
                             actionType = ActionType.HOLD,
                             repeatCount = block.repeatCount.coerceIn(1, ClickTarget.MAX_REPEAT_COUNT)
@@ -279,7 +272,6 @@ object MacroCompiler {
                     val tempSubId = "macro_sub_$subIndex"
                     val subTargets = mutableListOf<ClickTarget>()
                     block.items.forEachIndexed { childIdx, item ->
-                        val childJitter = if (item.disableJitter) false else microJitter
                         val child = if (item.actionType == ActionType.SWIPE) {
                             ClickTarget(
                                 id = childIdx + 1,
@@ -288,7 +280,7 @@ object MacroCompiler {
                                 y = item.y1,
                                 intervalMs = item.intervalMs.coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS),
                                 pressDurationMs = ClickTarget.DEFAULT_PRESS_DURATION_MS,
-                                microJitter = childJitter,
+                                microJitter = false,
                                 enabled = true,
                                 actionType = ActionType.SWIPE,
                                 endX = item.x2,
@@ -304,7 +296,7 @@ object MacroCompiler {
                                 y = item.y1,
                                 intervalMs = item.intervalMs.coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS),
                                 pressDurationMs = item.pressMs.coerceIn(ClickTarget.MIN_PRESS_MS, ClickTarget.MAX_PRESS_MS),
-                                microJitter = childJitter,
+                                microJitter = false,
                                 enabled = true,
                                 actionType = ActionType.HOLD,
                                 repeatCount = item.repeatCount.coerceIn(0, ClickTarget.MAX_REPEAT_COUNT)
@@ -316,8 +308,9 @@ object MacroCompiler {
                     }
                     val subPreset = ClickPreset(
                         id = tempSubId,
-                        name = ClickPreset.freezeName("$mainName.$subIndex"),
+                        name = "$mainName.$subIndex",
                         executionMode = ExecutionMode.CONCURRENT,
+                        isFrozen = true,
                         targets = subTargets
                     )
                     subPresets += subPreset
@@ -723,10 +716,10 @@ object MacroCompiler {
                 ) break
                 val dist = hypot(cand.x1 - head.x1, cand.y1 - head.y1)
                 if (dist > TAP_MAX_NET_DIST_PX) break
-                if (!withinTolerance(cand.durationMs, head.durationMs, 0.35, 16L)) break
+                if (!withinTolerance(cand.durationMs, head.durationMs, 0.25, 12L)) break
                 val prevGap = group.last().gapAfterMs
                 if (j + 1 < blocks.size && blocks[j].gapAfterMs > 0L &&
-                    !withinTolerance(cand.gapAfterMs, prevGap, 0.35, 25L)
+                    !withinTolerance(cand.gapAfterMs, prevGap, 0.25, 16L)
                 ) break
                 group += cand
                 j++

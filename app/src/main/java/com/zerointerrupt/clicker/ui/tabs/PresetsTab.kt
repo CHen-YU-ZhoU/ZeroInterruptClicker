@@ -25,20 +25,26 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.carousel.CarouselItemScope
 import androidx.compose.material3.carousel.HorizontalMultiBrowseCarousel
 import androidx.compose.material3.carousel.rememberCarouselState
@@ -61,6 +67,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.zerointerrupt.clicker.R
@@ -73,7 +80,6 @@ import com.zerointerrupt.clicker.ui.MainScreenCallbacks
 import com.zerointerrupt.clicker.ui.MainUiState
 import com.zerointerrupt.clicker.ui.components.BatchCreateEmptyPresetsDialog
 import com.zerointerrupt.clicker.ui.components.BatchDeletePresetsDialog
-import com.zerointerrupt.clicker.ui.components.BatchFreezePresetsDialog
 import com.zerointerrupt.clicker.ui.components.CheckSwitch
 import com.zerointerrupt.clicker.ui.components.ExpressiveCard
 import com.zerointerrupt.clicker.ui.components.ExpressiveConnectedGroup
@@ -86,8 +92,10 @@ import com.zerointerrupt.clicker.ui.components.OverflowMenuAction
 import com.zerointerrupt.clicker.ui.components.PageTopHeader
 import com.zerointerrupt.clicker.ui.components.PresetMiniCanvas
 import com.zerointerrupt.clicker.ui.components.PresetNameDialog
+import com.zerointerrupt.clicker.ui.components.PresetTreeFreezeDialog
 import com.zerointerrupt.clicker.ui.components.ScriptImportDialog
 import com.zerointerrupt.clicker.ui.components.TargetEditDialog
+import com.zerointerrupt.clicker.ui.components.buildPresetTree
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -108,13 +116,14 @@ fun PresetsTab(
     var renameTargetPreset by remember { mutableStateOf<ClickPreset?>(null) }
     var showBatchImportDialog by remember { mutableStateOf(false) }
     var batchImportInitialText by remember { mutableStateOf("") }
-    var showBatchFreezeDialog by remember { mutableStateOf(false) }
-    var showBatchUnfreezeDialog by remember { mutableStateOf(false) }
+    var showTreeFreezeDialog by remember { mutableStateOf(false) }
     var showBatchDeleteDialog by remember { mutableStateOf(false) }
     var showBatchCreateDialog by remember { mutableStateOf(false) }
     var editingTarget by remember { mutableStateOf<ClickTarget?>(null) }
     var showNewTargetDialog by remember { mutableStateOf(false) }
+    var showLoopCountDialog by remember { mutableStateOf(false) }
 
+    val treeNodes = remember(state.presets) { buildPresetTree(state.presets) }
     val visiblePresets = remember(state.presets) { state.presets.filter { !it.isFrozen } }
     val displayedPreset = remember(visiblePresets, state.activePresetId) {
         visiblePresets.firstOrNull { it.id == state.activePresetId } ?: visiblePresets.firstOrNull()
@@ -148,8 +157,7 @@ fun PresetsTab(
         counts
     }
 
-    val hasUnfrozenPreset = state.presets.any { !it.isFrozen }
-    val hasFrozenPreset = state.presets.any { it.isFrozen }
+    val frozenCount = remember(state.presets) { state.presets.count { it.isFrozen } }
     val menuActions = listOf(
         OverflowMenuAction(
             label = "批量导出 JSON",
@@ -166,18 +174,14 @@ fun PresetsTab(
             }
         ),
         OverflowMenuAction(
-            label = "批量冻结方案",
-            enabled = hasUnfrozenPreset,
-            onClick = { showBatchFreezeDialog = true }
-        ),
-        OverflowMenuAction(
-            label = "批量解冻方案",
-            enabled = hasFrozenPreset,
-            onClick = { showBatchUnfreezeDialog = true }
+            label = "冻结 / 解冻方案",
+            badge = if (frozenCount > 0) "${frozenCount}已冻" else null,
+            enabled = state.presets.isNotEmpty(),
+            onClick = { showTreeFreezeDialog = true }
         ),
         OverflowMenuAction(
             label = "批量删除方案",
-            enabled = state.presets.size > 1,
+            enabled = treeNodes.size > 1,
             isDestructive = true,
             onClick = { showBatchDeleteDialog = true }
         ),
@@ -222,7 +226,7 @@ fun PresetsTab(
                                 allPresets = state.presets,
                                 isSelected = preset.id == displayedPreset?.id,
                                 isChildSubPreset = (subPresetParentCount[preset.id] ?: 0) > 0,
-                                canDelete = state.presets.size > 1,
+                                canDelete = treeNodes.size > 1,
                                 screenWidthPx = state.screenWidthPx,
                                 screenHeightPx = state.screenHeightPx,
                                 onSelect = { callbacks.onSelectPreset(preset.id) },
@@ -242,7 +246,7 @@ fun PresetsTab(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(18.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text(
                                 text = "当前方案均已冻结",
@@ -250,16 +254,10 @@ fun PresetsTab(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "# 开头的冻结方案已从方案页隐藏，点击「批量解冻方案」或新建方案即可继续使用。",
+                                text = "已冻结的方案不在主方案页展示；请点击右上角 ⋮ 菜单中的「冻结 / 解冻方案」解冻，或点击右下角新建方案。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = cs.onSurfaceVariant
                             )
-                            FilledTonalButton(
-                                onClick = { showBatchUnfreezeDialog = true },
-                                shape = CircleShape
-                            ) {
-                                Text("批量解冻方案", fontWeight = FontWeight.SemiBold)
-                            }
                         }
                     }
                 }
@@ -322,6 +320,55 @@ fun PresetsTab(
                                 onSelect = { mode -> callbacks.onSetPresetExecutionMode(activePreset.id, mode) },
                                 height = 42.dp
                             )
+
+                            if (activePreset.executionMode == ExecutionMode.SEQUENTIAL) {
+                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "整套执行遍数",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                        Text(
+                                            text = if (activePreset.presetLoopCount <= 0) {
+                                                "无限循环"
+                                            } else {
+                                                "跑完 ${activePreset.presetLoopCount} 遍自动停止"
+                                            },
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = cs.primary,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        listOf(0 to "无限", 1 to "1遍", 3 to "3遍", 5 to "5遍").forEach { (cnt, tag) ->
+                                            FilterChip(
+                                                selected = activePreset.presetLoopCount == cnt,
+                                                onClick = { callbacks.onSetPresetLoopCount(activePreset.id, cnt) },
+                                                label = { Text(tag, maxLines = 1) }
+                                            )
+                                        }
+                                        val isCustomLoop = activePreset.presetLoopCount !in listOf(0, 1, 3, 5)
+                                        FilterChip(
+                                            selected = isCustomLoop,
+                                            onClick = { showLoopCountDialog = true },
+                                            label = {
+                                                Text(
+                                                    text = if (isCustomLoop) "${activePreset.presetLoopCount}遍" else "自定义",
+                                                    maxLines = 1
+                                                )
+                                            }
+                                        )
+                                    }
+                                }
+                            }
 
                             if (activePreset.targets.isEmpty()) {
                                 Surface(
@@ -413,13 +460,53 @@ fun PresetsTab(
     if (showCreateDialog) {
         PresetNameDialog(
             title = "手动新建方案",
-            initialName = "方案 ${state.presets.size + 1}",
+            initialName = "方案 ${ClickConfigStore.nextMainPresetNumber(state.presets)}",
             confirmLabel = "创建",
             showCopySwitch = true,
             onDismiss = { showCreateDialog = false },
             onConfirm = { name, copyCurrent ->
                 callbacks.onCreatePreset(name, copyCurrent)
                 showCreateDialog = false
+            }
+        )
+    }
+
+    if (showLoopCountDialog && displayedPreset != null) {
+        var loopText by remember(displayedPreset.id, displayedPreset.presetLoopCount) {
+            mutableStateOf(displayedPreset.presetLoopCount.toString())
+        }
+        val parsedLoop = loopText.toIntOrNull()?.coerceIn(0, ClickTarget.MAX_REPEAT_COUNT)
+        AlertDialog(
+            onDismissRequest = { showLoopCountDialog = false },
+            title = { Text("设置整套执行遍数", fontWeight = FontWeight.SemiBold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "0 表示无限循环；>= 1 表示顺序跑完指定遍数后自动停止并释放触发状态。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = cs.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = loopText,
+                        onValueChange = { raw -> loopText = raw.filter(Char::isDigit).take(4) },
+                        label = { Text("执行遍数 (0=无限, 1~9999)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = parsedLoop != null,
+                    onClick = {
+                        callbacks.onSetPresetLoopCount(displayedPreset.id, parsedLoop ?: 0)
+                        showLoopCountDialog = false
+                    }
+                ) { Text("确定") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLoopCountDialog = false }) { Text("取消") }
             }
         )
     }
@@ -463,28 +550,14 @@ fun PresetsTab(
         )
     }
 
-    if (showBatchFreezeDialog) {
-        BatchFreezePresetsDialog(
+    if (showTreeFreezeDialog) {
+        PresetTreeFreezeDialog(
             presets = state.presets,
             activePresetId = state.activePresetId,
-            freezeMode = true,
-            onDismiss = { showBatchFreezeDialog = false },
-            onConfirm = { selectedIds ->
-                callbacks.onBatchFreezePresets(selectedIds)
-                showBatchFreezeDialog = false
-            }
-        )
-    }
-
-    if (showBatchUnfreezeDialog) {
-        BatchFreezePresetsDialog(
-            presets = state.presets,
-            activePresetId = state.activePresetId,
-            freezeMode = false,
-            onDismiss = { showBatchUnfreezeDialog = false },
-            onConfirm = { selectedIds ->
-                callbacks.onBatchUnfreezePresets(selectedIds)
-                showBatchUnfreezeDialog = false
+            onDismiss = { showTreeFreezeDialog = false },
+            onConfirm = { frozenIds ->
+                callbacks.onApplyPresetFreezeStates(frozenIds)
+                showTreeFreezeDialog = false
             }
         )
     }
@@ -503,7 +576,7 @@ fun PresetsTab(
 
     if (showBatchCreateDialog) {
         BatchCreateEmptyPresetsDialog(
-            existingCount = state.presets.size,
+            nextNumber = ClickConfigStore.nextMainPresetNumber(state.presets),
             onDismiss = { showBatchCreateDialog = false },
             onConfirm = { count, mode ->
                 callbacks.onBatchCreateEmptyPresets(count, mode)

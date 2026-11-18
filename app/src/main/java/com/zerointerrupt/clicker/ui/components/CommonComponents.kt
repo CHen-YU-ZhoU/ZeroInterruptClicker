@@ -22,11 +22,16 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.KeyboardArrowRight
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -35,6 +40,8 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -328,8 +335,9 @@ fun SetupWizardBottomSheet(
                 fontWeight = FontWeight.Bold
             )
 
+            var stepNum = 1
             WizardStepCard(
-                step = "1",
+                step = (stepNum++).toString(),
                 title = "悬浮窗权限",
                 subtitle = if (state.overlayPermGranted) "已授权" else "未授权",
                 done = state.overlayPermGranted,
@@ -339,14 +347,23 @@ fun SetupWizardBottomSheet(
 
             if (state.showNotifRow) {
                 WizardStepCard(
-                    step = "2",
-                    title = "通知权限",
-                    subtitle = if (state.notifPermGranted) "已授权" else "未授权",
+                    step = (stepNum++).toString(),
+                    title = "通知权限（建议）",
+                    subtitle = if (state.notifPermGranted) "已授权" else "用于前台保活显示",
                     done = state.notifPermGranted,
                     actionLabel = if (state.notifPermGranted) "已完成" else "授予",
                     onAction = callbacks.onGrantNotif
                 )
             }
+
+            WizardStepCard(
+                step = (stepNum++).toString(),
+                title = "省电策略（建议）",
+                subtitle = if (state.batteryOptIgnored) "已忽略电池优化" else "建议设为无限制，防止后台断连",
+                done = state.batteryOptIgnored,
+                actionLabel = if (state.batteryOptIgnored) "已完成" else "去设置",
+                onAction = callbacks.onGrantBatteryOpt
+            )
 
             val shizukuConnected = state.connectionState == ShizukuConnectionState.CONNECTED
             val shizukuBtn = when (state.connectionState) {
@@ -357,7 +374,7 @@ fun SetupWizardBottomSheet(
                 ShizukuConnectionState.ERROR -> "重试"
             }
             WizardStepCard(
-                step = if (state.showNotifRow) "3" else "2",
+                step = (stepNum++).toString(),
                 title = "Shizuku 通道",
                 subtitle = if (shizukuConnected) "已连接" else "未连接",
                 done = shizukuConnected,
@@ -365,11 +382,11 @@ fun SetupWizardBottomSheet(
                 onAction = callbacks.onGrantShizuku
             )
 
-            // Step 4: 5-second touch calibration (when hardware touch node readable)
+            // Last step: 5-second touch calibration (when hardware touch node readable)
             val touchReadable = state.engineSnapshot.touchDeviceReadable &&
                 state.preferredBackend != ClickGlobalSettings.BACKEND_FALLBACK
             if (shizukuConnected && touchReadable) {
-                val stepNum = if (state.showNotifRow) "4" else "3"
+                val calStepNum = stepNum.toString()
                 val testing = state.selfCheckRemainingMs > 0L
                 Surface(
                     shape = RoundedCornerShape(20.dp),
@@ -396,7 +413,7 @@ fun SetupWizardBottomSheet(
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
-                                    text = if (state.selfCheckPassed) "✓" else stepNum,
+                                    text = if (state.selfCheckPassed) "✓" else calStepNum,
                                     style = MaterialTheme.typography.labelMedium,
                                     fontWeight = FontWeight.Bold,
                                     color = if (state.selfCheckPassed) MaterialTheme.colorScheme.onPrimary
@@ -706,6 +723,62 @@ fun ScriptImportDialog(
     )
 }
 
+data class PresetTreeNode(
+    val preset: ClickPreset,
+    val children: List<ClickPreset>
+)
+
+fun buildPresetTree(presets: List<ClickPreset>): List<PresetTreeNode> {
+    val byId = presets.associateBy { it.id }
+    val assignedParent = HashMap<String, String>()
+
+    // 1. Explicit parentPresetId (recorded macros & imported bundles)
+    for (p in presets) {
+        val pid = p.parentPresetId
+        if (pid.isNotBlank() && pid != p.id && pid in byId) {
+            assignedParent[p.id] = pid
+        }
+    }
+
+    // 2. Fallback: infer parent from SUB_PRESET references when child is frozen / named "<parent>.N"
+    for (parent in presets) {
+        if (parent.executionMode != ExecutionMode.SEQUENTIAL) continue
+        for (t in parent.targets) {
+            if (t.actionType != ActionType.SUB_PRESET || t.refPresetId.isBlank()) continue
+            val child = byId[t.refPresetId] ?: continue
+            if (child.id == parent.id || child.id in assignedParent) continue
+            if (child.isFrozen || child.name.startsWith("${parent.name}.")) {
+                assignedParent[child.id] = parent.id
+            }
+        }
+    }
+
+    val childrenMap = LinkedHashMap<String, MutableList<ClickPreset>>()
+    for (p in presets) {
+        val pid = assignedParent[p.id]
+        if (pid != null) {
+            childrenMap.getOrPut(pid) { mutableListOf() }.add(p)
+        }
+    }
+
+    val roots = presets.filter { it.id !in assignedParent }
+    val emittedIds = HashSet<String>()
+    val nodes = mutableListOf<PresetTreeNode>()
+    for (r in roots) {
+        emittedIds += r.id
+        val kids = childrenMap[r.id].orEmpty().filter { it.id != r.id }
+        kids.forEach { emittedIds += it.id }
+        nodes += PresetTreeNode(preset = r, children = kids)
+    }
+    // Defensive: ensure no cyclic orphan preset is ever hidden
+    for (p in presets) {
+        if (p.id !in emittedIds) {
+            nodes += PresetTreeNode(preset = p, children = emptyList())
+        }
+    }
+    return nodes
+}
+
 @Composable
 fun BatchDeletePresetsDialog(
     presets: List<ClickPreset>,
@@ -714,8 +787,13 @@ fun BatchDeletePresetsDialog(
     onConfirm: (Set<String>) -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
+    val treeNodes = remember(presets) { buildPresetTree(presets) }
     var selectedIds by remember(presets) { mutableStateOf(emptySet<String>()) }
-    val maxDeletable = (presets.size - 1).coerceAtLeast(0)
+    var expandedRoots by remember(presets) { mutableStateOf(emptySet<String>()) }
+    val maxDeletable = (treeNodes.size - 1).coerceAtLeast(0)
+    val cascadeCount = remember(presets, selectedIds) {
+        ClickConfigStore.collectCascadeDeleteIds(presets, selectedIds).size
+    }
     val canConfirm = selectedIds.isNotEmpty() && selectedIds.size <= maxDeletable
 
     AlertDialog(
@@ -729,18 +807,24 @@ fun BatchDeletePresetsDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "已选 ${selectedIds.size} 个（至少保留 1 个）",
+                        text = if (cascadeCount > selectedIds.size) {
+                            "已选 ${selectedIds.size} 个大方案（含子方案共 $cascadeCount 个，至少保留 1 个）"
+                        } else {
+                            "已选 ${selectedIds.size} 个（至少保留 1 个）"
+                        },
                         style = MaterialTheme.typography.bodySmall,
-                        color = cs.onSurfaceVariant
+                        color = cs.onSurfaceVariant,
+                        modifier = Modifier.weight(1f)
                     )
                     TextButton(
                         onClick = {
-                            val keeperId = presets.firstOrNull { it.id == activePresetId }?.id
-                                ?: presets.firstOrNull()?.id
+                            val keeperId = treeNodes.firstOrNull { node ->
+                                node.preset.id == activePresetId || node.children.any { it.id == activePresetId }
+                            }?.preset?.id ?: treeNodes.firstOrNull()?.preset?.id
                             selectedIds = if (selectedIds.size >= maxDeletable) {
                                 emptySet()
                             } else {
-                                presets.filter { it.id != keeperId }.map { it.id }.toSet()
+                                treeNodes.map { it.preset.id }.filter { it != keeperId }.toSet()
                             }
                         }
                     ) {
@@ -754,9 +838,13 @@ fun BatchDeletePresetsDialog(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    presets.forEach { preset ->
+                    treeNodes.forEach { node ->
+                        val preset = node.preset
                         val checked = preset.id in selectedIds
                         val canToggleOn = checked || selectedIds.size < maxDeletable
+                        val hasChildren = node.children.isNotEmpty()
+                        val expanded = preset.id in expandedRoots
+
                         Surface(
                             shape = RoundedCornerShape(14.dp),
                             color = if (checked) cs.errorContainer.copy(alpha = 0.45f) else cs.surfaceContainer,
@@ -774,9 +862,9 @@ fun BatchDeletePresetsDialog(
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
                                 Checkbox(
                                     checked = checked,
@@ -798,11 +886,71 @@ fun BatchDeletePresetsDialog(
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     val activeTag = if (preset.id == activePresetId) " · 使用中" else ""
+                                    val childTag = if (hasChildren) " · 含${node.children.size}子方案(一并删除)" else ""
                                     Text(
-                                        text = "${preset.targets.size} 步骤 · ${preset.executionMode.label}$activeTag",
+                                        text = "${preset.targets.size} 步骤 · ${preset.executionMode.label}$activeTag$childTag",
                                         style = MaterialTheme.typography.labelSmall,
-                                        color = cs.onSurfaceVariant
+                                        color = if (checked && hasChildren) cs.error else cs.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
                                     )
+                                }
+                                if (hasChildren) {
+                                    IconButton(
+                                        onClick = {
+                                            expandedRoots = if (expanded) {
+                                                expandedRoots - preset.id
+                                            } else {
+                                                expandedRoots + preset.id
+                                            }
+                                        },
+                                        modifier = Modifier.size(30.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = if (expanded) Icons.Rounded.KeyboardArrowDown else Icons.Rounded.KeyboardArrowRight,
+                                            contentDescription = if (expanded) "收起子方案" else "展开子方案",
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        if (hasChildren && expanded) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(start = 24.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                node.children.forEach { child ->
+                                    Surface(
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = if (checked) cs.errorContainer.copy(alpha = 0.25f) else cs.surfaceContainerHigh,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(horizontal = 12.dp, vertical = 7.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = child.name,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontWeight = FontWeight.Medium,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                            Text(
+                                                text = "${child.targets.size} 步骤${if (checked) " · 随主方案删除" else ""}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (checked) cs.error else cs.onSurfaceVariant
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -819,7 +967,7 @@ fun BatchDeletePresetsDialog(
                     contentColor = cs.onError
                 )
             ) {
-                Text("删除 (${selectedIds.size})")
+                Text("删除 ($cascadeCount)")
             }
         },
         dismissButton = {
@@ -830,7 +978,7 @@ fun BatchDeletePresetsDialog(
 
 @Composable
 fun BatchCreateEmptyPresetsDialog(
-    existingCount: Int,
+    nextNumber: Int,
     onDismiss: () -> Unit,
     onConfirm: (count: Int, mode: ExecutionMode) -> Unit
 ) {
@@ -870,8 +1018,8 @@ fun BatchCreateEmptyPresetsDialog(
                     height = 40.dp
                 )
                 if (parsedCount in 1..50) {
-                    val startNum = existingCount + 1
-                    val endNum = existingCount + parsedCount
+                    val startNum = nextNumber
+                    val endNum = nextNumber + parsedCount - 1
                     Text(
                         text = if (parsedCount == 1) "将新增：方案 $startNum" else "将新增：方案 $startNum ~ 方案 $endNum",
                         style = MaterialTheme.typography.bodySmall,
@@ -895,36 +1043,34 @@ fun BatchCreateEmptyPresetsDialog(
 }
 
 @Composable
-fun BatchFreezePresetsDialog(
+fun PresetTreeFreezeDialog(
     presets: List<ClickPreset>,
     activePresetId: String,
-    freezeMode: Boolean,
     onDismiss: () -> Unit,
     onConfirm: (Set<String>) -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
-    val candidates = remember(presets, freezeMode) {
-        presets.filter { if (freezeMode) !it.isFrozen else it.isFrozen }
+    val treeNodes = remember(presets) { buildPresetTree(presets) }
+    var frozenIds by remember(presets) {
+        mutableStateOf(presets.filter { it.isFrozen }.map { it.id }.toSet())
     }
-    var selectedIds by remember(candidates) { mutableStateOf(emptySet<String>()) }
-    val allSelected = candidates.isNotEmpty() && selectedIds.size == candidates.size
+    var expandedRoots by remember(presets) { mutableStateOf(emptySet<String>()) }
+
+    fun toggleFrozen(id: String) {
+        frozenIds = if (id in frozenIds) frozenIds - id else frozenIds + id
+    }
+
+    fun toggleExpanded(rootId: String) {
+        expandedRoots = if (rootId in expandedRoots) expandedRoots - rootId else expandedRoots + rootId
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = {
-            Text(
-                text = if (freezeMode) "批量冻结方案" else "批量解冻方案",
-                fontWeight = FontWeight.SemiBold
-            )
-        },
+        title = { Text("冻结与解冻", fontWeight = FontWeight.SemiBold) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    text = if (freezeMode) {
-                        "冻结会在名称前加「#」，在方案页隐藏显示，悬浮窗切换方案时自动跳过。"
-                    } else {
-                        "解冻会去掉名称开头的「#」，恢复在方案页显示与悬浮窗轮换。"
-                    },
+                    text = "冻结后的方案在方案页隐藏，悬浮窗切换时自动跳过且不占序号；嵌套子方案默认收起。",
                     style = MaterialTheme.typography.bodySmall,
                     color = cs.onSurfaceVariant
                 )
@@ -934,79 +1080,150 @@ fun BatchFreezePresetsDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = if (candidates.isEmpty()) {
-                            if (freezeMode) "当前无未冻结方案" else "当前无已冻结方案"
-                        } else {
-                            "已选 ${selectedIds.size} / ${candidates.size} 个"
-                        },
+                        text = "共 ${treeNodes.size} 个主方案 · 已冻结 ${frozenIds.size} 个",
                         style = MaterialTheme.typography.bodySmall,
                         color = cs.onSurfaceVariant
                     )
-                    if (candidates.isNotEmpty()) {
-                        TextButton(
-                            onClick = {
-                                selectedIds = if (allSelected) {
-                                    emptySet()
-                                } else {
-                                    candidates.map { it.id }.toSet()
-                                }
+                    TextButton(
+                        onClick = {
+                            frozenIds = if (frozenIds.isEmpty()) {
+                                treeNodes.flatMap { it.children }.map { it.id }.toSet()
+                            } else {
+                                emptySet()
                             }
-                        ) {
-                            Text(if (allSelected) "清空" else "全选")
                         }
+                    ) {
+                        Text(if (frozenIds.isEmpty()) "冻结子方案" else "全部解冻")
                     }
                 }
-                Column(
+                LazyColumn(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 280.dp)
-                        .verticalScroll(rememberScrollState()),
+                        .heightIn(max = 320.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    candidates.forEach { preset ->
-                        val checked = preset.id in selectedIds
-                        val targetName = if (freezeMode) {
-                            ClickPreset.freezeName(preset.name)
-                        } else {
-                            ClickPreset.unfreezeName(preset.name)
-                        }
-                        Surface(
-                            shape = RoundedCornerShape(14.dp),
-                            color = if (checked) cs.primaryContainer.copy(alpha = 0.5f) else cs.surfaceContainer,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(14.dp))
-                                .clickable {
-                                    selectedIds = if (checked) selectedIds - preset.id else selectedIds + preset.id
-                                }
-                        ) {
-                            Row(
+                    treeNodes.forEach { node ->
+                        val root = node.preset
+                        val hasChildren = node.children.isNotEmpty()
+                        val expanded = root.id in expandedRoots
+                        val rootFrozen = root.id in frozenIds
+
+                        item(key = "root_${root.id}") {
+                            Surface(
+                                shape = RoundedCornerShape(14.dp),
+                                color = if (rootFrozen) cs.secondaryContainer.copy(alpha = 0.55f) else cs.surfaceContainer,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Checkbox(
-                                    checked = checked,
-                                    onCheckedChange = { next ->
-                                        selectedIds = if (next) selectedIds + preset.id else selectedIds - preset.id
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .clickable {
+                                        if (hasChildren) toggleExpanded(root.id) else toggleFrozen(root.id)
                                     }
-                                )
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = "${preset.name} → $targetName",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Medium,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = 6.dp, end = 10.dp, top = 6.dp, bottom = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    if (hasChildren) {
+                                        IconButton(
+                                            onClick = { toggleExpanded(root.id) },
+                                            modifier = Modifier.size(30.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = if (expanded) Icons.Rounded.KeyboardArrowDown else Icons.Rounded.KeyboardArrowRight,
+                                                contentDescription = if (expanded) "收起子方案" else "展开子方案",
+                                                modifier = Modifier.size(18.dp),
+                                                tint = cs.onSurfaceVariant
+                                            )
+                                        }
+                                    } else {
+                                        Spacer(Modifier.width(6.dp))
+                                    }
+
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = root.name,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        val activeTag = if (root.id == activePresetId && !rootFrozen) " · 使用中" else ""
+                                        val childTag = if (hasChildren) " · ${node.children.size} 个子方案" else ""
+                                        Text(
+                                            text = "${root.targets.size} 步骤 · ${root.executionMode.label}$activeTag$childTag",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = cs.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+
+                                    FilterChip(
+                                        selected = rootFrozen,
+                                        onClick = { toggleFrozen(root.id) },
+                                        label = {
+                                            Text(
+                                                text = if (rootFrozen) "已冻结" else "正常",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                        }
                                     )
-                                    val activeTag = if (preset.id == activePresetId) " · 使用中" else ""
-                                    Text(
-                                        text = "${preset.targets.size} 步骤 · ${preset.executionMode.label}$activeTag",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = cs.onSurfaceVariant
-                                    )
+                                }
+                            }
+                        }
+
+                        if (hasChildren && expanded) {
+                            items(
+                                items = node.children,
+                                key = { child -> "child_${child.id}" }
+                            ) { child ->
+                                val childFrozen = child.id in frozenIds
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = if (childFrozen) cs.secondaryContainer.copy(alpha = 0.45f) else cs.surfaceContainerHigh,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = 24.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .clickable { toggleFrozen(child.id) }
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 10.dp, vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = child.name,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontWeight = FontWeight.Medium,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                text = "${child.targets.size} 步骤 · ${child.executionMode.label}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = cs.onSurfaceVariant
+                                            )
+                                        }
+                                        FilterChip(
+                                            selected = childFrozen,
+                                            onClick = { toggleFrozen(child.id) },
+                                            label = {
+                                                Text(
+                                                    text = if (childFrozen) "已冻结" else "正常",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                            }
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1015,11 +1232,8 @@ fun BatchFreezePresetsDialog(
             }
         },
         confirmButton = {
-            Button(
-                onClick = { onConfirm(selectedIds) },
-                enabled = selectedIds.isNotEmpty()
-            ) {
-                Text("${if (freezeMode) "冻结" else "解冻"} (${selectedIds.size})")
+            Button(onClick = { onConfirm(frozenIds) }) {
+                Text("保存")
             }
         },
         dismissButton = {
@@ -1461,7 +1675,7 @@ fun TargetEditDialog(
                 )
 
                 HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
-                if (actionType != ActionType.SUB_PRESET) {
+                if (actionType == ActionType.TAP) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,

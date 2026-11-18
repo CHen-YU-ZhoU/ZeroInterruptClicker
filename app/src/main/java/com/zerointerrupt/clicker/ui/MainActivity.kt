@@ -15,6 +15,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.CountDownTimer
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -68,6 +69,7 @@ class MainActivity : ComponentActivity() {
             overlayPermGranted = false,
             notifPermGranted = true,
             showNotifRow = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
+            batteryOptIgnored = true,
             selfCheckPassed = false,
             selfCheckRemainingMs = 0L,
             selfCheckTimeoutMs = SELF_CHECK_TIMEOUT_MS,
@@ -103,6 +105,12 @@ class MainActivity : ComponentActivity() {
 
     private val notifPermLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
+    ) {
+        syncFromStorageAndSystem()
+    }
+
+    private val batteryOptLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
     ) {
         syncFromStorageAndSystem()
     }
@@ -248,6 +256,8 @@ class MainActivity : ComponentActivity() {
         } else {
             true
         }
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val batteryOptIgnored = pm?.isIgnoringBatteryOptimizations(packageName) ?: true
 
         presets.forEach { preset ->
             preset.targets.forEach { t -> t.remapToScreen(metrics.widthPx, metrics.heightPx) }
@@ -256,6 +266,7 @@ class MainActivity : ComponentActivity() {
         uiModel = uiModel.copy(
             overlayPermGranted = overlayGranted,
             notifPermGranted = notifGranted,
+            batteryOptIgnored = batteryOptIgnored,
             selfCheckPassed = settings.selfCheckPassed,
             tuningTier = settings.tuningTier,
             intervalMs = settings.defaultIntervalMs,
@@ -357,6 +368,7 @@ class MainActivity : ComponentActivity() {
                     notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                 }
             },
+            onGrantBatteryOpt = { openBatteryOptimizationSettings(scope) },
             onStartSelfCheck = {
                 selfCheckTimer?.cancel()
                 scope.launch {
@@ -558,7 +570,7 @@ class MainActivity : ComponentActivity() {
                 syncFromStorageAndSystem()
             },
             onCyclePreset = { delta ->
-                val presets = ClickConfigStore.loadPresets(this)
+                val presets = ClickConfigStore.loadPresets(this).filter { !it.isFrozen }
                 if (presets.size > 1) {
                     val activeId = ClickConfigStore.getActivePresetId(this)
                     val idx = presets.indexOfFirst { it.id == activeId }.coerceAtLeast(0)
@@ -613,6 +625,11 @@ class MainActivity : ComponentActivity() {
             },
             onSetPresetExecutionMode = { presetId, mode ->
                 ClickConfigStore.setPresetExecutionMode(this, presetId, mode)
+                notifyOverlayRefresh()
+                syncFromStorageAndSystem()
+            },
+            onSetPresetLoopCount = { presetId, loopCount ->
+                ClickConfigStore.setPresetLoopCount(this, presetId, loopCount)
                 notifyOverlayRefresh()
                 syncFromStorageAndSystem()
             },
@@ -684,20 +701,12 @@ class MainActivity : ComponentActivity() {
                     showMessage(scope, "至少需要保留 1 个方案")
                 }
             },
-            onBatchFreezePresets = { presetIds ->
-                val count = ClickConfigStore.freezePresetsBatch(this, presetIds)
-                if (count > 0) {
+            onApplyPresetFreezeStates = { frozenIds ->
+                val changed = ClickConfigStore.applyPresetFreezeStates(this, frozenIds)
+                if (changed > 0) {
                     notifyOverlayRefresh()
                     syncFromStorageAndSystem()
-                    showMessage(scope, "已冻结 $count 个方案（已加 # 前缀，悬浮窗切换时跳过）")
-                }
-            },
-            onBatchUnfreezePresets = { presetIds ->
-                val count = ClickConfigStore.unfreezePresetsBatch(this, presetIds)
-                if (count > 0) {
-                    notifyOverlayRefresh()
-                    syncFromStorageAndSystem()
-                    showMessage(scope, "已解冻 $count 个方案（已移除 # 前缀）")
+                    showMessage(scope, "已更新方案冻结状态（共冻结 ${frozenIds.size} 个，悬浮窗切换时跳过）")
                 }
             },
             onBatchCreateEmptyPresets = { count, mode ->
@@ -938,6 +947,23 @@ class MainActivity : ComponentActivity() {
             Uri.parse("package:$packageName")
         )
         overlayPermLauncher.launch(intent)
+    }
+
+    @SuppressLint("BatteryLife")
+    private fun openBatteryOptimizationSettings(scope: kotlinx.coroutines.CoroutineScope) {
+        try {
+            val intent = Intent(
+                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:$packageName")
+            )
+            batteryOptLauncher.launch(intent)
+        } catch (_: Throwable) {
+            try {
+                batteryOptLauncher.launch(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: Throwable) {
+                showMessage(scope, "请在系统应用信息中将本应用设为「无限制」省电策略")
+            }
+        }
     }
 
     @SuppressLint("WrongConstant")
