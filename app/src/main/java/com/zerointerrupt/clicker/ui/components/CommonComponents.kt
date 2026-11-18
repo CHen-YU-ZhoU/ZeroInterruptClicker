@@ -62,9 +62,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Outline
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontFamily
@@ -72,6 +75,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import com.zerointerrupt.clicker.R
 import com.zerointerrupt.clicker.model.ActionType
@@ -104,13 +110,111 @@ fun CheckSwitch(
     )
 }
 
+/**
+ * Degree-7 (G3-continuous: curvature = 0 and curvature derivative = 0 at straight-edge joins)
+ * high-order Bezier corner shape with symmetric evenly-spaced edge control points (1, 0.75, 0.5, 0.25, 0).
+ */
+class SmoothRoundedCornerShape(
+    private val cornerRadius: Dp
+) : Shape {
+    override fun createOutline(
+        size: Size,
+        layoutDirection: LayoutDirection,
+        density: Density
+    ): Outline {
+        val w = size.width
+        val h = size.height
+        val rPx = with(density) { cornerRadius.toPx() }.coerceAtLeast(0f)
+        val r = minOf(rPx, w * 0.46f, h * 0.46f)
+        val path = Path()
+        if (r <= 0.5f || w <= 1f || h <= 1f) {
+            path.moveTo(0f, 0f)
+            path.lineTo(w, 0f)
+            path.lineTo(w, h)
+            path.lineTo(0f, h)
+            path.close()
+            return Outline.Generic(path)
+        }
+
+        // L = 1.50 * r preserves ~0.299r diagonal clearance (matching circle's 0.293r) while extending tangents to G3 continuity.
+        val d = minOf(r * 1.50f, w * 0.495f, h * 0.495f)
+
+        // Start after top-left corner on top edge -> trace clockwise
+        path.moveTo(d, 0f)
+        path.lineTo(w - d, 0f)
+
+        // Top-right corner: (w - u*d, v*d) as t goes 0..1 from top edge to right edge
+        for (i in 1..STEPS) {
+            path.lineTo(w - UNIT_X[i] * d, UNIT_Y[i] * d)
+        }
+
+        path.lineTo(w, h - d)
+        // Bottom-right corner: (w - v*d, h - u*d) from right edge to bottom edge
+        for (i in 1..STEPS) {
+            path.lineTo(w - UNIT_Y[i] * d, h - UNIT_X[i] * d)
+        }
+
+        path.lineTo(d, h)
+        // Bottom-left corner: (u*d, h - v*d) from bottom edge to left edge
+        for (i in 1..STEPS) {
+            path.lineTo(UNIT_X[i] * d, h - UNIT_Y[i] * d)
+        }
+
+        path.lineTo(0f, d)
+        // Top-left corner: (v*d, u*d) from left edge to top edge
+        for (i in 1..STEPS) {
+            path.lineTo(UNIT_Y[i] * d, UNIT_X[i] * d)
+        }
+
+        path.close()
+        return Outline.Generic(path)
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        return other is SmoothRoundedCornerShape && cornerRadius == other.cornerRadius
+    }
+
+    override fun hashCode(): Int = cornerRadius.hashCode()
+
+    private companion object {
+        const val STEPS = 28
+
+        // Control weights of symmetric degree-7 Bezier from (1, 0) to (0, 1):
+        // P0=(1,0), P1=(0.75,0), P2=(0.5,0), P3=(0.25,0), P4=(0,0.25), P5=(0,0.5), P6=(0,0.75), P7=(0,1)
+        val CTRL_X = doubleArrayOf(1.0, 0.75, 0.50, 0.25, 0.0, 0.0, 0.0, 0.0)
+        val CTRL_Y = doubleArrayOf(0.0, 0.0, 0.0, 0.0, 0.25, 0.50, 0.75, 1.0)
+        val BINOM = doubleArrayOf(1.0, 7.0, 21.0, 35.0, 35.0, 21.0, 7.0, 1.0)
+
+        val UNIT_X = FloatArray(STEPS + 1)
+        val UNIT_Y = FloatArray(STEPS + 1)
+
+        init {
+            for (step in 0..STEPS) {
+                val t = step.toDouble() / STEPS
+                val omt = 1.0 - t
+                var sx = 0.0
+                var sy = 0.0
+                for (i in 0..7) {
+                    val b = BINOM[i] * Math.pow(t, i.toDouble()) * Math.pow(omt, (7 - i).toDouble())
+                    sx += b * CTRL_X[i]
+                    sy += b * CTRL_Y[i]
+                }
+                UNIT_X[step] = sx.toFloat()
+                UNIT_Y[step] = sy.toFloat()
+            }
+        }
+    }
+}
+
 @Composable
 fun PresetMiniCanvas(
     preset: ClickPreset,
     allPresets: List<ClickPreset> = listOf(preset),
     screenWidthPx: Int,
     screenHeightPx: Int,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    drawOuterFrame: Boolean = true
 ) {
     val bezelColor = MaterialTheme.colorScheme.surfaceContainerHighest
     val outlineColor = MaterialTheme.colorScheme.outlineVariant
@@ -122,13 +226,17 @@ fun PresetMiniCanvas(
     val aspect = (screenWidthPx.toFloat() / screenHeightPx.coerceAtLeast(1).toFloat())
         .coerceIn(0.42f, 0.72f)
 
-    Canvas(
-        modifier = modifier
+    val canvasModifier = if (drawOuterFrame) {
+        modifier
             .aspectRatio(aspect)
             .clip(RoundedCornerShape(14.dp))
             .background(bezelColor)
             .border(1.dp, outlineColor, RoundedCornerShape(14.dp))
-    ) {
+    } else {
+        modifier
+    }
+
+    Canvas(modifier = canvasModifier) {
         val w = size.width
         val h = size.height
         val maxDispW = (screenWidthPx - 1).coerceAtLeast(1).toFloat()
@@ -136,29 +244,31 @@ fun PresetMiniCanvas(
 
         // Subtle grid guidelines
         drawLine(
-            color = outlineColor.copy(alpha = 0.25f),
+            color = outlineColor.copy(alpha = 0.22f),
             start = Offset(w * 0.5f, 0f),
             end = Offset(w * 0.5f, h),
             strokeWidth = 1f
         )
         drawLine(
-            color = outlineColor.copy(alpha = 0.25f),
+            color = outlineColor.copy(alpha = 0.22f),
             start = Offset(0f, h * 0.5f),
             end = Offset(w, h * 0.5f),
             strokeWidth = 1f
         )
 
-        // Draw rounded screen safe frame
-        drawRoundRect(
-            color = outlineColor.copy(alpha = 0.35f),
-            topLeft = Offset(4f, 4f),
-            size = androidx.compose.ui.geometry.Size(w - 8f, h - 8f),
-            cornerRadius = CornerRadius(10.dp.toPx(), 10.dp.toPx()),
-            style = Stroke(width = 1f)
-        )
+        if (drawOuterFrame) {
+            drawRoundRect(
+                color = outlineColor.copy(alpha = 0.35f),
+                topLeft = Offset(4f, 4f),
+                size = Size(w - 8f, h - 8f),
+                cornerRadius = CornerRadius(10.dp.toPx(), 10.dp.toPx()),
+                style = Stroke(width = 1f)
+            )
+        }
 
         val previewTargets = ClickConfigStore.collectPreviewTargets(allPresets, preset)
-        previewTargets.forEach { t ->
+        val densePreview = previewTargets.size > 10
+        previewTargets.forEachIndexed { idx, t ->
             val u = if (t.normX in 0f..1f) t.normX else (t.x / maxDispW).coerceIn(0f, 1f)
             val v = if (t.normY in 0f..1f) t.normY else (t.y / maxDispH).coerceIn(0f, 1f)
             val sx = u * w
@@ -176,45 +286,62 @@ fun PresetMiniCanvas(
                 val ex = eu * w
                 val ey = ev * h
 
-                drawLine(
-                    color = color.copy(alpha = 0.85f),
-                    start = Offset(sx, sy),
-                    end = Offset(ex, ey),
-                    strokeWidth = 2.dp.toPx(),
-                    cap = StrokeCap.Round,
-                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 4f), 0f)
-                )
-
-                val angle = atan2((ey - sy).toDouble(), (ex - sx).toDouble())
-                val len = 6.dp.toPx()
-                val spread = Math.toRadians(28.0)
-                val arrow = Path().apply {
-                    moveTo(ex, ey)
-                    lineTo(
-                        ex - (len * cos(angle - spread)).toFloat(),
-                        ey - (len * sin(angle - spread)).toFloat()
+                if (densePreview) {
+                    drawLine(
+                        color = color.copy(alpha = 0.85f),
+                        start = Offset(sx, sy),
+                        end = Offset(ex, ey),
+                        strokeWidth = 2.dp.toPx(),
+                        cap = StrokeCap.Round
                     )
-                    lineTo(
-                        ex - (len * cos(angle + spread)).toFloat(),
-                        ey - (len * sin(angle + spread)).toFloat()
+                } else {
+                    drawLine(
+                        color = color.copy(alpha = 0.85f),
+                        start = Offset(sx, sy),
+                        end = Offset(ex, ey),
+                        strokeWidth = 2.dp.toPx(),
+                        cap = StrokeCap.Round,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 4f), 0f)
                     )
-                    close()
+                    val angle = atan2((ey - sy).toDouble(), (ex - sx).toDouble())
+                    val len = 6.dp.toPx()
+                    val spread = Math.toRadians(28.0)
+                    val arrow = Path().apply {
+                        moveTo(ex, ey)
+                        lineTo(
+                            ex - (len * cos(angle - spread)).toFloat(),
+                            ey - (len * sin(angle - spread)).toFloat()
+                        )
+                        lineTo(
+                            ex - (len * cos(angle + spread)).toFloat(),
+                            ey - (len * sin(angle + spread)).toFloat()
+                        )
+                        close()
+                    }
+                    drawPath(arrow, color)
+                    drawCircle(color = color.copy(alpha = 0.25f), radius = 5.5.dp.toPx(), center = Offset(ex, ey))
                 }
-                drawPath(arrow, color)
-                drawCircle(color = color.copy(alpha = 0.25f), radius = 6.dp.toPx(), center = Offset(ex, ey))
             }
 
-            if (t.actionType == ActionType.HOLD) {
-                drawCircle(
-                    color = color,
-                    radius = 7.dp.toPx(),
-                    center = Offset(sx, sy),
-                    style = Stroke(width = 1.6.dp.toPx())
-                )
+            val isDenseMidKnot = densePreview && t.actionType == ActionType.SWIPE && idx > 0 &&
+                (maxOf(0, idx - 8) until idx).any { k ->
+                    val prev = previewTargets[k]
+                    prev.actionType == ActionType.SWIPE &&
+                        prev.intervalMs <= 80L &&
+                        kotlin.math.hypot((t.x - prev.endX).toDouble(), (t.y - prev.endY).toDouble()) <= 24.0
+                }
+            if (!isDenseMidKnot) {
+                if (t.actionType == ActionType.HOLD && !densePreview) {
+                    drawCircle(
+                        color = color,
+                        radius = 7.dp.toPx(),
+                        center = Offset(sx, sy),
+                        style = Stroke(width = 1.6.dp.toPx())
+                    )
+                }
+                drawCircle(color = color.copy(alpha = 0.24f), radius = 5.5.dp.toPx(), center = Offset(sx, sy))
+                drawCircle(color = color, radius = 3.2.dp.toPx(), center = Offset(sx, sy))
             }
-
-            drawCircle(color = color.copy(alpha = 0.24f), radius = 5.5.dp.toPx(), center = Offset(sx, sy))
-            drawCircle(color = color, radius = 3.2.dp.toPx(), center = Offset(sx, sy))
         }
     }
 }

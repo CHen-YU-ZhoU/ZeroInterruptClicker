@@ -135,6 +135,16 @@ fun LabTab(
                         onSelect = callbacks.onLauncherIconModeChange,
                         height = 42.dp
                     )
+                    LabSwitchRow(
+                        title = "桌面图标动态取色",
+                        checked = state.launcherDynamicIcon,
+                        onCheckedChange = callbacks.onLauncherDynamicIconChange
+                    )
+                    Text(
+                        text = "向系统桌面提供 Monochrome 单色图层（需 Android 13+ 且桌面支持/开启主题图标配色）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = cs.onSurfaceVariant
+                    )
                 }
 
                 HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))

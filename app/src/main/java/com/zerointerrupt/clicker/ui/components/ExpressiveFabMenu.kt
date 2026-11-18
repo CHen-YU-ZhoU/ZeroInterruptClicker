@@ -296,8 +296,8 @@ fun M3FabMenuScope.ExpressiveFabMenuItem(
             shape = CircleShape,
             color = containerColor,
             contentColor = contentColor,
-            tonalElevation = 6.dp,
-            shadowElevation = 6.dp,
+            tonalElevation = 0.dp,
+            shadowElevation = 0.dp,
             onClick = onClick,
         ) {
             Row(
@@ -374,11 +374,11 @@ fun ExpressiveToggleFab(
         }
     }
 
-    Box(Modifier.size(maxOf(initialSize, finalSize)), contentAlignment = Alignment.BottomEnd) {
+    Box(Modifier.size(maxOf(initialSize, finalSize)), contentAlignment = Alignment.Center) {
         Box(
             modifier
                 .graphicsLayer {
-                    this.shadowElevation = 6.dp.toPx()
+                    this.shadowElevation = 0f
                     this.shape = shape
                     this.clip = true
                 }

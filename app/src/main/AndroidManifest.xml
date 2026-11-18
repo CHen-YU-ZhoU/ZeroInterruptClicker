@@ -69,6 +69,48 @@
             </intent-filter>
         </activity-alias>
 
+        <activity-alias
+            android:name=".LauncherSystemMonochromeAlias"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_auto_themed"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_auto_themed_round"
+            android:targetActivity=".ui.MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherDarkMonochromeAlias"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_themed"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_themed_round"
+            android:targetActivity=".ui.MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherLightMonochromeAlias"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_light_themed"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_light_themed_round"
+            android:targetActivity=".ui.MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
         <service
             android:name=".overlay.OverlayService"
             android:enabled="true"

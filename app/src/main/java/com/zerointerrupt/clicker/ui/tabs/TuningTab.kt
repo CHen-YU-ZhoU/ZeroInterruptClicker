@@ -224,6 +224,17 @@ fun TuningTab(
                     checked = state.autoCollapseBar,
                     onCheckedChange = callbacks.onAutoCollapseChange
                 )
+
+                SettingSwitchRow(
+                    title = "录制模式下轨迹显示",
+                    checked = state.showMacroTrajectories,
+                    onCheckedChange = callbacks.onShowMacroTrajectoriesChange
+                )
+                Text(
+                    text = "开启后完整显示全部录制与多指并发轨迹；轨迹复杂遮挡屏幕时可关闭隐藏",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.onSurfaceVariant
+                )
             }
         }
 

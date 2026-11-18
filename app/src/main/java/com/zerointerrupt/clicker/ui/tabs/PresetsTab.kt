@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -28,6 +29,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.MoreVert
@@ -94,7 +96,9 @@ import com.zerointerrupt.clicker.ui.components.PresetMiniCanvas
 import com.zerointerrupt.clicker.ui.components.PresetNameDialog
 import com.zerointerrupt.clicker.ui.components.PresetTreeFreezeDialog
 import com.zerointerrupt.clicker.ui.components.ScriptImportDialog
+import com.zerointerrupt.clicker.ui.components.SmoothRoundedCornerShape
 import com.zerointerrupt.clicker.ui.components.TargetEditDialog
+import androidx.compose.ui.unit.lerp as dpLerp
 import com.zerointerrupt.clicker.ui.components.buildPresetTree
 import kotlin.math.roundToInt
 
@@ -213,10 +217,10 @@ fun PresetsTab(
                         val carouselState = rememberCarouselState(initialItem = activeIdx) { latestPresetCount }
                         HorizontalMultiBrowseCarousel(
                             state = carouselState,
-                            preferredItemWidth = 148.dp,
+                            preferredItemWidth = 128.dp,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(210.dp),
+                                .height(224.dp),
                             itemSpacing = 10.dp,
                             contentPadding = PaddingValues(horizontal = 20.dp)
                         ) { index ->
@@ -286,8 +290,13 @@ fun PresetsTab(
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
+                                    val detailModeLabel = if (activePreset.executionMode == ExecutionMode.SEQUENTIAL) {
+                                        "顺序"
+                                    } else {
+                                        "并发"
+                                    }
                                     Text(
-                                        text = "${activePreset.targets.size} 步骤",
+                                        text = "${activePreset.targets.size} 步骤 · $detailModeLabel",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = cs.onSurfaceVariant
                                     )
@@ -650,11 +659,12 @@ private fun CarouselItemScope.PresetCarouselCard(
     var cardMenuExpanded by remember { mutableStateOf(false) }
 
     val cardBg = if (isSelected) {
-        lerp(cs.surfaceContainerLow, cs.primaryContainer, 0.42f)
+        lerp(cs.surfaceContainerLow, cs.primaryContainer, 0.36f)
     } else {
-        cs.surfaceContainerLow
+        cs.surfaceContainerHigh
     }
-    val shape = RoundedCornerShape(24.dp)
+    // Outer radius 24dp with 9dp badge inset and 30dp (r = 15dp) circle badges => concentric 15 + 9 = 24dp.
+    val shape = SmoothRoundedCornerShape(24.dp)
     val fadeModifier = Modifier.graphicsLayer {
         val maxW = carouselItemInfo.maxSize
         val visFrac = if (maxW > 4f) (carouselItemInfo.maskRect.width / maxW).coerceIn(0f, 1f) else 1f
@@ -663,39 +673,33 @@ private fun CarouselItemScope.PresetCarouselCard(
 
     Box(
         modifier = Modifier
-            .height(210.dp)
+            .height(224.dp)
             .maskClip(shape)
             .then(
                 if (isSelected) {
-                    Modifier.maskBorder(BorderStroke(1.5.dp, cs.primary), shape)
+                    Modifier.maskBorder(BorderStroke(1.8.dp, cs.primary), shape)
                 } else {
-                    Modifier.maskBorder(BorderStroke(1.dp, cs.outlineVariant.copy(alpha = 0.4f)), shape)
+                    Modifier.maskBorder(BorderStroke(1.dp, cs.outlineVariant.copy(alpha = 0.50f)), shape)
                 }
             )
             .background(cardBg)
             .clickable(onClick = onSelect)
     ) {
-        // Slim centered phone layout preview filling the slim card cleanly
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(top = 12.dp, bottom = 52.dp, start = 12.dp, end = 12.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            PresetMiniCanvas(
-                preset = preset,
-                allPresets = allPresets,
-                screenWidthPx = screenWidthPx,
-                screenHeightPx = screenHeightPx,
-                modifier = Modifier.height(132.dp)
-            )
-        }
+        // Single magnified phone screen frame IS the preset card itself
+        PresetMiniCanvas(
+            preset = preset,
+            allPresets = allPresets,
+            screenWidthPx = screenWidthPx,
+            screenHeightPx = screenHeightPx,
+            modifier = Modifier.fillMaxSize(),
+            drawOuterFrame = false
+        )
 
-        // Top overlay: active badge (left) + compact ⋮ menu matching Files by Google (right)
+        // Concentric top corner circular actions (9dp inset + 30dp circle => 24dp card corner)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(8.dp)
+                .padding(9.dp)
                 .then(fadeModifier),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
@@ -704,27 +708,28 @@ private fun CarouselItemScope.PresetCarouselCard(
                 Surface(
                     shape = CircleShape,
                     color = cs.primary,
-                    contentColor = cs.onPrimary
+                    contentColor = cs.onPrimary,
+                    modifier = Modifier.size(30.dp)
                 ) {
-                    Text(
-                        text = "使用中",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
-                    )
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Rounded.Check,
+                            contentDescription = "使用中",
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
                 }
             } else {
-                Spacer(Modifier.width(1.dp))
+                Spacer(Modifier.size(30.dp))
             }
 
             Box {
                 Surface(
                     shape = CircleShape,
-                    color = cs.surfaceContainerLowest.copy(alpha = 0.85f),
+                    color = cs.surfaceContainerLowest.copy(alpha = 0.88f),
                     contentColor = cs.onSurface,
                     modifier = Modifier
-                        .size(28.dp)
+                        .size(30.dp)
                         .clip(CircleShape)
                         .clickable { cardMenuExpanded = true }
                 ) {
@@ -732,7 +737,7 @@ private fun CarouselItemScope.PresetCarouselCard(
                         Icon(
                             imageVector = Icons.Rounded.MoreVert,
                             contentDescription = "方案操作",
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(17.dp)
                         )
                     }
                 }
@@ -767,36 +772,33 @@ private fun CarouselItemScope.PresetCarouselCard(
             }
         }
 
-        // Bottom info cleanly inside narrow card width
-        Column(
+        // Bottom-right scheme label only (steps & mode moved cleanly to detail section below)
+        Surface(
+            shape = CircleShape,
+            color = if (isSelected) {
+                cs.primaryContainer.copy(alpha = 0.92f)
+            } else {
+                cs.surfaceContainerLowest.copy(alpha = 0.88f)
+            },
+            contentColor = if (isSelected) cs.onPrimaryContainer else cs.onSurface,
             modifier = Modifier
-                .align(Alignment.BottomStart)
-                .fillMaxWidth()
-                .background(cardBg.copy(alpha = 0.86f))
-                .padding(horizontal = 12.dp, vertical = 9.dp)
-                .then(fadeModifier),
-            verticalArrangement = Arrangement.spacedBy(1.dp)
+                .align(Alignment.BottomEnd)
+                .padding(end = 9.dp, bottom = 9.dp)
+                .heightIn(min = 28.dp)
+                .then(fadeModifier)
         ) {
-            Text(
-                text = preset.name,
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold,
-                color = cs.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            val modeTag = when {
-                preset.executionMode == ExecutionMode.SEQUENTIAL -> "顺序"
-                isChildSubPreset -> "并发子方案"
-                else -> "并发"
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = preset.name,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
-            Text(
-                text = "${preset.targets.size} 步骤 · $modeTag",
-                style = MaterialTheme.typography.labelSmall,
-                color = cs.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
         }
     }
 }
@@ -983,18 +985,19 @@ private fun PresetAddSpeedDial(
             ExpressiveToggleFab(
                 checked = expanded,
                 onCheckedChange = { onToggle() },
-                initialSize = 48.dp,
-                finalSize = 52.dp,
-                initialCornerRadius = 14.dp,
-                finalCornerRadius = 26.dp
+                initialSize = 58.dp,
+                finalSize = 48.dp,
+                initialCornerRadius = 18.dp,
+                finalCornerRadius = 24.dp
             ) { progress, iconColor ->
                 val p = progress()
+                val iconSize = dpLerp(26.dp, 22.dp, p.coerceIn(0f, 1f))
                 Icon(
                     imageVector = Icons.Rounded.Add,
                     contentDescription = if (expanded) "收起新建方式" else "新增方案",
                     tint = iconColor,
                     modifier = Modifier
-                        .size(22.dp)
+                        .size(iconSize)
                         .graphicsLayer { rotationZ = p * 45f }
                 )
             }

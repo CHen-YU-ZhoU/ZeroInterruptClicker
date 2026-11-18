@@ -311,6 +311,7 @@ object MacroCompiler {
                         name = "$mainName.$subIndex",
                         executionMode = ExecutionMode.CONCURRENT,
                         isFrozen = true,
+                        isRecordedMacro = true,
                         targets = subTargets
                     )
                     subPresets += subPreset
@@ -340,6 +341,7 @@ object MacroCompiler {
             id = "macro_main",
             name = mainName,
             executionMode = ExecutionMode.SEQUENTIAL,
+            isRecordedMacro = true,
             targets = mainTargets
         )
         val tempAll = subPresets + mainPreset

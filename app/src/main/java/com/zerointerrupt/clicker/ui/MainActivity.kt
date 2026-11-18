@@ -81,12 +81,15 @@ class MainActivity : ComponentActivity() {
             lockedAnchorAlpha = ClickGlobalSettings.DEFAULT_LOCKED_ALPHA,
             autoLockOnStart = true,
             autoCollapseBar = false,
+            showMacroTrajectories = true,
             presets = emptyList(),
             activePresetId = "preset_1",
             screenWidthPx = 1080,
             screenHeightPx = 2400,
             themeMode = ClickGlobalSettings.THEME_SYSTEM,
             dynamicColor = true,
+            launcherIconMode = ClickGlobalSettings.LAUNCHER_SYSTEM,
+            launcherDynamicIcon = false,
             volumeKeyToggleEnabled = true,
             proModeEnabled = false,
             preferredBackend = ClickGlobalSettings.BACKEND_AUTO,
@@ -276,6 +279,7 @@ class MainActivity : ComponentActivity() {
             lockedAnchorAlpha = settings.lockedAnchorAlpha,
             autoLockOnStart = settings.autoLockOnStart,
             autoCollapseBar = settings.autoCollapseBar,
+            showMacroTrajectories = settings.showMacroTrajectories,
             presets = presets,
             activePresetId = activeId,
             screenWidthPx = metrics.widthPx,
@@ -283,6 +287,7 @@ class MainActivity : ComponentActivity() {
             themeMode = settings.themeMode,
             dynamicColor = settings.dynamicColor,
             launcherIconMode = settings.launcherIconMode,
+            launcherDynamicIcon = settings.launcherDynamicIcon,
             volumeKeyToggleEnabled = settings.volumeKeyToggleEnabled,
             proModeEnabled = settings.proModeEnabled,
             preferredBackend = settings.preferredBackend,
@@ -486,7 +491,8 @@ class MainActivity : ComponentActivity() {
                             jitterRadiusPx = 4.0f,
                             lockedAnchorAlpha = ClickGlobalSettings.DEFAULT_LOCKED_ALPHA,
                             autoLockOnStart = true,
-                            autoCollapseBar = false
+                            autoCollapseBar = false,
+                            showMacroTrajectories = true
                         )
                     },
                     syncTapPresets = true
@@ -556,6 +562,9 @@ class MainActivity : ComponentActivity() {
             },
             onAutoCollapseChange = { enabled ->
                 saveCurrentSettings({ it.copy(autoCollapseBar = enabled) })
+            },
+            onShowMacroTrajectoriesChange = { enabled ->
+                saveCurrentSettings({ it.copy(showMacroTrajectories = enabled) }, notifyOverlay = true)
             },
             onApplyDefaultsToGlobal = {
                 val settings = ClickConfigStore.loadSettings(this)
@@ -803,7 +812,10 @@ class MainActivity : ComponentActivity() {
                 saveCurrentSettings({ it.copy(dynamicColor = enabled) }, notifyOverlay = true)
             },
             onLauncherIconModeChange = { mode ->
-                switchLauncherIcon(scope, mode)
+                switchLauncherIcon(scope, mode, uiModel.launcherDynamicIcon)
+            },
+            onLauncherDynamicIconChange = { enabled ->
+                switchLauncherIcon(scope, uiModel.launcherIconMode, enabled)
             },
             onVolumeKeyToggleChange = { enabled ->
                 saveCurrentSettings({ it.copy(volumeKeyToggleEnabled = enabled) }, notifyOverlay = false)
@@ -861,53 +873,58 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun resolveActiveAliasFromPackageManager(): Int {
+    private fun resolveActiveAliasFromPackageManager(): Pair<Int, Boolean> {
         return try {
-            val lightState = packageManager.getComponentEnabledSetting(
-                ComponentName(this, "$packageName.LauncherLightAlias")
+            val candidates = listOf(
+                Triple("$packageName.LauncherLightMonochromeAlias", ClickGlobalSettings.LAUNCHER_LIGHT, true),
+                Triple("$packageName.LauncherDarkMonochromeAlias", ClickGlobalSettings.LAUNCHER_DARK, true),
+                Triple("$packageName.LauncherSystemMonochromeAlias", ClickGlobalSettings.LAUNCHER_SYSTEM, true),
+                Triple("$packageName.LauncherLightAlias", ClickGlobalSettings.LAUNCHER_LIGHT, false),
+                Triple("$packageName.LauncherDarkAlias", ClickGlobalSettings.LAUNCHER_DARK, false),
+                Triple("$packageName.LauncherSystemAlias", ClickGlobalSettings.LAUNCHER_SYSTEM, false)
             )
-            if (lightState == PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
-                return ClickGlobalSettings.LAUNCHER_LIGHT
+            for ((cls, mode, dynamic) in candidates) {
+                val st = packageManager.getComponentEnabledSetting(ComponentName(this, cls))
+                if (st == PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
+                    return mode to dynamic
+                }
             }
-            val darkState = packageManager.getComponentEnabledSetting(
-                ComponentName(this, "$packageName.LauncherDarkAlias")
-            )
-            if (darkState == PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
-                return ClickGlobalSettings.LAUNCHER_DARK
-            }
-            ClickGlobalSettings.LAUNCHER_SYSTEM
+            ClickGlobalSettings.LAUNCHER_SYSTEM to false
         } catch (_: Throwable) {
-            ClickGlobalSettings.LAUNCHER_SYSTEM
+            ClickGlobalSettings.LAUNCHER_SYSTEM to false
         }
     }
 
     private fun reconcileLauncherIconMode() {
         val currentSettings = ClickConfigStore.loadSettings(this)
-        val resolvedMode = if (ClickConfigStore.hasLauncherIconModePref(this)) {
-            currentSettings.launcherIconMode
+        val (resolvedMode, resolvedDynamic) = if (ClickConfigStore.hasLauncherIconModePref(this)) {
+            currentSettings.launcherIconMode to currentSettings.launcherDynamicIcon
         } else {
             val detected = resolveActiveAliasFromPackageManager()
-            ClickConfigStore.saveSettings(this, currentSettings.copy(launcherIconMode = detected))
+            ClickConfigStore.saveSettings(
+                this,
+                currentSettings.copy(launcherIconMode = detected.first, launcherDynamicIcon = detected.second)
+            )
             detected
         }
-        applyLauncherIconComponents(resolvedMode)
+        applyLauncherIconComponents(resolvedMode, resolvedDynamic)
     }
 
-    private fun applyLauncherIconComponents(mode: Int) {
-        val systemAlias = ComponentName(this, "$packageName.LauncherSystemAlias")
-        val darkAlias = ComponentName(this, "$packageName.LauncherDarkAlias")
-        val lightAlias = ComponentName(this, "$packageName.LauncherLightAlias")
+    private fun applyLauncherIconComponents(mode: Int, dynamicIcon: Boolean) {
         val entries = listOf(
-            ClickGlobalSettings.LAUNCHER_SYSTEM to systemAlias,
-            ClickGlobalSettings.LAUNCHER_DARK to darkAlias,
-            ClickGlobalSettings.LAUNCHER_LIGHT to lightAlias
+            Triple(ClickGlobalSettings.LAUNCHER_SYSTEM, false, ComponentName(this, "$packageName.LauncherSystemAlias")),
+            Triple(ClickGlobalSettings.LAUNCHER_DARK, false, ComponentName(this, "$packageName.LauncherDarkAlias")),
+            Triple(ClickGlobalSettings.LAUNCHER_LIGHT, false, ComponentName(this, "$packageName.LauncherLightAlias")),
+            Triple(ClickGlobalSettings.LAUNCHER_SYSTEM, true, ComponentName(this, "$packageName.LauncherSystemMonochromeAlias")),
+            Triple(ClickGlobalSettings.LAUNCHER_DARK, true, ComponentName(this, "$packageName.LauncherDarkMonochromeAlias")),
+            Triple(ClickGlobalSettings.LAUNCHER_LIGHT, true, ComponentName(this, "$packageName.LauncherLightMonochromeAlias"))
         )
         val safeMode = mode.coerceIn(
             ClickGlobalSettings.LAUNCHER_SYSTEM,
             ClickGlobalSettings.LAUNCHER_LIGHT
         )
-        for ((entryMode, component) in entries) {
-            val desiredState = if (entryMode == safeMode) {
+        for ((entryMode, entryDynamic, component) in entries) {
+            val desiredState = if (entryMode == safeMode && entryDynamic == dynamicIcon) {
                 PackageManager.COMPONENT_ENABLED_STATE_ENABLED
             } else {
                 PackageManager.COMPONENT_ENABLED_STATE_DISABLED
@@ -922,20 +939,28 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun switchLauncherIcon(scope: kotlinx.coroutines.CoroutineScope, mode: Int) {
+    private fun switchLauncherIcon(
+        scope: kotlinx.coroutines.CoroutineScope,
+        mode: Int,
+        dynamicIcon: Boolean
+    ) {
         val safeMode = mode.coerceIn(
             ClickGlobalSettings.LAUNCHER_SYSTEM,
             ClickGlobalSettings.LAUNCHER_LIGHT
         )
         try {
-            applyLauncherIconComponents(safeMode)
-            saveCurrentSettings({ it.copy(launcherIconMode = safeMode) }, notifyOverlay = false)
+            applyLauncherIconComponents(safeMode, dynamicIcon)
+            saveCurrentSettings(
+                mutate = { it.copy(launcherIconMode = safeMode, launcherDynamicIcon = dynamicIcon) },
+                notifyOverlay = false
+            )
             val modeLabel = when (safeMode) {
                 ClickGlobalSettings.LAUNCHER_DARK -> "深色"
                 ClickGlobalSettings.LAUNCHER_LIGHT -> "浅色"
                 else -> "跟随系统"
             }
-            showMessage(scope, "桌面图标已设为「$modeLabel」，返回桌面后生效")
+            val suffix = if (dynamicIcon) " · 动态取色" else ""
+            showMessage(scope, "桌面图标已设为「$modeLabel$suffix」，返回桌面后生效")
         } catch (t: Throwable) {
             showMessage(scope, "切换图标失败: ${t.message ?: "未知错误"}")
         }

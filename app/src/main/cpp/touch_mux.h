@@ -136,7 +136,8 @@ public:
                               int rotation,
                               float jitterRadiusPx,
                               int executionMode = 0,
-                              int presetLoopCount = 0);
+                              int presetLoopCount = 0,
+                              bool forceReset = false);
     void stopClicking();
 
     // Direct RPC gesture injection (runs multiplexed seamlessly inside engineLoop)
@@ -370,6 +371,7 @@ private:
     bool cfgClickingRunning_ = false;
     ExecutionMode cfgExecutionMode_ = ExecutionMode::CONCURRENT;
     int32_t cfgPresetLoopCount_ = 0;
+    uint64_t cfgForceResetSeq_ = 0;
     std::vector<NativeClickTarget> cfgTargets_;
     std::vector<RpcCommand> cfgRpcCommands_;
     int64_t cfgSelfCheckDeadlineNs_ = 0;
@@ -385,6 +387,7 @@ private:
     bool activeClickingRunning_ = false;
     ExecutionMode activeExecutionMode_ = ExecutionMode::CONCURRENT;
     int32_t activePresetLoopCount_ = 0;
+    uint64_t activeForceResetSeq_ = 0;
     int32_t seqCompletedLoops_ = 0;
     size_t activeStageIdx_ = 0;
     int64_t selfCheckDeadlineNs_ = 0;

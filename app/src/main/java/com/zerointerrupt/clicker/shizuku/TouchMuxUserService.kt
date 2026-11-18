@@ -137,7 +137,8 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         rotation: Int,
         jitterRadiusPx: Float,
         executionMode: Int,
-        presetLoopCount: Int
+        presetLoopCount: Int,
+        forceReset: Boolean
     )
     private external fun nativeUpdateDisplayMetrics(displayW: Int, displayH: Int, rotation: Int)
     private external fun nativeStopClicking()
@@ -592,7 +593,8 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 rotation = rotation,
                 jitterRadiusPx = jitterRadiusPx,
                 executionMode = executionMode,
-                presetLoopCount = presetLoopCount
+                presetLoopCount = presetLoopCount,
+                forceReset = true
             )
             currentMode.set(mode)
             clickingActive.set(true)
@@ -663,7 +665,8 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 rotation = rotation,
                 jitterRadiusPx = jitterRadiusPx,
                 executionMode = executionMode,
-                presetLoopCount = presetLoopCount
+                presetLoopCount = presetLoopCount,
+                forceReset = false
             )
         } else {
             synchronized(fallbackLock) {
@@ -922,7 +925,8 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         rotation: Int,
         jitterRadiusPx: Float,
         executionMode: Int,
-        presetLoopCount: Int
+        presetLoopCount: Int,
+        forceReset: Boolean
     ) {
         val n = list.size
         val ids = IntArray(n)
@@ -989,7 +993,8 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             rotation,
             jitterRadiusPx.coerceIn(0f, 16f),
             executionMode,
-            presetLoopCount.coerceIn(0, 9999)
+            presetLoopCount.coerceIn(0, 9999),
+            forceReset
         )
     }
 

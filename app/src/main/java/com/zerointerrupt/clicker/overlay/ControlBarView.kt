@@ -30,9 +30,9 @@ import kotlin.math.roundToInt
  * 1. Compact initial state (isToolsExpanded = false):
  *    [ Top edge-dock (< / >) ] -> [ Play / Stop ] -> [ Switch Preset (1..N) ] -> [ Expand tools (v, rotated 90 deg) ]
  * 2. Tools expanded state (isToolsExpanded = true):
- *    Unfolds +, -, Lock, Tune, Close above the symmetric collapse tools chevron (^).
+ *    Unfolds +, -, Lock, Record, Close above the symmetric collapse tools chevron (^).
  * 3. Edge-docked collapsed state (isCollapsed = true):
- *    Ultra-slim 26dp x 74dp edge-docked tab with live TouchMux LED + inward chevron.
+ *    Ultra-slim 20dp x 80dp edge-docked tab with live TouchMux LED + inward chevron.
  *
  * Every touch target uses Android native Material RippleDrawable for classic ripple wave feedback.
  */
@@ -50,7 +50,6 @@ class ControlBarView(
         fun onAddTarget()
         fun onRemoveTarget()
         fun onToggleLockEdit()
-        fun onToggleTunePanel()
         fun onStartMacroRecord()
         fun onCloseOverlay()
         fun onCollapseRequested()
@@ -67,14 +66,15 @@ class ControlBarView(
     private val edgeMarginPx = (12f * density).roundToInt()
     private val morphHostWidthPx = expandedWidthPx + edgeMarginPx
     private val btnSizePx = (38f * density).roundToInt()
-    private val capHeightPx = (30f * density).roundToInt()
+    // Outer radius = 26dp semicircle, padPx = 5dp -> cap width = 42dp -> concentric cap radius = 21dp.
+    private val capHeightPx = (34f * density).roundToInt()
     private val padPx = (5f * density).roundToInt()
     private val gapPx = (4f * density).roundToInt()
 
     // Top cap + Play + Switch + Bottom cap + 3 gaps + outer vertical padding
     private val compactBarHeightPx = padPx * 2 + capHeightPx * 2 + btnSizePx * 2 + gapPx * 3
-    // Unfolded height includes 6 secondary tool buttons (+, -, lock, tune, record, close) each + gapPx
-    private val fullBarHeightPx = compactBarHeightPx + (btnSizePx + gapPx) * 6
+    // Unfolded height includes 5 secondary tool buttons (+, -, lock, record, close) each + gapPx
+    private val fullBarHeightPx = compactBarHeightPx + (btnSizePx + gapPx) * 5
 
     private val collapsedWidthPx = (20f * density).roundToInt()
     private val collapsedHeightPx = (80f * density).roundToInt()
@@ -86,7 +86,6 @@ class ControlBarView(
     private var runningState: Boolean = false
     private var lockedState: Boolean = false
     private var engineModeState: Int = TouchMuxUserService.MODE_IDLE
-    private var tunePanelOpenState: Boolean = false
     private var activePresetIndex: Int = 0
     private var totalPresetCount: Int = 1
 
@@ -103,8 +102,6 @@ class ControlBarView(
     private val removeBg = ovalGradient()
     private val lockBtn: ImageView
     private val lockBg = ovalGradient()
-    private val tuneBtn: ImageView
-    private val tuneBg = ovalGradient()
     private val recordBtn: ImageView
     private val recordBg = ovalGradient()
     private val closeBtn: ImageView
@@ -167,11 +164,10 @@ class ControlBarView(
         addBtn = createActionButton(R.drawable.ic_add, addBg) { listener.onAddTarget() }
         removeBtn = createActionButton(R.drawable.ic_remove, removeBg) { listener.onRemoveTarget() }
         lockBtn = createActionButton(R.drawable.ic_lock_open, lockBg) { listener.onToggleLockEdit() }
-        tuneBtn = createActionButton(R.drawable.ic_tune, tuneBg) { listener.onToggleTunePanel() }
         recordBtn = createActionButton(R.drawable.ic_record, recordBg) { listener.onStartMacroRecord() }
         closeBtn = createActionButton(R.drawable.ic_close, closeBg) { listener.onCloseOverlay() }
 
-        listOf(addBtn, removeBtn, lockBtn, tuneBtn, recordBtn, closeBtn).forEach { btn ->
+        listOf(addBtn, removeBtn, lockBtn, recordBtn, closeBtn).forEach { btn ->
             secondaryToolsContainer.addView(
                 btn,
                 LinearLayout.LayoutParams(btnSizePx, btnSizePx).apply {
@@ -264,22 +260,27 @@ class ControlBarView(
 
     fun applyThemeColors(newColors: OverlayThemeColors) {
         colors = newColors
+        val outerRadiusPx = expandedWidthPx * 0.5f
         expandedContainer.background = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
-            cornerRadius = 24f * density
+            cornerRadius = outerRadiusPx
             setColor(newColors.surfaceContainerHigh)
             setStroke((1f * density).roundToInt().coerceAtLeast(1), newColors.outlineVariant)
         }
 
         val rippleTint = ColorStateList.valueOf(newColors.ripple)
-        listOf(playStopBtn, switchPresetBtn, addBtn, removeBtn, lockBtn, tuneBtn, recordBtn, closeBtn).forEach { btn ->
+        listOf(playStopBtn, switchPresetBtn, addBtn, removeBtn, lockBtn, recordBtn, closeBtn).forEach { btn ->
             (btn.background as? RippleDrawable)?.setColor(rippleTint)
         }
 
-        val capCornerRadius = capHeightPx * 0.5f
-        val capRadii = FloatArray(8) { capCornerRadius }
-        headerCollapseView.foreground = newColors.createRippleDrawable(null, maskCornerRadii = capRadii)
-        footerExpandView.foreground = newColors.createRippleDrawable(null, maskCornerRadii = capRadii)
+        val capW = (expandedWidthPx - padPx * 2).toFloat()
+        val capH = capHeightPx.toFloat()
+        val outerCapR = capW * 0.5f
+        val innerCapR = (capH - outerCapR).coerceAtLeast(8f * density)
+        val topCapRadii = floatArrayOf(outerCapR, outerCapR, outerCapR, outerCapR, innerCapR, innerCapR, innerCapR, innerCapR)
+        val bottomCapRadii = floatArrayOf(innerCapR, innerCapR, innerCapR, innerCapR, outerCapR, outerCapR, outerCapR, outerCapR)
+        headerCollapseView.foreground = newColors.createRippleDrawable(null, maskCornerRadii = topCapRadii)
+        footerExpandView.foreground = newColors.createRippleDrawable(null, maskCornerRadii = bottomCapRadii)
         updateCollapsedPillForeground()
 
         redrawButtonStates()
@@ -441,14 +442,12 @@ class ControlBarView(
         isRunning: Boolean,
         isLocked: Boolean,
         engineMode: Int,
-        tunePanelOpen: Boolean,
         presetIndex: Int,
         presetCount: Int
     ) {
         runningState = isRunning
         lockedState = isLocked
         engineModeState = engineMode
-        tunePanelOpenState = tunePanelOpen
         activePresetIndex = presetIndex
         totalPresetCount = presetCount.coerceAtLeast(1)
         redrawButtonStates()
@@ -492,14 +491,6 @@ class ControlBarView(
             lockBtn.setImageResource(R.drawable.ic_lock_open)
             lockBtn.setColorFilter(colors.primary)
             lockBg.setColor(neutralBg)
-        }
-
-        if (tunePanelOpenState) {
-            tuneBtn.setColorFilter(colors.onPrimaryContainer)
-            tuneBg.setColor(colors.primaryContainer)
-        } else {
-            tuneBtn.setColorFilter(neutralFg)
-            tuneBg.setColor(neutralBg)
         }
 
         recordBg.setColor(ColorUtils.setAlphaComponent(colors.tertiaryContainer, 220))
@@ -626,6 +617,7 @@ class ControlBarView(
             strokeJoin = Paint.Join.ROUND
             strokeWidth = 1.9f * density
         }
+        private val bgPath = Path()
         private val bgRect = RectF()
 
         override fun onDraw(canvas: Canvas) {
@@ -634,14 +626,19 @@ class ControlBarView(
             val h = height.toFloat()
             if (w <= 0f || h <= 0f) return
 
+            val outerR = w * 0.5f
+            val innerR = (h - outerR).coerceAtLeast(8f * density)
+            val radii = floatArrayOf(outerR, outerR, outerR, outerR, innerR, innerR, innerR, innerR)
             bgPaint.color = ColorUtils.setAlphaComponent(colors.surfaceContainerHighest, 185)
             bgRect.set(0f, 0f, w, h)
-            canvas.drawRoundRect(bgRect, h * 0.5f, h * 0.5f, bgPaint)
+            bgPath.reset()
+            bgPath.addRoundRect(bgRect, radii, Path.Direction.CW)
+            canvas.drawPath(bgPath, bgPaint)
 
             val ledColor = statusLedColor()
-            val cy = h * 0.5f
-            val ledX = if (dockRightState) w * 0.30f else w * 0.70f
-            val chevronX = if (dockRightState) w * 0.68f else w * 0.32f
+            val cy = h * 0.53f
+            val ledX = if (dockRightState) w * 0.31f else w * 0.69f
+            val chevronX = if (dockRightState) w * 0.67f else w * 0.33f
 
             if (runningState) {
                 ledHaloPaint.color = ColorUtils.setAlphaComponent(ledColor, 85)
@@ -676,6 +673,7 @@ class ControlBarView(
             strokeJoin = Paint.Join.ROUND
             strokeWidth = 1.9f * density
         }
+        private val bgPath = Path()
         private val bgRect = RectF()
 
         override fun onDraw(canvas: Canvas) {
@@ -684,16 +682,21 @@ class ControlBarView(
             val h = height.toFloat()
             if (w <= 0f || h <= 0f) return
 
+            val outerR = w * 0.5f
+            val innerR = (h - outerR).coerceAtLeast(8f * density)
+            val radii = floatArrayOf(innerR, innerR, innerR, innerR, outerR, outerR, outerR, outerR)
             bgPaint.color = ColorUtils.setAlphaComponent(
                 if (isToolsExpandedState) colors.primaryContainer else colors.surfaceContainerHighest,
                 if (isToolsExpandedState) 210 else 185
             )
             bgRect.set(0f, 0f, w, h)
-            canvas.drawRoundRect(bgRect, h * 0.5f, h * 0.5f, bgPaint)
+            bgPath.reset()
+            bgPath.addRoundRect(bgRect, radii, Path.Direction.CW)
+            canvas.drawPath(bgPath, bgPaint)
 
             strokePaint.color = if (isToolsExpandedState) colors.onPrimaryContainer else colors.onSurfaceVariant
             val cx = w * 0.5f
-            val cy = h * 0.5f
+            val cy = h * 0.47f
             // Exact 90-degree rotation of the top horizontal chevron (aw <-> ah)
             val halfW = 4.6f * density
             val depthH = 3.5f * density

@@ -232,6 +232,7 @@ data class ClickPreset(
     var presetLoopCount: Int = 0,
     var isFrozen: Boolean = false,
     var parentPresetId: String = "",
+    var isRecordedMacro: Boolean = false,
     val targets: MutableList<ClickTarget> = mutableListOf()
 )
 
@@ -246,10 +247,12 @@ data class ClickGlobalSettings(
     val selfCheckPassed: Boolean = false,
     val autoLockOnStart: Boolean = true,
     val autoCollapseBar: Boolean = false,
+    val showMacroTrajectories: Boolean = true,
     val lockedAnchorAlpha: Float = DEFAULT_LOCKED_ALPHA,
     val themeMode: Int = THEME_SYSTEM,
     val dynamicColor: Boolean = true,
     val launcherIconMode: Int = LAUNCHER_SYSTEM,
+    val launcherDynamicIcon: Boolean = false,
     val volumeKeyToggleEnabled: Boolean = true,
     val proModeEnabled: Boolean = false,
     val preferredBackend: Int = BACKEND_AUTO,
@@ -306,10 +309,12 @@ object ClickConfigStore {
     private const val KEY_SELF_CHECK_PASSED = "self_check_passed"
     private const val KEY_AUTO_LOCK_ON_START = "auto_lock_on_start"
     private const val KEY_AUTO_COLLAPSE_BAR = "auto_collapse_bar"
+    private const val KEY_SHOW_MACRO_TRAJECTORIES = "show_macro_trajectories"
     private const val KEY_LOCKED_ANCHOR_ALPHA = "locked_anchor_alpha"
     private const val KEY_THEME_MODE = "theme_mode"
     private const val KEY_DYNAMIC_COLOR = "dynamic_color"
     private const val KEY_LAUNCHER_ICON_MODE = "launcher_icon_mode"
+    private const val KEY_LAUNCHER_DYNAMIC_ICON = "launcher_dynamic_icon"
     private const val KEY_VOL_KEY_TOGGLE = "volume_key_toggle_enabled"
     private const val KEY_PRO_MODE = "pro_mode_enabled"
     private const val KEY_PREFERRED_BACKEND = "preferred_backend"
@@ -374,6 +379,7 @@ object ClickConfigStore {
             selfCheckPassed = prefs.getBoolean(KEY_SELF_CHECK_PASSED, false),
             autoLockOnStart = prefs.getBoolean(KEY_AUTO_LOCK_ON_START, true),
             autoCollapseBar = prefs.getBoolean(KEY_AUTO_COLLAPSE_BAR, false),
+            showMacroTrajectories = prefs.getBoolean(KEY_SHOW_MACRO_TRAJECTORIES, true),
             lockedAnchorAlpha = prefs.getFloat(KEY_LOCKED_ANCHOR_ALPHA, ClickGlobalSettings.DEFAULT_LOCKED_ALPHA)
                 .coerceIn(ClickGlobalSettings.MIN_LOCKED_ALPHA, ClickGlobalSettings.MAX_LOCKED_ALPHA),
             themeMode = prefs.getInt(KEY_THEME_MODE, ClickGlobalSettings.THEME_SYSTEM)
@@ -381,6 +387,7 @@ object ClickConfigStore {
             dynamicColor = prefs.getBoolean(KEY_DYNAMIC_COLOR, true),
             launcherIconMode = prefs.getInt(KEY_LAUNCHER_ICON_MODE, ClickGlobalSettings.LAUNCHER_SYSTEM)
                 .coerceIn(ClickGlobalSettings.LAUNCHER_SYSTEM, ClickGlobalSettings.LAUNCHER_LIGHT),
+            launcherDynamicIcon = prefs.getBoolean(KEY_LAUNCHER_DYNAMIC_ICON, false),
             volumeKeyToggleEnabled = prefs.getBoolean(KEY_VOL_KEY_TOGGLE, true),
             proModeEnabled = prefs.getBoolean(KEY_PRO_MODE, false),
             preferredBackend = prefs.getInt(KEY_PREFERRED_BACKEND, ClickGlobalSettings.BACKEND_AUTO)
@@ -403,6 +410,7 @@ object ClickConfigStore {
             .putBoolean(KEY_SELF_CHECK_PASSED, settings.selfCheckPassed)
             .putBoolean(KEY_AUTO_LOCK_ON_START, settings.autoLockOnStart)
             .putBoolean(KEY_AUTO_COLLAPSE_BAR, settings.autoCollapseBar)
+            .putBoolean(KEY_SHOW_MACRO_TRAJECTORIES, settings.showMacroTrajectories)
             .putFloat(
                 KEY_LOCKED_ANCHOR_ALPHA,
                 settings.lockedAnchorAlpha.coerceIn(
@@ -419,6 +427,7 @@ object ClickConfigStore {
                     ClickGlobalSettings.LAUNCHER_LIGHT
                 )
             )
+            .putBoolean(KEY_LAUNCHER_DYNAMIC_ICON, settings.launcherDynamicIcon)
             .putBoolean(KEY_VOL_KEY_TOGGLE, settings.volumeKeyToggleEnabled)
             .putBoolean(KEY_PRO_MODE, settings.proModeEnabled)
             .putInt(KEY_PREFERRED_BACKEND, settings.preferredBackend)
@@ -535,6 +544,7 @@ object ClickConfigStore {
                         migratedLegacyFrozen = true
                     }
                     val parentId = obj.optString("parentPresetId", "")
+                    val isRecorded = obj.optBoolean("isRecordedMacro", false)
                     val targets = jsonArrayToTargets(
                         obj.optJSONArray("targets"),
                         defaultRepeat = ClickTarget.defaultRepeatFor(execMode)
@@ -546,6 +556,7 @@ object ClickConfigStore {
                         presetLoopCount = loopCount,
                         isFrozen = frozen,
                         parentPresetId = parentId,
+                        isRecordedMacro = isRecorded,
                         targets = targets
                     )
                 }
@@ -612,6 +623,9 @@ object ClickConfigStore {
                 put("isFrozen", preset.isFrozen)
                 if (preset.parentPresetId.isNotBlank()) {
                     put("parentPresetId", preset.parentPresetId)
+                }
+                if (preset.isRecordedMacro) {
+                    put("isRecordedMacro", true)
                 }
                 put("targets", targetsToJsonArray(preset.targets))
             })
@@ -683,6 +697,7 @@ object ClickConfigStore {
         presetLoopCount: Int = 0,
         isFrozen: Boolean = false,
         parentPresetId: String = "",
+        isRecordedMacro: Boolean = false,
         activate: Boolean = true
     ): ClickPreset {
         val presets = loadPresets(context)
@@ -704,6 +719,7 @@ object ClickConfigStore {
             presetLoopCount = presetLoopCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT),
             isFrozen = isFrozen,
             parentPresetId = parentPresetId,
+            isRecordedMacro = isRecordedMacro,
             targets = copiedTargets
         )
         presets += created
@@ -742,6 +758,7 @@ object ClickConfigStore {
                 presetLoopCount = sub.presetLoopCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT),
                 isFrozen = true,
                 parentPresetId = mainId,
+                isRecordedMacro = sub.isRecordedMacro,
                 targets = copiedTargets
             )
         }
@@ -759,6 +776,7 @@ object ClickConfigStore {
             presetLoopCount = mainPreset.presetLoopCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT),
             isFrozen = false,
             parentPresetId = "",
+            isRecordedMacro = mainPreset.isRecordedMacro,
             targets = finalMainTargets
         )
 
@@ -818,6 +836,53 @@ object ClickConfigStore {
             persistPresetsInternal(context, presets, getActivePresetId(context))
         }
         return true
+    }
+
+    fun isMacroPreset(presets: List<ClickPreset>, preset: ClickPreset): Boolean {
+        if (preset.isRecordedMacro) return true
+        if (preset.targets.any { it.actionType == ActionType.SUB_PRESET }) return true
+        if (presets.any { it.parentPresetId == preset.id }) return true
+        return preset.executionMode == ExecutionMode.SEQUENTIAL && preset.targets.size >= 8
+    }
+
+    data class DisplayTargetEntry(
+        val target: ClickTarget,
+        val isExpandedChild: Boolean
+    )
+
+    fun collectExpandedDisplayTargets(
+        presets: List<ClickPreset>,
+        preset: ClickPreset,
+        screenW: Int,
+        screenH: Int,
+        visitedIds: MutableSet<String> = mutableSetOf(preset.id),
+        fromChild: Boolean = false
+    ): List<DisplayTargetEntry> {
+        val out = mutableListOf<DisplayTargetEntry>()
+        for (t in preset.targets) {
+            if (t.actionType == ActionType.SUB_PRESET) {
+                if (!t.enabled) continue
+                if (t.refPresetId.isNotBlank() && t.refPresetId !in visitedIds) {
+                    val child = presets.firstOrNull { it.id == t.refPresetId }
+                    if (child != null) {
+                        visitedIds += child.id
+                        out += collectExpandedDisplayTargets(
+                            presets = presets,
+                            preset = child,
+                            screenW = screenW,
+                            screenH = screenH,
+                            visitedIds = visitedIds,
+                            fromChild = true
+                        )
+                        visitedIds -= child.id
+                    }
+                }
+            } else {
+                val copy = t.copy().apply { remapToScreen(screenW, screenH) }
+                out += DisplayTargetEntry(copy, isExpandedChild = fromChild)
+            }
+        }
+        return out
     }
 
     fun collectPreviewTargets(
@@ -1287,6 +1352,9 @@ object ClickConfigStore {
             put("name", preset.name)
             put("executionMode", preset.executionMode.code)
             put("presetLoopCount", preset.presetLoopCount)
+            if (preset.isRecordedMacro) {
+                put("isRecordedMacro", true)
+            }
             put("targets", targetsToJsonArray(preset.targets))
         }
         return obj.toString(2)
@@ -1303,6 +1371,9 @@ object ClickConfigStore {
                 put("isFrozen", preset.isFrozen)
                 if (preset.parentPresetId.isNotBlank()) {
                     put("parentPresetId", preset.parentPresetId)
+                }
+                if (preset.isRecordedMacro) {
+                    put("isRecordedMacro", true)
                 }
                 put("targets", targetsToJsonArray(preset.targets))
             })
@@ -1328,11 +1399,13 @@ object ClickConfigStore {
             val name: String
             val execMode: ExecutionMode
             val loopCount: Int
+            val isRecorded: Boolean
             val targets: MutableList<ClickTarget>
             if (trimmed.startsWith("[")) {
                 name = "导入方案"
                 execMode = ExecutionMode.CONCURRENT
                 loopCount = 0
+                isRecorded = false
                 targets = jsonArrayToTargets(JSONArray(trimmed), defaultRepeat = 0)
             } else {
                 val obj = JSONObject(trimmed)
@@ -1340,6 +1413,7 @@ object ClickConfigStore {
                 execMode = ExecutionMode.fromCode(obj.optInt("executionMode", 0))
                 loopCount = obj.optInt("presetLoopCount", 0)
                     .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+                isRecorded = obj.optBoolean("isRecordedMacro", false)
                 targets = jsonArrayToTargets(
                     obj.optJSONArray("targets"),
                     defaultRepeat = ClickTarget.defaultRepeatFor(execMode)
@@ -1352,6 +1426,7 @@ object ClickConfigStore {
                 initialTargets = targets,
                 executionMode = execMode,
                 presetLoopCount = loopCount,
+                isRecordedMacro = isRecorded,
                 activate = true
             )
         } catch (_: Throwable) {
@@ -1414,6 +1489,7 @@ object ClickConfigStore {
                 val loopCount: Int,
                 val isFrozen: Boolean,
                 val oldParentId: String,
+                val isRecordedMacro: Boolean,
                 val targets: MutableList<ClickTarget>
             )
 
@@ -1436,13 +1512,14 @@ object ClickConfigStore {
                     isFrozen = true
                 }
                 val oldParentId = item.optString("parentPresetId", "").trim()
+                val isRecorded = item.optBoolean("isRecordedMacro", false)
                 val targets = jsonArrayToTargets(
                     item.optJSONArray("targets"),
                     defaultRepeat = ClickTarget.defaultRepeatFor(execMode)
                 )
                 targets.forEach { it.remapToScreen(screenW, screenH) }
                 val cleanName = rawName.ifEmpty { "导入方案 ${existingPresets.size + staged.size + 1}" }
-                staged += StagedPreset(oldId, newId, cleanName, execMode, loopCount, isFrozen, oldParentId, targets)
+                staged += StagedPreset(oldId, newId, cleanName, execMode, loopCount, isFrozen, oldParentId, isRecorded, targets)
             }
             if (staged.isEmpty()) return emptyList()
 
@@ -1467,6 +1544,7 @@ object ClickConfigStore {
                     presetLoopCount = s.loopCount,
                     isFrozen = s.isFrozen,
                     parentPresetId = resolvedParentId,
+                    isRecordedMacro = s.isRecordedMacro,
                     targets = remappedTargets
                 )
             }

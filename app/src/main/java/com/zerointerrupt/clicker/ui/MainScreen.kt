@@ -116,8 +116,8 @@ fun MainScreen(
                             .statusBarsPadding()
                             .navigationBarsPadding()
                     ) {
-                        Spacer(Modifier.height(12.dp))
-                        MainTab.entries.forEach { tab ->
+                        Spacer(Modifier.weight(1f))
+                        MainTab.entries.forEachIndexed { index, tab ->
                             val selected = currentTab == tab
                             NavigationRailItem(
                                 selected = selected,
@@ -142,6 +142,7 @@ fun MainScreen(
                                     unselectedTextColor = cs.onSurfaceVariant
                                 )
                             )
+                            Spacer(Modifier.weight(1f))
                         }
                     }
 

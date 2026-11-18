@@ -9,6 +9,7 @@ import android.graphics.Path
 import android.graphics.Typeface
 import android.view.View
 import com.zerointerrupt.clicker.model.ActionType
+import com.zerointerrupt.clicker.model.ClickConfigStore
 import com.zerointerrupt.clicker.model.ClickTarget
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -34,7 +35,8 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
         val endX: Float,
         val endY: Float,
         val intervalMs: Long,
-        val enabled: Boolean
+        val enabled: Boolean,
+        val isExpandedChild: Boolean
     )
 
     private var nodes: List<DrawNode> = emptyList()
@@ -98,20 +100,39 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
     }
 
     fun updateSwipes(targets: List<ClickTarget>, isRunning: Boolean, isLocked: Boolean) {
+        updateExpandedSwipes(
+            entries = targets.map { ClickConfigStore.DisplayTargetEntry(it, isExpandedChild = false) },
+            isRunning = isRunning,
+            isLocked = isLocked
+        )
+    }
+
+    fun updateExpandedSwipes(
+        entries: List<ClickConfigStore.DisplayTargetEntry>,
+        isRunning: Boolean,
+        isLocked: Boolean
+    ) {
         running = isRunning
         locked = isLocked
-        nodes = targets
-            .filter { it.actionType != ActionType.SUB_PRESET }
-            .map {
+        var seq = 1
+        nodes = entries
+            .filter { it.target.actionType != ActionType.SUB_PRESET }
+            .map { entry ->
+                val t = entry.target
+                val displayNum = if (entry.isExpandedChild) seq++ else {
+                    seq = maxOf(seq, t.index + 1)
+                    t.index
+                }
                 DrawNode(
-                    indexNumber = it.index,
-                    actionType = it.actionType,
-                    x = it.x,
-                    y = it.y,
-                    endX = it.endX,
-                    endY = it.endY,
-                    intervalMs = it.intervalMs,
-                    enabled = it.enabled
+                    indexNumber = displayNum,
+                    actionType = t.actionType,
+                    x = t.x,
+                    y = t.y,
+                    endX = t.endX,
+                    endY = t.endY,
+                    intervalMs = t.intervalMs,
+                    enabled = t.enabled,
+                    isExpandedChild = entry.isExpandedChild
                 )
             }
         invalidate()
@@ -172,10 +193,12 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
             canvas.drawPath(arrowPath, arrowPaint)
         }
 
-        // When unlocked, individual draggable AnchorPointView windows draw all rings/handles above this layer
-        if (!locked) return
+        // When unlocked, direct non-child anchors render as draggable AnchorPointView windows above this layer;
+        // expanded multi-finger child nodes still render here so concurrent sub-preset fingers remain visible.
+        val hasExpandedChildren = nodes.any { it.isExpandedChild }
+        if (!locked && !hasExpandedChildren) return
 
-        // Layer 2: Unified locked anchor rendering (single WindowManager window = zero alpha stacking)
+        // Layer 2: Unified anchor rendering (single WindowManager window = zero alpha stacking)
         val ringAlphaScale = if (running) 0.78f else 0.94f
         val radius = 19f * d
         val endRadius = 13.5f * d
@@ -186,6 +209,7 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
 
         for (i in nodes.indices) {
             val node = nodes[i]
+            if (!locked && !node.isExpandedChild) continue
             val accentColor = when {
                 !node.enabled -> Color.parseColor("#64748B")
                 running -> Color.parseColor("#00E676")
@@ -194,14 +218,21 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
                 else -> Color.parseColor("#00E5FF")
             }
 
-            // Skip redundant intermediate vertex rings for dense continuous curved trajectories
-            val prev = nodes.getOrNull(i - 1)
-            val isContinuousMidKnot = denseMode &&
-                node.actionType == ActionType.SWIPE &&
-                prev != null &&
-                prev.actionType == ActionType.SWIPE &&
-                prev.intervalMs <= 80L &&
-                hypot((node.x - prev.endX).toDouble(), (node.y - prev.endY).toDouble()) <= 20.0
+            // Search neighboring stages (supports multi-finger concurrent SWIPE streams interleaved in sequential blocks)
+            var isContinuousMidKnot = false
+            if (denseMode && node.actionType == ActionType.SWIPE) {
+                val minIdx = maxOf(0, i - 12)
+                for (k in (i - 1) downTo minIdx) {
+                    val prev = nodes[k]
+                    if (prev.actionType == ActionType.SWIPE &&
+                        prev.intervalMs <= 80L &&
+                        hypot((node.x - prev.endX).toDouble(), (node.y - prev.endY).toDouble()) <= 22.0
+                    ) {
+                        isContinuousMidKnot = true
+                        break
+                    }
+                }
+            }
 
             if (isContinuousMidKnot) {
                 centerDotPaint.color = accentColor
@@ -239,11 +270,19 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
             }
 
             if (node.actionType == ActionType.SWIPE) {
-                val next = nodes.getOrNull(i + 1)
-                val seamlesslyContinues = node.intervalMs <= 80L &&
-                    next != null &&
-                    (next.actionType == ActionType.SWIPE || next.actionType == ActionType.HOLD) &&
-                    hypot((next.x - node.endX).toDouble(), (next.y - node.endY).toDouble()) <= 20.0
+                var seamlesslyContinues = false
+                if (node.intervalMs <= 80L) {
+                    val maxIdx = minOf(nodes.lastIndex, i + 12)
+                    for (k in (i + 1)..maxIdx) {
+                        val next = nodes[k]
+                        if ((next.actionType == ActionType.SWIPE || next.actionType == ActionType.HOLD) &&
+                            hypot((next.x - node.endX).toDouble(), (next.y - node.endY).toDouble()) <= 22.0
+                        ) {
+                            seamlesslyContinues = true
+                            break
+                        }
+                    }
+                }
                 if (!seamlesslyContinues) {
                     fillPaint.color = accentColor
                     fillPaint.alpha = 36

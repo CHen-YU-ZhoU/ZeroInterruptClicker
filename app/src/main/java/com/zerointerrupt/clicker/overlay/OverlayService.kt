@@ -160,7 +160,9 @@ class OverlayService : Service(), ControlBarView.Listener {
     private var lockedAlpha: Float = ClickGlobalSettings.DEFAULT_LOCKED_ALPHA
     private var isLocked: Boolean = false
     private var lastAutoLockOnStart: Boolean = true
+    private var showMacroTrajectoriesPref: Boolean = true
     private var isClicking: Boolean = false
+    private var runSessionSeq: Long = 0L
     private var pendingAutoLockStartRunnable: Runnable? = null
     private var engineMode: Int = TouchMuxUserService.MODE_IDLE
 
@@ -189,6 +191,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         lockedAlpha = initialSettings.lockedAnchorAlpha
             .coerceIn(ClickGlobalSettings.MIN_LOCKED_ALPHA, ClickGlobalSettings.MAX_LOCKED_ALPHA)
         lastAutoLockOnStart = initialSettings.autoLockOnStart
+        showMacroTrajectoriesPref = initialSettings.showMacroTrajectories
         ShizukuController.initialize(this)
         startForegroundWithNotification()
         displayManager.registerDisplayListener(displayListener, null)
@@ -274,10 +277,13 @@ class OverlayService : Service(), ControlBarView.Listener {
                     else -> null
                 }
                 if (match != null) {
-                    if (isClicking) stopClickingInternal()
+                    val wasClicking = isClicking
                     ClickConfigStore.setActivePresetId(this, match.id)
                     replaceTargetsWithActivePreset()
                     OverlayStateHub.bumpConfigVersion()
+                    if (wasClicking) {
+                        continueClickingAfterPresetSwitch(showToast = false)
+                    }
                 }
             }
             ACTION_REFRESH_SETTINGS -> {
@@ -289,12 +295,19 @@ class OverlayService : Service(), ControlBarView.Listener {
                     ClickGlobalSettings.MIN_LOCKED_ALPHA,
                     ClickGlobalSettings.MAX_LOCKED_ALPHA
                 )
+                showMacroTrajectoriesPref = settings.showMacroTrajectories
                 if (normalOverlayAttached) {
                     if (settings.autoLockOnStart && !lastAutoLockOnStart && !isLocked) {
                         applyLockMode(true)
                     }
                     lastAutoLockOnStart = settings.autoLockOnStart
                     reloadTargetSettingsFromStore()
+                    if (shouldHideCurrentMacroOverlay()) {
+                        removeAllAnchorWindows()
+                    } else if (!isLocked) {
+                        attachAllAnchors()
+                    }
+                    syncSwipeConnectorLayer()
                     if (tunePanelView != null) {
                         showOrUpdateTunePanel(forceShow = true)
                     }
@@ -523,15 +536,23 @@ class OverlayService : Service(), ControlBarView.Listener {
         val storedSig = stored.map {
             listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled, it.actionType, it.endX, it.endY, it.swipeDurationMs, it.repeatCount, it.refPresetId, it.subDurationMs)
         }
-        if (activePresetId != preset.id ||
+        val presetSwitched = activePresetId != preset.id
+        if (presetSwitched ||
             activeExecutionMode != preset.executionMode ||
             activePresetLoopCount != preset.presetLoopCount ||
             currentSig != storedSig
         ) {
-            if (isClicking) {
-                stopClickingInternal()
-            }
+            val wasClicking = isClicking
             replaceTargetsWithActivePreset()
+            if (wasClicking) {
+                if (presetSwitched) {
+                    continueClickingAfterPresetSwitch(showToast = false)
+                } else if (targets.any { it.enabled }) {
+                    pushTargetsToServiceAsync()
+                } else {
+                    stopClickingInternal()
+                }
+            }
         }
     }
 
@@ -577,7 +598,6 @@ class OverlayService : Service(), ControlBarView.Listener {
                 isRunning = isClicking,
                 isLocked = isLocked,
                 engineMode = engineMode,
-                tunePanelOpen = (tunePanelView != null),
                 presetIndex = presetIdx,
                 presetCount = presetCount
             )
@@ -918,10 +938,46 @@ class OverlayService : Service(), ControlBarView.Listener {
         controlBarLp = null
     }
 
+    private fun buildExpandedDisplayEntries(): List<ClickConfigStore.DisplayTargetEntry> {
+        val metrics = ShizukuController.getDisplayScreenMetrics(this)
+        val presets = ClickConfigStore.loadPresets(this)
+        val out = mutableListOf<ClickConfigStore.DisplayTargetEntry>()
+        for (t in targets) {
+            if (t.actionType == ActionType.SUB_PRESET) {
+                if (!t.enabled || t.refPresetId.isBlank()) continue
+                val child = presets.firstOrNull { it.id == t.refPresetId } ?: continue
+                out += ClickConfigStore.collectExpandedDisplayTargets(
+                    presets = presets,
+                    preset = child,
+                    screenW = metrics.widthPx,
+                    screenH = metrics.heightPx,
+                    fromChild = true
+                )
+            } else {
+                out += ClickConfigStore.DisplayTargetEntry(t, isExpandedChild = false)
+            }
+        }
+        return out
+    }
+
+    private fun shouldHideCurrentMacroOverlay(): Boolean {
+        if (showMacroTrajectoriesPref) return false
+        val presets = ClickConfigStore.loadPresets(this)
+        val activePreset = presets.firstOrNull { it.id == activePresetId }
+            ?: ClickConfigStore.getActivePreset(this)
+        return ClickConfigStore.isMacroPreset(presets, activePreset)
+    }
+
     private fun syncSwipeConnectorLayer() {
-        val hasSwipes = targets.any { it.actionType == ActionType.SWIPE }
-        val hasVisibleTargets = targets.any { it.actionType != ActionType.SUB_PRESET }
-        if (!hasSwipes && !(isLocked && hasVisibleTargets)) {
+        if (shouldHideCurrentMacroOverlay()) {
+            removeSwipeConnectorLayer()
+            return
+        }
+        val displayEntries = buildExpandedDisplayEntries()
+        val hasSwipes = displayEntries.any { it.target.actionType == ActionType.SWIPE }
+        val hasExpandedChildren = displayEntries.any { it.isExpandedChild }
+        val hasVisibleTargets = displayEntries.isNotEmpty()
+        if (!hasSwipes && !hasExpandedChildren && !(isLocked && hasVisibleTargets)) {
             removeSwipeConnectorLayer()
             return
         }
@@ -950,7 +1006,7 @@ class OverlayService : Service(), ControlBarView.Listener {
                 }
             }
         }
-        view.updateSwipes(targets, isClicking, isLocked)
+        view.updateExpandedSwipes(displayEntries, isClicking, isLocked)
     }
 
     private fun removeSwipeConnectorLayer() {
@@ -974,7 +1030,7 @@ class OverlayService : Service(), ControlBarView.Listener {
     }
 
     private fun attachAllAnchors() {
-        if (isLocked) return
+        if (isLocked || shouldHideCurrentMacroOverlay()) return
         for (t in targets) {
             attachSingleAnchor(t)
         }
@@ -1094,7 +1150,7 @@ class OverlayService : Service(), ControlBarView.Listener {
                 t.setStartPixel(cx, cy, metrics.widthPx, metrics.heightPx)
             }
         }
-        swipeConnectorView?.updateSwipes(targets, isClicking, isLocked)
+        swipeConnectorView?.updateExpandedSwipes(buildExpandedDisplayEntries(), isClicking, isLocked)
     }
 
     private fun handleAnchorDragFinish(targetId: Int) {
@@ -1143,7 +1199,6 @@ class OverlayService : Service(), ControlBarView.Listener {
             isRunning = isClicking,
             isLocked = isLocked,
             engineMode = engineMode,
-            tunePanelOpen = (tunePanelView != null),
             presetIndex = presetIdx,
             presetCount = presetCount
         )
@@ -1379,18 +1434,57 @@ class OverlayService : Service(), ControlBarView.Listener {
             scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
             return
         }
-        if (isClicking) {
-            stopClickingInternal()
-        }
+        val wasClicking = isClicking
         val (newIdx, total, nextPreset) = ClickConfigStore.switchToNextPreset(this)
         replaceTargetsWithActivePreset()
         OverlayStateHub.bumpConfigVersion()
-        Toast.makeText(
-            this,
-            "切换方案 ${newIdx + 1}/$total：${nextPreset.name} (${targets.size} 点)",
-            Toast.LENGTH_SHORT
-        ).show()
-        scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+        if (wasClicking) {
+            continueClickingAfterPresetSwitch(
+                showToast = true,
+                switchIdx = newIdx,
+                switchTotal = total,
+                presetName = nextPreset.name
+            )
+        } else {
+            Toast.makeText(
+                this,
+                "切换方案 ${newIdx + 1}/$total：${nextPreset.name} (${targets.size} 点)",
+                Toast.LENGTH_SHORT
+            ).show()
+            scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+        }
+    }
+
+    private fun continueClickingAfterPresetSwitch(
+        showToast: Boolean,
+        switchIdx: Int = 0,
+        switchTotal: Int = 1,
+        presetName: String = ""
+    ) {
+        if (targets.none { it.enabled }) {
+            stopClickingInternal()
+            if (showToast) {
+                Toast.makeText(
+                    this,
+                    "切换方案 ${switchIdx + 1}/$switchTotal：$presetName（无启用节点，已停止）",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            return
+        }
+        if (!ShizukuController.isServiceConnected()) {
+            stopClickingInternal()
+            Toast.makeText(this, "Shizuku 触控服务尚未连接，已停止运行", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (showToast) {
+            Toast.makeText(
+                this,
+                "切换方案 ${switchIdx + 1}/$switchTotal：$presetName · 无缝运行中",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+        startClickingInternal()
     }
 
     override fun onToggleToolsExpanded() {
@@ -1504,6 +1598,7 @@ class OverlayService : Service(), ControlBarView.Listener {
 
     private fun startClickingInternal() {
         cancelAutoCollapse()
+        val expectedSeq = ++runSessionSeq
         val snapshot = targets.map { it.copy() }
         val modeSnapshot = activeExecutionMode
         val loopSnapshot = activePresetLoopCount
@@ -1519,6 +1614,7 @@ class OverlayService : Service(), ControlBarView.Listener {
                 presetLoopCount = loopSnapshot
             )
             withContext(Dispatchers.Main) {
+                if (expectedSeq != runSessionSeq || !isClicking) return@withContext
                 if (mode < 0) {
                     isClicking = false
                     OverlayStateHub.setClickingRunning(this@OverlayService, false)
@@ -1542,6 +1638,7 @@ class OverlayService : Service(), ControlBarView.Listener {
     private fun stopClickingInternal() {
         pendingAutoLockStartRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingAutoLockStartRunnable = null
+        runSessionSeq++
         if (!isClicking) return
         cancelAutoCollapse()
         isClicking = false
@@ -1640,25 +1737,13 @@ class OverlayService : Service(), ControlBarView.Listener {
         scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
     }
 
-    override fun onToggleTunePanel() {
-        if (tunePanelView != null) {
-            dismissTunePanel()
-            scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
-        } else {
-            cancelAutoCollapse()
-            if (isLocked && !isClicking) {
-                applyLockMode(false)
-            }
-            showOrUpdateTunePanel(forceShow = true)
-        }
-    }
-
     private fun ensureNormalOverlayAttached() {
         if (normalOverlayAttached) return
         normalOverlayAttached = true
         val settings = ClickConfigStore.loadSettings(this)
         isLocked = settings.autoLockOnStart
         lastAutoLockOnStart = settings.autoLockOnStart
+        showMacroTrajectoriesPref = settings.showMacroTrajectories
         loadInitialTargets()
         syncSwipeConnectorLayer()
         attachAllAnchors()
@@ -1829,7 +1914,7 @@ class OverlayService : Service(), ControlBarView.Listener {
                 windowManager.updateViewLayout(endView, endLp)
             }
         }
-        swipeConnectorView?.updateSwipes(targets, isClicking, isLocked)
+        swipeConnectorView?.updateExpandedSwipes(buildExpandedDisplayEntries(), isClicking, isLocked)
 
         serviceScope.launch(Dispatchers.IO) {
             ShizukuController.updateDisplayMetrics()

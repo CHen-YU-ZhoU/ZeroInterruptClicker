@@ -1293,7 +1293,8 @@ void TouchMuxEngine::setTargetsAndRunning(const std::vector<NativeClickTarget>& 
                                           int rotation,
                                           float jitterRadiusPx,
                                           int executionMode,
-                                          int presetLoopCount) {
+                                          int presetLoopCount,
+                                          bool forceReset) {
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         cfgTargets_ = targets;
@@ -1306,6 +1307,9 @@ void TouchMuxEngine::setTargetsAndRunning(const std::vector<NativeClickTarget>& 
                                 ? ExecutionMode::SEQUENTIAL
                                 : ExecutionMode::CONCURRENT;
         cfgPresetLoopCount_ = std::clamp(presetLoopCount, 0, 9999);
+        if (forceReset) {
+            ++cfgForceResetSeq_;
+        }
     }
     signalWake();
 }
@@ -2102,6 +2106,7 @@ void TouchMuxEngine::handleWakeSignal() {
     bool nextRunning = false;
     ExecutionMode nextExecMode = ExecutionMode::CONCURRENT;
     int32_t nextPresetLoopCount = 0;
+    uint64_t nextForceResetSeq = 0;
     bool stopThread = false;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -2112,6 +2117,7 @@ void TouchMuxEngine::handleWakeSignal() {
         nextRunning = cfgClickingRunning_;
         nextExecMode = cfgExecutionMode_;
         nextPresetLoopCount = cfgPresetLoopCount_;
+        nextForceResetSeq = cfgForceResetSeq_;
         nextTargets = cfgTargets_;
         pendingRpc.swap(cfgRpcCommands_);
         stopThread = cfgStopThreadRequested_;
@@ -2237,6 +2243,7 @@ void TouchMuxEngine::handleWakeSignal() {
         activeClickingRunning_ = false;
         activeExecutionMode_ = nextExecMode;
         activePresetLoopCount_ = nextPresetLoopCount;
+        activeForceResetSeq_ = nextForceResetSeq;
         seqCompletedLoops_ = 0;
         releaseAllVirtualTargetSlots();
         virtualTargets_.clear();
@@ -2256,7 +2263,8 @@ void TouchMuxEngine::handleWakeSignal() {
         return;
     }
 
-    const bool freshStart = !activeClickingRunning_;
+    const bool freshStart = !activeClickingRunning_ || (nextForceResetSeq != activeForceResetSeq_);
+    activeForceResetSeq_ = nextForceResetSeq;
     const bool execModeChanged = (activeExecutionMode_ != nextExecMode) || freshStart;
     activeExecutionMode_ = nextExecMode;
     activePresetLoopCount_ = nextPresetLoopCount;
@@ -2269,6 +2277,13 @@ void TouchMuxEngine::handleWakeSignal() {
     } else {
         stages_.clear();
         activeStageIdx_ = 0;
+        auto isCompatibleLiveTarget = [](const NativeClickTarget& oldCfg, const NativeClickTarget& newCfg) {
+            return newCfg.id == oldCfg.id &&
+                   newCfg.enabled &&
+                   oldCfg.actionType == newCfg.actionType &&
+                   std::hypot(oldCfg.x - newCfg.x, oldCfg.y - newCfg.y) <= 24.0f &&
+                   std::hypot(oldCfg.endX - newCfg.endX, oldCfg.endY - newCfg.endY) <= 24.0f;
+        };
         if (execModeChanged) {
             releaseAllVirtualTargetSlots();
         } else {
@@ -2276,7 +2291,7 @@ void TouchMuxEngine::handleWakeSignal() {
             for (auto& oldRt : virtualTargets_) {
                 bool stillEnabled = false;
                 for (const auto& nt : nextTargets) {
-                    if (nt.id == oldRt.config.id && nt.enabled) {
+                    if (isCompatibleLiveTarget(oldRt.config, nt)) {
                         stillEnabled = true;
                         break;
                     }
@@ -2300,7 +2315,7 @@ void TouchMuxEngine::handleWakeSignal() {
             bool matched = false;
             if (!execModeChanged) {
                 for (const auto& oldRt : virtualTargets_) {
-                    if (oldRt.config.id == nt.id && activeClickingRunning_) {
+                    if (isCompatibleLiveTarget(oldRt.config, nt) && activeClickingRunning_) {
                         VirtualTargetRuntime updated = oldRt;
                         updated.config = nt;
                         if (nt.repeatCount == 0 && updated.finishedRounds) {
