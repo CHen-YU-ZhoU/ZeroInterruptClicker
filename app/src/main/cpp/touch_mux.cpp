@@ -50,6 +50,10 @@
 #define KEY_VOLUMEDOWN 114
 #endif
 
+#ifndef EVIOCGMTSLOTS
+#define EVIOCGMTSLOTS(len) _IOC(_IOC_READ, 'E', 0x0a, len)
+#endif
+
 namespace touchmux {
 
 namespace {
@@ -399,6 +403,78 @@ std::vector<std::string> TouchMuxEngine::findVolumeDownKeyDevices() {
     }
     closedir(dir);
     return paths;
+}
+
+bool TouchMuxEngine::hasActivePhysicalTouch(int fd, const DeviceDesc& desc) {
+    std::array<uint8_t, kBitFieldBytes(KEY_MAX)> keyState {};
+    if (ioctl(fd, EVIOCGKEY(keyState.size()), keyState.data()) >= 0 &&
+        testBit(keyState, BTN_TOUCH)) {
+        return true;
+    }
+    if (desc.isTypeB) {
+        const int slots = std::clamp(desc.slotCount, 1, kMaxPhysSlots);
+        struct {
+            uint32_t code;
+            int32_t values[kMaxPhysSlots];
+        } req {};
+        req.code = ABS_MT_TRACKING_ID;
+        std::fill(std::begin(req.values), std::end(req.values), -1);
+        const size_t reqBytes = sizeof(uint32_t) + static_cast<size_t>(slots) * sizeof(int32_t);
+        if (ioctl(fd, EVIOCGMTSLOTS(reqBytes), &req) >= 0) {
+            for (int i = 0; i < slots; ++i) {
+                if (req.values[i] >= 0) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void TouchMuxEngine::waitForPhysicalTouchIdle(int fd, const DeviceDesc& desc, int maxWaitMs) {
+    if (fd < 0 || maxWaitMs <= 0) {
+        return;
+    }
+    const int64_t deadlineNs =
+        nowMonotonicNs() + static_cast<int64_t>(maxWaitMs) * 1000000LL;
+    bool sawActive = false;
+    struct input_event drainBuf[64];
+
+    for (;;) {
+        bool drainedAny = false;
+        while (read(fd, drainBuf, sizeof(drainBuf)) > 0) {
+            drainedAny = true;
+        }
+
+        if (!hasActivePhysicalTouch(fd, desc)) {
+            if (sawActive || drainedAny) {
+                // Give Android InputReader / SpotController a brief window to consume the final UP/SYN_REPORT
+                usleep(20000);
+                while (read(fd, drainBuf, sizeof(drainBuf)) > 0) {
+                }
+                if (hasActivePhysicalTouch(fd, desc)) {
+                    sawActive = true;
+                    continue;
+                }
+                LOGI("Physical touchscreen %s reached idle before EVIOCGRAB.", desc.path.c_str());
+            }
+            break;
+        }
+
+        sawActive = true;
+        const int64_t nowNs = nowMonotonicNs();
+        if (nowNs >= deadlineNs) {
+            LOGW("Timed out waiting %dms for physical touchscreen %s to become idle before EVIOCGRAB.",
+                 maxWaitMs, desc.path.c_str());
+            break;
+        }
+        const int64_t remMs = (deadlineNs - nowNs + 999999LL) / 1000000LL;
+        const int pollMs = static_cast<int>(std::min<int64_t>(remMs, 20LL));
+        struct pollfd pfd {};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        poll(&pfd, 1, std::max(1, pollMs));
+    }
 }
 
 ProbeResult TouchMuxEngine::probeDevices() {
@@ -1109,6 +1185,8 @@ int TouchMuxEngine::initAndGrab(int displayW,
             break;
     }
 
+    waitForPhysicalTouchIdle(physFd_, desc, 800);
+
     if (ioctl(physFd_, EVIOCGRAB, 1) < 0) {
         int err = errno;
         if (err == EBUSY) {
@@ -1135,6 +1213,10 @@ int TouchMuxEngine::initAndGrab(int displayW,
             activeBackend_.store(static_cast<int32_t>(MuxBackendMode::NONE));
             return -err;
         }
+    }
+
+    struct input_event postGrabDrain[64];
+    while (read(physFd_, postGrabDrain, sizeof(postGrabDrain)) > 0) {
     }
 
     epollFd_ = epoll_create1(EPOLL_CLOEXEC);
@@ -3096,6 +3178,7 @@ bool TouchMuxEngine::startRecording(int displayW,
 
     // Verify no process currently holds an exclusive EVIOCGRAB on this touchscreen node; otherwise
     // kernel evdev_events() routes all touches solely to the grab holder and fd reads nothing.
+    waitForPhysicalTouchIdle(fd, desc, 500);
     if (ioctl(fd, EVIOCGRAB, 1) < 0) {
         int grabErr = errno;
         if (grabErr == EBUSY) {

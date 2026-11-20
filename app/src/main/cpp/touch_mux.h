@@ -274,6 +274,8 @@ private:
 
     static bool findBestTouchscreen(DeviceDesc& outDesc, int& outErrno);
     static std::vector<std::string> findVolumeDownKeyDevices();
+    static bool hasActivePhysicalTouch(int fd, const DeviceDesc& desc);
+    static void waitForPhysicalTouchIdle(int fd, const DeviceDesc& desc, int maxWaitMs);
     bool setupUinputDevice(const DeviceDesc& desc, int& outErrno);
     bool setupUhidDevice(const DeviceDesc& desc, int& outErrno);
     void handleUhidEvents();

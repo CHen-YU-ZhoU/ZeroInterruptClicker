@@ -10,8 +10,10 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.SoundEffectConstants
 import android.view.View
 import android.view.ViewConfiguration
 import android.widget.FrameLayout
@@ -126,7 +128,7 @@ class ControlBarView(
 
         headerCollapseView = ExpandedHeaderView(context).apply {
             isClickable = true
-            setOnClickListener { listener.onCollapseRequested() }
+            setRobustClickListener(recoverWhenIdle = false) { listener.onCollapseRequested() }
         }
         expandedContainer.addView(
             headerCollapseView,
@@ -135,7 +137,7 @@ class ControlBarView(
             }
         )
 
-        playStopBtn = createActionButton(R.drawable.ic_play, playStopBg) { listener.onTogglePlayStop() }
+        playStopBtn = createActionButton(R.drawable.ic_play, playStopBg, recoverWhenIdle = true) { listener.onTogglePlayStop() }
         expandedContainer.addView(
             playStopBtn,
             LinearLayout.LayoutParams(btnSizePx, btnSizePx).apply {
@@ -146,7 +148,7 @@ class ControlBarView(
         switchPresetBtn = PresetSwitchButtonView(context).apply {
             isClickable = true
             background = initialColors.createRippleDrawable(switchPresetBg)
-            setOnClickListener { listener.onSwitchPreset() }
+            setRobustClickListener(recoverWhenIdle = false) { listener.onSwitchPreset() }
         }
         expandedContainer.addView(
             switchPresetBtn,
@@ -185,7 +187,7 @@ class ControlBarView(
 
         footerExpandView = ExpandToolsFooterView(context).apply {
             isClickable = true
-            setOnClickListener { listener.onToggleToolsExpanded() }
+            setRobustClickListener(recoverWhenIdle = false) { listener.onToggleToolsExpanded() }
         }
         expandedContainer.addView(
             footerExpandView,
@@ -195,7 +197,7 @@ class ControlBarView(
         collapsedPillView = CollapsedEdgePillView(context).apply {
             isClickable = true
             visibility = View.GONE
-            setOnClickListener { listener.onExpandRequested() }
+            setRobustClickListener(recoverWhenIdle = true) { listener.onExpandRequested() }
         }
 
         addView(
@@ -211,6 +213,7 @@ class ControlBarView(
     }
 
     private var hasActiveTouch = false
+    private var externalCancelInProgress = false
     private var pendingTouchIdleCallback: (() -> Unit)? = null
 
     fun hasActiveTouchGesture(): Boolean = hasActiveTouch
@@ -225,9 +228,18 @@ class ControlBarView(
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         when (ev.actionMasked) {
-            MotionEvent.ACTION_DOWN -> hasActiveTouch = true
+            MotionEvent.ACTION_DOWN -> {
+                hasActiveTouch = true
+                externalCancelInProgress = false
+            }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                val handled = super.dispatchTouchEvent(ev)
+                externalCancelInProgress =
+                    (ev.actionMasked == MotionEvent.ACTION_CANCEL) && !isDragging
+                val handled = try {
+                    super.dispatchTouchEvent(ev)
+                } finally {
+                    externalCancelInProgress = false
+                }
                 hasActiveTouch = false
                 val idleCallback = pendingTouchIdleCallback
                 pendingTouchIdleCallback = null
@@ -238,6 +250,70 @@ class ControlBarView(
         return super.dispatchTouchEvent(ev)
     }
 
+    @SuppressLint("ClickableViewAccessibility")
+    private fun View.setRobustClickListener(
+        recoverWhenIdle: Boolean = false,
+        onClick: () -> Unit
+    ) {
+        var downTimeMs = 0L
+        var downRawX = 0f
+        var downRawY = 0f
+        var isDown = false
+        var movedBeyondSlop = false
+
+        setOnClickListener { onClick() }
+        setOnTouchListener { v, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downTimeMs = SystemClock.uptimeMillis()
+                    downRawX = event.rawX
+                    downRawY = event.rawY
+                    isDown = true
+                    movedBeyondSlop = false
+                    false
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (isDragging || hypot(event.rawX - downRawX, event.rawY - downRawY) >= touchSlop) {
+                        movedBeyondSlop = true
+                        isDown = false
+                    }
+                    false
+                }
+                MotionEvent.ACTION_UP -> {
+                    isDown = false
+                    false
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    val wasDown = isDown
+                    val wasMoved = movedBeyondSlop
+                    isDown = false
+                    movedBeyondSlop = false
+                    if (wasDown &&
+                        !wasMoved &&
+                        !isDragging &&
+                        externalCancelInProgress &&
+                        (recoverWhenIdle || runningState) &&
+                        v.isAttachedToWindow &&
+                        v.isShown &&
+                        this@ControlBarView.alpha > 0.1f
+                    ) {
+                        val elapsedMs = SystemClock.uptimeMillis() - downTimeMs
+                        val hasValidCancelCoords = (event.rawX != 0f || event.rawY != 0f)
+                        val cancelDistOk = !hasValidCancelCoords ||
+                            hypot(event.rawX - downRawX, event.rawY - downRawY) < touchSlop * 2f
+                        if (elapsedMs in 0L..600L && cancelDistOk) {
+                            v.playSoundEffect(SoundEffectConstants.CLICK)
+                            onClick()
+                        }
+                    }
+                    // Return false so View.onTouchEvent(ACTION_CANCEL) still clears pressed/ripple cleanly
+                    false
+                }
+                else -> false
+            }
+        }
+    }
+
     private fun ovalGradient(): GradientDrawable = GradientDrawable().apply {
         shape = GradientDrawable.OVAL
     }
@@ -245,6 +321,7 @@ class ControlBarView(
     private fun createActionButton(
         iconRes: Int,
         bgDrawable: GradientDrawable,
+        recoverWhenIdle: Boolean = false,
         onClick: () -> Unit
     ): ImageView {
         val iv = ImageView(context)
@@ -254,7 +331,7 @@ class ControlBarView(
         iv.setImageDrawable(ContextCompat.getDrawable(context, iconRes))
         iv.isClickable = true
         iv.background = colors.createRippleDrawable(bgDrawable)
-        iv.setOnClickListener { onClick() }
+        iv.setRobustClickListener(recoverWhenIdle = recoverWhenIdle, onClick = onClick)
         return iv
     }
 
