@@ -1,168 +1,247 @@
 package com.zerointerrupt.clicker.ui
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.app.StatusBarManager
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.CountDownTimer
+import android.os.PowerManager
 import android.provider.Settings
+import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.lifecycleScope
+import com.zerointerrupt.clicker.BuildConfig
+import com.zerointerrupt.clicker.QuickTileService
+import com.zerointerrupt.clicker.R
+import com.zerointerrupt.clicker.automation.LocalRpcServer
+import com.zerointerrupt.clicker.model.ActionType
 import com.zerointerrupt.clicker.model.ClickConfigStore
 import com.zerointerrupt.clicker.model.ClickGlobalSettings
 import com.zerointerrupt.clicker.model.ClickPreset
 import com.zerointerrupt.clicker.model.ClickTarget
+import com.zerointerrupt.clicker.model.ExecutionMode
 import com.zerointerrupt.clicker.overlay.OverlayService
 import com.zerointerrupt.clicker.overlay.OverlayStateHub
 import com.zerointerrupt.clicker.shizuku.ShizukuConnectionState
 import com.zerointerrupt.clicker.shizuku.ShizukuController
 import com.zerointerrupt.clicker.ui.theme.ZeroInterruptTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-class MainActivity : AppCompatActivity() {
-
-    private var overlayPermGranted by mutableStateOf(false)
-    private var notifPermGranted by mutableStateOf(false)
-    private var selfCheckPassed by mutableStateOf(false)
-    private var intervalMs by mutableLongStateOf(ClickTarget.DEFAULT_INTERVAL_MS)
-    private var pressDurationMs by mutableLongStateOf(ClickTarget.DEFAULT_PRESS_DURATION_MS)
-    private var microJitter by mutableStateOf(true)
-    private var autoLockOnStart by mutableStateOf(true)
-    private var autoCollapseBar by mutableStateOf(true)
-    private var selfCheckRemainingMs by mutableLongStateOf(0L)
-
-    private var presets by mutableStateOf<List<ClickPreset>>(emptyList())
-    private var activePresetId by mutableStateOf("")
-    private var screenWidthPx by mutableIntStateOf(1080)
-    private var screenHeightPx by mutableIntStateOf(2400)
+class MainActivity : ComponentActivity() {
 
     private var selfCheckTimer: CountDownTimer? = null
-    private val snackbarHostState = SnackbarHostState()
+    private lateinit var snackbarHostState: SnackbarHostState
+    private var currentActiveTab by mutableStateOf(MainTab.HOME)
+    private var requestedTab by mutableStateOf<MainTab?>(null)
+
+    private var uiModel by mutableStateOf(
+        MainUiState(
+            connectionState = ShizukuConnectionState.SHIZUKU_NOT_RUNNING,
+            engineSnapshot = ShizukuController.engineSnapshot.value,
+            slotStates = ShizukuController.slotStates.value,
+            overlayVisible = false,
+            clickingRunning = false,
+            overlayPermGranted = false,
+            notifPermGranted = true,
+            showNotifRow = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
+            batteryOptIgnored = true,
+            selfCheckPassed = false,
+            selfCheckRemainingMs = 0L,
+            selfCheckTimeoutMs = SELF_CHECK_TIMEOUT_MS,
+            tuningTier = ClickGlobalSettings.TIER_CUSTOM,
+            intervalMs = ClickTarget.DEFAULT_INTERVAL_MS,
+            pressDurationMs = ClickTarget.DEFAULT_PRESS_DURATION_MS,
+            microJitter = true,
+            jitterRadiusPx = 4.0f,
+            lockedAnchorAlpha = ClickGlobalSettings.DEFAULT_LOCKED_ALPHA,
+            autoLockOnStart = true,
+            autoCollapseBar = false,
+            showMacroTrajectories = true,
+            presets = emptyList(),
+            activePresetId = "preset_1",
+            screenWidthPx = 1080,
+            screenHeightPx = 2400,
+            themeMode = ClickGlobalSettings.THEME_SYSTEM,
+            dynamicColor = true,
+            launcherIconMode = ClickGlobalSettings.LAUNCHER_SYSTEM,
+            volumeKeyToggleEnabled = true,
+            proModeEnabled = false,
+            preferredBackend = ClickGlobalSettings.BACKEND_AUTO,
+            rpcBridgeEnabled = false,
+            rpcToken = "",
+            rpcServerRunning = false,
+            appVersionName = BuildConfig.VERSION_NAME
+        )
+    )
 
     private val overlayPermLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        refreshLocalPermissionsAndSettings()
+        syncFromStorageAndSystem()
     }
 
     private val notifPermLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) {
-        refreshLocalPermissionsAndSettings()
+        syncFromStorageAndSystem()
+    }
+
+    private val batteryOptLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        syncFromStorageAndSystem()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-
+        enableEdgeToEdge()
+        handleOpenTabIntent(intent)
+        reconcileLauncherIconMode()
         ShizukuController.initialize(this)
-        loadSettingsIntoState()
-        reloadPresetsState()
-        refreshPermissionStates()
+        LocalRpcServer.syncWithSettings(this)
+        syncFromStorageAndSystem()
 
         setContent {
-            val connState by ShizukuController.connectionState.collectAsStateWithLifecycle()
-            val engineSnap by ShizukuController.engineSnapshot.collectAsStateWithLifecycle()
-            val overlayVisible by OverlayStateHub.overlayVisible.collectAsStateWithLifecycle()
-            val clickingRunning by OverlayStateHub.clickingRunning.collectAsStateWithLifecycle()
-            val configVersion by OverlayStateHub.configVersion.collectAsStateWithLifecycle()
+            val connectionState by ShizukuController.connectionState.collectAsState()
+            val engineSnapshot by ShizukuController.engineSnapshot.collectAsState()
+            val slotStates by ShizukuController.slotStates.collectAsState()
+            val overlayVisible by OverlayStateHub.overlayVisible.collectAsState()
+            val clickingRunning by OverlayStateHub.clickingRunning.collectAsState()
+            val configVersion by OverlayStateHub.configVersion.collectAsState()
+
+            val scope = rememberCoroutineScope()
+            snackbarHostState = remember { SnackbarHostState() }
 
             LaunchedEffect(configVersion) {
-                reloadPresetsState()
+                syncFromStorageAndSystem()
             }
 
-            val uiState = MainUiState(
-                connectionState = connState,
-                engineSnapshot = engineSnap,
+            LaunchedEffect(ShizukuController.emergencyUngrabEvents) {
+                ShizukuController.emergencyUngrabEvents.collect {
+                    OverlayStateHub.setClickingRunning(this@MainActivity, false)
+                    snackbarHostState.showSnackbar("已响应长按音量减键：紧急释放物理屏独占")
+                }
+            }
+
+            LaunchedEffect(ShizukuController.clickingCompletedEvents) {
+                ShizukuController.clickingCompletedEvents.collect {
+                    OverlayStateHub.setClickingRunning(this@MainActivity, false)
+                }
+            }
+
+            LaunchedEffect(currentActiveTab, uiModel.proModeEnabled, connectionState) {
+                while (uiModel.proModeEnabled &&
+                    currentActiveTab == MainTab.LAB &&
+                    connectionState == ShizukuConnectionState.CONNECTED
+                ) {
+                    ShizukuController.refreshSlotStates()
+                    delay(400L)
+                }
+            }
+
+            val mergedState = uiModel.copy(
+                connectionState = connectionState,
+                engineSnapshot = engineSnapshot,
+                slotStates = slotStates,
                 overlayVisible = overlayVisible,
                 clickingRunning = clickingRunning,
-                overlayPermGranted = overlayPermGranted,
-                notifPermGranted = notifPermGranted,
-                showNotifRow = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
-                selfCheckPassed = selfCheckPassed,
-                intervalMs = intervalMs,
-                pressDurationMs = pressDurationMs,
-                microJitter = microJitter,
-                autoLockOnStart = autoLockOnStart,
-                autoCollapseBar = autoCollapseBar,
-                selfCheckRemainingMs = selfCheckRemainingMs,
-                selfCheckTimeoutMs = SELF_CHECK_TIMEOUT_MS.toLong(),
-                presets = presets,
-                activePresetId = activePresetId,
-                screenWidthPx = screenWidthPx,
-                screenHeightPx = screenHeightPx
+                rpcServerRunning = LocalRpcServer.isRunning()
             )
 
-            val callbacks = MainScreenCallbacks(
-                onToggleOverlay = ::toggleOverlayService,
-                onGrantOverlay = ::requestOverlayPermission,
-                onGrantShizuku = ::handleShizukuAction,
-                onGrantNotif = ::requestNotificationPermission,
-                onStartSelfCheck = ::launchTouchSelfCheckFlow,
-                onConfirmSelfCheck = ::confirmTouchSelfCheck,
-                onRollbackSelfCheck = ::rollbackTouchSelfCheck,
-                onReleaseNative = ::releaseNativeGrab,
-                onIntervalChange = { value, commit ->
-                    intervalMs = value.coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS)
-                    persistGlobalSettingsAuto(notifyOverlay = commit)
-                },
-                onPressChange = { value, commit ->
-                    pressDurationMs = value.coerceIn(ClickTarget.MIN_PRESS_MS, ClickTarget.MAX_PRESS_MS)
-                    persistGlobalSettingsAuto(notifyOverlay = commit)
-                },
-                onJitterChange = { checked ->
-                    microJitter = checked
-                    persistGlobalSettingsAuto(notifyOverlay = true)
-                },
-                onAutoLockChange = { checked ->
-                    autoLockOnStart = checked
-                    persistGlobalSettingsAuto(notifyOverlay = true)
-                },
-                onAutoCollapseChange = { checked ->
-                    autoCollapseBar = checked
-                    persistGlobalSettingsAuto(notifyOverlay = true)
-                },
-                onApplyDefaultsToCurrentPreset = ::applyDefaultsToCurrentPresetTargets,
-                onSelectPreset = ::selectPreset,
-                onCreatePreset = ::createPreset,
-                onRenamePreset = ::renamePreset,
-                onDeletePreset = ::deletePreset,
-                onSavePresetTarget = ::upsertPresetTarget,
-                onTogglePresetTargetEnabled = ::togglePresetTargetEnabled,
-                onDeletePresetTarget = ::deletePresetTarget
-            )
+            val callbacks = remember(scope) { buildCallbacks(scope) }
 
-            ZeroInterruptTheme {
+            val darkTheme = when (mergedState.themeMode) {
+                ClickGlobalSettings.THEME_DARK -> true
+                ClickGlobalSettings.THEME_LIGHT -> false
+                else -> isSystemInDarkTheme()
+            }
+
+            LaunchedEffect(darkTheme) {
+                enableEdgeToEdge(
+                    statusBarStyle = if (darkTheme) {
+                        SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                    } else {
+                        SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+                    },
+                    navigationBarStyle = if (darkTheme) {
+                        SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                    } else {
+                        SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+                    }
+                )
+            }
+
+            ZeroInterruptTheme(
+                darkTheme = darkTheme,
+                dynamicColor = mergedState.dynamicColor
+            ) {
                 MainScreen(
-                    state = uiState,
+                    state = mergedState,
                     callbacks = callbacks,
-                    snackbarHostState = snackbarHostState
+                    snackbarHostState = snackbarHostState,
+                    requestedTab = requestedTab,
+                    onConsumeRequestedTab = { requestedTab = null },
+                    onCurrentTabChanged = { currentActiveTab = it }
                 )
             }
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleOpenTabIntent(intent)
+    }
+
+    private fun handleOpenTabIntent(intent: Intent?) {
+        val tabName = intent?.getStringExtra(EXTRA_OPEN_TAB) ?: return
+        val match = MainTab.entries.firstOrNull { it.name == tabName } ?: return
+        requestedTab = match
+        intent.removeExtra(EXTRA_OPEN_TAB)
+    }
+
     override fun onResume() {
         super.onResume()
-        refreshLocalPermissionsAndSettings()
-        reloadPresetsState()
+        isResumedInForeground = true
         ShizukuController.evaluateShizukuState()
+        LocalRpcServer.syncWithSettings(this)
+        syncFromStorageAndSystem()
+    }
+
+    override fun onPause() {
+        isResumedInForeground = false
+        super.onPause()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        ShizukuController.updateDisplayMetrics()
+        syncFromStorageAndSystem()
     }
 
     override fun onDestroy() {
@@ -171,27 +250,13 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    private fun loadSettingsIntoState() {
-        val s = ClickConfigStore.loadSettings(this)
-        intervalMs = s.defaultIntervalMs
-        pressDurationMs = s.defaultPressDurationMs
-        microJitter = s.defaultMicroJitter
-        autoLockOnStart = s.autoLockOnStart
-        autoCollapseBar = s.autoCollapseBar
-        selfCheckPassed = s.selfCheckPassed
-    }
-
-    private fun reloadPresetsState() {
+    private fun syncFromStorageAndSystem() {
+        val settings = ClickConfigStore.loadSettings(this)
+        val presets = ClickConfigStore.loadPresets(this)
+        val activeId = ClickConfigStore.getActivePresetId(this)
         val metrics = ShizukuController.getDisplayScreenMetrics(this)
-        screenWidthPx = metrics.widthPx.coerceAtLeast(1)
-        screenHeightPx = metrics.heightPx.coerceAtLeast(1)
-        presets = ClickConfigStore.loadPresets(this)
-        activePresetId = ClickConfigStore.getActivePresetId(this)
-    }
-
-    private fun refreshPermissionStates() {
-        overlayPermGranted = Settings.canDrawOverlays(this)
-        notifPermGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val overlayGranted = Settings.canDrawOverlays(this)
+        val notifGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.POST_NOTIFICATIONS
@@ -199,21 +264,721 @@ class MainActivity : AppCompatActivity() {
         } else {
             true
         }
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val batteryOptIgnored = pm?.isIgnoringBatteryOptimizations(packageName) ?: true
+
+        presets.forEach { preset ->
+            preset.targets.forEach { t -> t.remapToScreen(metrics.widthPx, metrics.heightPx) }
+        }
+
+        uiModel = uiModel.copy(
+            overlayPermGranted = overlayGranted,
+            notifPermGranted = notifGranted,
+            batteryOptIgnored = batteryOptIgnored,
+            selfCheckPassed = settings.selfCheckPassed,
+            tuningTier = settings.tuningTier,
+            intervalMs = settings.defaultIntervalMs,
+            pressDurationMs = settings.defaultPressDurationMs,
+            microJitter = settings.defaultMicroJitter,
+            jitterRadiusPx = settings.jitterRadiusPx,
+            lockedAnchorAlpha = settings.lockedAnchorAlpha,
+            autoLockOnStart = settings.autoLockOnStart,
+            autoCollapseBar = settings.autoCollapseBar,
+            showMacroTrajectories = settings.showMacroTrajectories,
+            presets = presets,
+            activePresetId = activeId,
+            screenWidthPx = metrics.widthPx,
+            screenHeightPx = metrics.heightPx,
+            themeMode = settings.themeMode,
+            dynamicColor = settings.dynamicColor,
+            launcherIconMode = settings.launcherIconMode,
+            volumeKeyToggleEnabled = settings.volumeKeyToggleEnabled,
+            proModeEnabled = settings.proModeEnabled,
+            preferredBackend = settings.preferredBackend,
+            rpcBridgeEnabled = settings.rpcBridgeEnabled,
+            rpcToken = settings.rpcToken,
+            rpcServerRunning = LocalRpcServer.isRunning()
+        )
     }
 
-    private fun refreshLocalPermissionsAndSettings() {
-        refreshPermissionStates()
-        selfCheckPassed = ClickConfigStore.loadSettings(this).selfCheckPassed
+    private fun saveCurrentSettings(
+        mutate: (ClickGlobalSettings) -> ClickGlobalSettings,
+        notifyOverlay: Boolean = true,
+        syncRpc: Boolean = false,
+        syncTapPresets: Boolean = false
+    ) {
+        val next = mutate(ClickConfigStore.loadSettings(this))
+        ClickConfigStore.saveSettings(this, next)
+        if (syncTapPresets) {
+            ClickConfigStore.applyGlobalTapSettingsToAllPresets(this, next)
+        }
+        if (syncRpc) {
+            LocalRpcServer.syncWithSettings(this)
+        }
+        syncFromStorageAndSystem()
+        if (notifyOverlay) {
+            notifyOverlayRefresh()
+        }
     }
 
-    private fun showSnackbar(message: String) {
-        lifecycleScope.launch {
-            snackbarHostState.currentSnackbarData?.dismiss()
+    private fun notifyOverlayRefresh() {
+        OverlayStateHub.bumpConfigVersion()
+        if (OverlayStateHub.overlayVisible.value) {
+            startService(
+                Intent(this, OverlayService::class.java).apply {
+                    action = OverlayService.ACTION_REFRESH_SETTINGS
+                }
+            )
+        }
+    }
+
+    private fun showMessage(scope: kotlinx.coroutines.CoroutineScope, message: String) {
+        if (!::snackbarHostState.isInitialized) return
+        scope.launch {
             snackbarHostState.showSnackbar(message)
         }
     }
 
-    private fun requestOverlayPermission() {
+    private fun copyToClipboard(scope: kotlinx.coroutines.CoroutineScope, label: String, text: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        cm?.setPrimaryClip(ClipData.newPlainText(label, text))
+        showMessage(scope, "已复制 $label")
+    }
+
+    private fun buildCallbacks(scope: kotlinx.coroutines.CoroutineScope): MainScreenCallbacks {
+        return MainScreenCallbacks(
+            onToggleOverlay = {
+                if (!Settings.canDrawOverlays(this)) {
+                    openOverlayPermissionSettings()
+                } else if (OverlayStateHub.overlayVisible.value) {
+                    startService(
+                        Intent(this, OverlayService::class.java).apply {
+                            action = OverlayService.ACTION_STOP_OVERLAY
+                        }
+                    )
+                } else {
+                    ContextCompat.startForegroundService(
+                        this,
+                        Intent(this, OverlayService::class.java).apply {
+                            action = OverlayService.ACTION_START_OVERLAY
+                        }
+                    )
+                }
+            },
+            onGrantOverlay = { openOverlayPermissionSettings() },
+            onGrantShizuku = {
+                ShizukuController.requestPermission()
+                if (ShizukuController.connectionState.value == ShizukuConnectionState.SHIZUKU_NOT_RUNNING) {
+                    showMessage(scope, "未检测到 Shizuku 后台服务，请先打开 Shizuku 并启动")
+                }
+            },
+            onGrantNotif = {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+            },
+            onGrantBatteryOpt = { openBatteryOptimizationSettings(scope) },
+            onStartSelfCheck = {
+                selfCheckTimer?.cancel()
+                scope.launch {
+                    val rc = withContext(Dispatchers.IO) {
+                        ShizukuController.startSelfCheckGrab(SELF_CHECK_TIMEOUT_MS.toInt())
+                    }
+                    if (rc < 0) {
+                        uiModel = uiModel.copy(selfCheckRemainingMs = 0L)
+                        showMessage(scope, "启动 5 秒校准失败（code=$rc），请检查 Shizuku 与设备节点")
+                    } else {
+                        uiModel = uiModel.copy(selfCheckRemainingMs = SELF_CHECK_TIMEOUT_MS)
+                        selfCheckTimer = object : CountDownTimer(SELF_CHECK_TIMEOUT_MS, 500L) {
+                            override fun onTick(millisUntilFinished: Long) {
+                                uiModel = uiModel.copy(selfCheckRemainingMs = millisUntilFinished)
+                            }
+
+                            override fun onFinish() {
+                                uiModel = uiModel.copy(selfCheckRemainingMs = 0L)
+                                scope.launch(Dispatchers.IO) {
+                                    ShizukuController.cancelSelfCheckAndUngrab()
+                                }
+                                syncFromStorageAndSystem()
+                                showMessage(scope, "校准倒计时结束，已自动安全回滚")
+                            }
+                        }.start()
+                    }
+                }
+            },
+            onConfirmSelfCheck = {
+                selfCheckTimer?.cancel()
+                selfCheckTimer = null
+                uiModel = uiModel.copy(selfCheckRemainingMs = 0L)
+                scope.launch {
+                    val ok = withContext(Dispatchers.IO) {
+                        ShizukuController.confirmSelfCheck()
+                    }
+                    syncFromStorageAndSystem()
+                    showMessage(
+                        scope,
+                        if (ok) "触控校准通过，零断触就绪" else "校准确认失败，请重试"
+                    )
+                }
+            },
+            onRollbackSelfCheck = {
+                selfCheckTimer?.cancel()
+                selfCheckTimer = null
+                uiModel = uiModel.copy(selfCheckRemainingMs = 0L)
+                scope.launch(Dispatchers.IO) {
+                    ShizukuController.cancelSelfCheckAndUngrab()
+                }
+                syncFromStorageAndSystem()
+                showMessage(scope, "已撤销硬件独占")
+            },
+            onReleaseNative = {
+                selfCheckTimer?.cancel()
+                selfCheckTimer = null
+                uiModel = uiModel.copy(selfCheckRemainingMs = 0L)
+                scope.launch(Dispatchers.IO) {
+                    ShizukuController.shutdownEngine()
+                }
+                showMessage(scope, "已释放底层硬件独占与槽位")
+            },
+            onCleanupOrphans = {
+                scope.launch {
+                    val count = withContext(Dispatchers.IO) {
+                        ShizukuController.cleanupOrphanProcesses()
+                    }
+                    showMessage(scope, "已清理 $count 个异常残留进程")
+                }
+            },
+            onRefreshCapabilities = {
+                ShizukuController.evaluateShizukuState()
+                ShizukuController.refreshCapabilitiesAsync()
+                showMessage(scope, "正在重新探测硬件与权限")
+            },
+            onSelectTuningTier = { tier ->
+                saveCurrentSettings(
+                    mutate = { cur ->
+                        when (tier) {
+                            ClickGlobalSettings.TIER_CASUAL -> cur.copy(
+                                tuningTier = ClickGlobalSettings.TIER_CASUAL,
+                                defaultIntervalMs = ClickGlobalSettings.CASUAL_INTERVAL_MS,
+                                defaultPressDurationMs = ClickGlobalSettings.CASUAL_PRESS_MS
+                            )
+                            ClickGlobalSettings.TIER_STANDARD -> cur.copy(
+                                tuningTier = ClickGlobalSettings.TIER_STANDARD,
+                                defaultIntervalMs = ClickGlobalSettings.STANDARD_INTERVAL_MS,
+                                defaultPressDurationMs = ClickGlobalSettings.STANDARD_PRESS_MS
+                            )
+                            ClickGlobalSettings.TIER_FAST -> cur.copy(
+                                tuningTier = ClickGlobalSettings.TIER_FAST,
+                                defaultIntervalMs = ClickGlobalSettings.FAST_INTERVAL_MS,
+                                defaultPressDurationMs = ClickGlobalSettings.FAST_PRESS_MS
+                            )
+                            else -> cur.copy(
+                                tuningTier = ClickGlobalSettings.TIER_CUSTOM,
+                                defaultIntervalMs = cur.customIntervalMs,
+                                defaultPressDurationMs = cur.customPressDurationMs
+                            )
+                        }
+                    },
+                    syncTapPresets = true
+                )
+            },
+            onResetTuningDefaults = {
+                saveCurrentSettings(
+                    mutate = {
+                        it.copy(
+                            tuningTier = ClickGlobalSettings.TIER_STANDARD,
+                            defaultIntervalMs = ClickGlobalSettings.STANDARD_INTERVAL_MS,
+                            defaultPressDurationMs = ClickGlobalSettings.STANDARD_PRESS_MS,
+                            customIntervalMs = ClickTarget.DEFAULT_INTERVAL_MS,
+                            customPressDurationMs = ClickTarget.DEFAULT_PRESS_DURATION_MS,
+                            defaultMicroJitter = true,
+                            jitterRadiusPx = 4.0f,
+                            lockedAnchorAlpha = ClickGlobalSettings.DEFAULT_LOCKED_ALPHA,
+                            autoLockOnStart = true,
+                            autoCollapseBar = false,
+                            showMacroTrajectories = true
+                        )
+                    },
+                    syncTapPresets = true
+                )
+                showMessage(scope, "已恢复默认参数")
+            },
+            onIntervalChange = { value, commit ->
+                val clamped = value.coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS)
+                uiModel = uiModel.copy(
+                    tuningTier = ClickGlobalSettings.TIER_CUSTOM,
+                    intervalMs = clamped
+                )
+                if (commit) {
+                    saveCurrentSettings(
+                        mutate = {
+                            it.copy(
+                                tuningTier = ClickGlobalSettings.TIER_CUSTOM,
+                                defaultIntervalMs = clamped,
+                                customIntervalMs = clamped
+                            )
+                        },
+                        syncTapPresets = true
+                    )
+                }
+            },
+            onPressChange = { value, commit ->
+                val clamped = value.coerceIn(ClickTarget.MIN_PRESS_MS, ClickTarget.MAX_PRESS_MS)
+                uiModel = uiModel.copy(
+                    tuningTier = ClickGlobalSettings.TIER_CUSTOM,
+                    pressDurationMs = clamped
+                )
+                if (commit) {
+                    saveCurrentSettings(
+                        mutate = {
+                            it.copy(
+                                tuningTier = ClickGlobalSettings.TIER_CUSTOM,
+                                defaultPressDurationMs = clamped,
+                                customPressDurationMs = clamped
+                            )
+                        },
+                        syncTapPresets = true
+                    )
+                }
+            },
+            onMicroJitterChange = { enabled ->
+                saveCurrentSettings({ it.copy(defaultMicroJitter = enabled) })
+            },
+            onJitterRadiusChange = { radius, commit ->
+                val clamped = radius.coerceIn(0f, 16f)
+                uiModel = uiModel.copy(jitterRadiusPx = clamped)
+                if (commit) {
+                    saveCurrentSettings({ it.copy(jitterRadiusPx = clamped) })
+                }
+            },
+            onLockedAlphaChange = { alpha, commit ->
+                val clamped = alpha.coerceIn(
+                    ClickGlobalSettings.MIN_LOCKED_ALPHA,
+                    ClickGlobalSettings.MAX_LOCKED_ALPHA
+                )
+                uiModel = uiModel.copy(lockedAnchorAlpha = clamped)
+                if (commit) {
+                    saveCurrentSettings({ it.copy(lockedAnchorAlpha = clamped) })
+                }
+            },
+            onAutoLockChange = { enabled ->
+                saveCurrentSettings({ it.copy(autoLockOnStart = enabled) })
+            },
+            onAutoCollapseChange = { enabled ->
+                saveCurrentSettings({ it.copy(autoCollapseBar = enabled) })
+            },
+            onShowMacroTrajectoriesChange = { enabled ->
+                saveCurrentSettings({ it.copy(showMacroTrajectories = enabled) }, notifyOverlay = true)
+            },
+            onApplyDefaultsToGlobal = {
+                val settings = ClickConfigStore.loadSettings(this)
+                ClickConfigStore.applyGlobalTapSettingsToAllPresets(this, settings)
+                notifyOverlayRefresh()
+                syncFromStorageAndSystem()
+                showMessage(scope, "已将连点设置应用到全部方案")
+            },
+            onSelectPreset = { presetId ->
+                ClickConfigStore.setActivePresetId(this, presetId)
+                notifyOverlayRefresh()
+                syncFromStorageAndSystem()
+            },
+            onCyclePreset = { delta ->
+                val presets = ClickConfigStore.loadPresets(this).filter { !it.isFrozen }
+                if (presets.size > 1) {
+                    val activeId = ClickConfigStore.getActivePresetId(this)
+                    val idx = presets.indexOfFirst { it.id == activeId }.coerceAtLeast(0)
+                    val nextIdx = Math.floorMod(idx + delta, presets.size)
+                    ClickConfigStore.setActivePresetId(this, presets[nextIdx].id)
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                }
+            },
+            onCreatePreset = { name, copyCurrent ->
+                val active = ClickConfigStore.getActivePreset(this)
+                val baseTargets = if (copyCurrent) active.targets else emptyList()
+                val mode = if (copyCurrent) active.executionMode else ExecutionMode.CONCURRENT
+                ClickConfigStore.createPreset(
+                    context = this,
+                    name = name,
+                    initialTargets = baseTargets,
+                    executionMode = mode,
+                    presetLoopCount = if (copyCurrent) active.presetLoopCount else 0,
+                    isRawMacro = copyCurrent && active.isRawMacro,
+                    rawMacroJson = if (copyCurrent && active.isRawMacro) active.rawMacroJson else "",
+                    activate = true
+                )
+                notifyOverlayRefresh()
+                syncFromStorageAndSystem()
+            },
+            onStartMacroRecording = {
+                if (!Settings.canDrawOverlays(this)) {
+                    openOverlayPermissionSettings()
+                    showMessage(scope, "请先授予悬浮窗权限以启用录制控件")
+                } else if (!ShizukuController.isServiceConnected()) {
+                    ShizukuController.evaluateShizukuState()
+                    showMessage(scope, "请先在主页或设置向导中授权并连接 Shizuku")
+                } else {
+                    ContextCompat.startForegroundService(
+                        this,
+                        Intent(this, OverlayService::class.java).apply {
+                            action = OverlayService.ACTION_START_RECORDING
+                        }
+                    )
+                    showMessage(scope, "录制控件已开启，切到目标画面后点「就绪」")
+                }
+            },
+            onStartRawMacroRecording = {
+                if (!Settings.canDrawOverlays(this)) {
+                    openOverlayPermissionSettings()
+                    showMessage(scope, "请先授予悬浮窗权限以启用录宏控件")
+                } else if (!ShizukuController.isServiceConnected()) {
+                    ShizukuController.evaluateShizukuState()
+                    showMessage(scope, "请先在主页或设置向导中授权并连接 Shizuku")
+                } else {
+                    ContextCompat.startForegroundService(
+                        this,
+                        Intent(this, OverlayService::class.java).apply {
+                            action = OverlayService.ACTION_START_RAW_RECORDING
+                        }
+                    )
+                    showMessage(scope, "录宏控件已开启，切到目标画面后点「就绪」")
+                }
+            },
+            onRenamePreset = { presetId, newName ->
+                ClickConfigStore.renamePreset(this, presetId, newName)
+                notifyOverlayRefresh()
+                syncFromStorageAndSystem()
+            },
+            onDeletePreset = { presetId ->
+                if (ClickConfigStore.deletePreset(this, presetId)) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                }
+            },
+            onSetPresetExecutionMode = { presetId, mode ->
+                ClickConfigStore.setPresetExecutionMode(this, presetId, mode)
+                notifyOverlayRefresh()
+                syncFromStorageAndSystem()
+            },
+            onSetPresetLoopCount = { presetId, loopCount ->
+                ClickConfigStore.setPresetLoopCount(this, presetId, loopCount)
+                notifyOverlayRefresh()
+                syncFromStorageAndSystem()
+            },
+            onExportPresetJson = { preset ->
+                val json = ClickConfigStore.exportPresetToJson(preset)
+                copyToClipboard(scope, "方案「${preset.name}」JSON", json)
+            },
+            onImportPresetJson = { rawJson ->
+                val metrics = ShizukuController.getDisplayScreenMetrics(this)
+                val imported = ClickConfigStore.importPresetFromJson(
+                    this,
+                    rawJson,
+                    metrics.widthPx,
+                    metrics.heightPx
+                )
+                if (imported != null) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "成功导入方案「${imported.name}」")
+                } else {
+                    showMessage(scope, "JSON 解析失败，请检查内容格式")
+                }
+            },
+            onImportPresetScript = { rawScript ->
+                val metrics = ShizukuController.getDisplayScreenMetrics(this)
+                val imported = ClickConfigStore.importPresetFromScript(
+                    this,
+                    rawScript,
+                    metrics.widthPx,
+                    metrics.heightPx
+                )
+                if (imported != null) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "已通过脚本创建方案「${imported.name}」")
+                } else {
+                    showMessage(scope, "脚本语法或 JSON 格式无效，请检查后重试")
+                }
+            },
+            onExportAllPresetsJson = {
+                val presets = ClickConfigStore.loadPresets(this)
+                val activeId = ClickConfigStore.getActivePresetId(this)
+                val json = ClickConfigStore.exportPresetsBundleToJson(presets, activeId)
+                copyToClipboard(scope, "全部 ${presets.size} 个方案 JSON", json)
+            },
+            onBatchImportPresetsJson = { rawJson ->
+                val metrics = ShizukuController.getDisplayScreenMetrics(this)
+                val imported = ClickConfigStore.importPresetsBatchFromJson(
+                    this,
+                    rawJson,
+                    metrics.widthPx,
+                    metrics.heightPx
+                )
+                if (imported.isNotEmpty()) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "成功批量导入 ${imported.size} 个方案")
+                } else {
+                    showMessage(scope, "批量 JSON 解析失败，请检查内容格式")
+                }
+            },
+            onBatchDeletePresets = { presetIds ->
+                val deleted = ClickConfigStore.deletePresetsBatch(this, presetIds)
+                if (deleted > 0) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "已删除选中的 $deleted 个方案")
+                } else {
+                    showMessage(scope, "至少需要保留 1 个方案")
+                }
+            },
+            onApplyPresetFreezeStates = { frozenIds ->
+                val changed = ClickConfigStore.applyPresetFreezeStates(this, frozenIds)
+                if (changed > 0) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "已更新方案冻结状态（共冻结 ${frozenIds.size} 个，悬浮窗切换时跳过）")
+                }
+            },
+            onBatchCreateEmptyPresets = { count, mode ->
+                val created = ClickConfigStore.createEmptyPresetsBatch(this, count, mode)
+                if (created.isNotEmpty()) {
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                    showMessage(scope, "已批量添加 ${created.size} 个空方案")
+                }
+            },
+            onSavePresetTarget = { targetId, x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs ->
+                val metrics = ShizukuController.getDisplayScreenMetrics(this)
+                val settings = ClickConfigStore.loadSettings(this)
+                val current = ClickConfigStore.loadTargetsForScreen(this, metrics.widthPx, metrics.heightPx)
+                val nextId = (current.maxOfOrNull { it.id } ?: 0) + 1
+                val resolvedInterval = if (actionType == ActionType.TAP) settings.defaultIntervalMs else intervalMs
+                val resolvedPress = if (actionType == ActionType.TAP) settings.defaultPressDurationMs else pressMs
+                val safeRepeat = repeatCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT)
+                val safeSubDur = subDurationMs.coerceIn(ClickTarget.MIN_SUB_DURATION_MS, ClickTarget.MAX_SUB_DURATION_MS)
+                if (targetId == null) {
+                    val t = ClickTarget(
+                        id = nextId,
+                        index = current.size + 1,
+                        x = x,
+                        y = y,
+                        intervalMs = resolvedInterval,
+                        pressDurationMs = resolvedPress,
+                        microJitter = jitter,
+                        enabled = enabled,
+                        actionType = actionType,
+                        endX = endX,
+                        endY = endY,
+                        swipeDurationMs = swipeDur,
+                        repeatCount = safeRepeat,
+                        refPresetId = refPresetId,
+                        subDurationMs = safeSubDur
+                    ).apply {
+                        if (actionType != ActionType.SUB_PRESET) {
+                            setStartPixel(x, y, metrics.widthPx, metrics.heightPx)
+                            setEndPixel(endX, endY, metrics.widthPx, metrics.heightPx)
+                        }
+                    }
+                    current += t
+                } else {
+                    val idx = current.indexOfFirst { it.id == targetId }
+                    if (idx >= 0) {
+                        val updated = current[idx].copy(
+                            intervalMs = resolvedInterval,
+                            pressDurationMs = resolvedPress,
+                            microJitter = jitter,
+                            enabled = enabled,
+                            actionType = actionType,
+                            swipeDurationMs = swipeDur,
+                            repeatCount = safeRepeat,
+                            refPresetId = refPresetId,
+                            subDurationMs = safeSubDur
+                        ).apply {
+                            if (actionType != ActionType.SUB_PRESET) {
+                                setStartPixel(x, y, metrics.widthPx, metrics.heightPx)
+                                setEndPixel(endX, endY, metrics.widthPx, metrics.heightPx)
+                            }
+                        }
+                        current[idx] = updated
+                    }
+                }
+                ClickConfigStore.saveTargets(this, current)
+                notifyOverlayRefresh()
+                syncFromStorageAndSystem()
+            },
+            onTogglePresetTargetEnabled = { targetId, enabled ->
+                val metrics = ShizukuController.getDisplayScreenMetrics(this)
+                val current = ClickConfigStore.loadTargetsForScreen(this, metrics.widthPx, metrics.heightPx)
+                val idx = current.indexOfFirst { it.id == targetId }
+                if (idx >= 0) {
+                    current[idx] = current[idx].copy(enabled = enabled)
+                    ClickConfigStore.saveTargets(this, current)
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                }
+            },
+            onDeletePresetTarget = { targetId ->
+                val metrics = ShizukuController.getDisplayScreenMetrics(this)
+                val current = ClickConfigStore.loadTargetsForScreen(this, metrics.widthPx, metrics.heightPx)
+                if (current.removeAll { it.id == targetId }) {
+                    ClickConfigStore.saveTargets(this, current)
+                    notifyOverlayRefresh()
+                    syncFromStorageAndSystem()
+                }
+            },
+            onThemeModeChange = { mode ->
+                saveCurrentSettings({ it.copy(themeMode = mode) }, notifyOverlay = true)
+            },
+            onDynamicColorChange = { enabled ->
+                saveCurrentSettings({ it.copy(dynamicColor = enabled) }, notifyOverlay = true)
+            },
+            onLauncherIconModeChange = { mode ->
+                switchLauncherIcon(scope, mode)
+            },
+            onVolumeKeyToggleChange = { enabled ->
+                saveCurrentSettings({ it.copy(volumeKeyToggleEnabled = enabled) }, notifyOverlay = false)
+                scope.launch(Dispatchers.IO) {
+                    ShizukuController.setVolumeKeyControlEnabled(enabled)
+                }
+            },
+            onRequestAddQuickTile = {
+                requestAddQuickSettingsTile(scope)
+            },
+            onProModeChange = { enabled ->
+                saveCurrentSettings(
+                    mutate = {
+                        if (enabled) it.copy(proModeEnabled = true)
+                        else it.copy(proModeEnabled = false, rpcBridgeEnabled = false)
+                    },
+                    notifyOverlay = false,
+                    syncRpc = true
+                )
+                if (enabled) {
+                    showMessage(scope, "已开启专业模式")
+                }
+            },
+            onPreferredBackendChange = { backend ->
+                saveCurrentSettings({ it.copy(preferredBackend = backend) }, notifyOverlay = false)
+                scope.launch(Dispatchers.IO) {
+                    ShizukuController.setPreferredBackend(backend, reinitIfActive = false)
+                }
+                showMessage(scope, "下次启停将优先使用选定注入后端")
+            },
+            onRpcBridgeEnabledChange = { enabled ->
+                saveCurrentSettings(
+                    mutate = { it.copy(rpcBridgeEnabled = enabled) },
+                    notifyOverlay = false,
+                    syncRpc = true
+                )
+                showMessage(
+                    scope,
+                    if (enabled) "自动化 RPC 接口桥已开启 (127.0.0.1:${LocalRpcServer.RPC_PORT})"
+                    else "自动化 RPC 接口桥已关闭"
+                )
+            },
+            onResetRpcToken = {
+                val nextToken = ClickConfigStore.generateRpcToken()
+                saveCurrentSettings(
+                    mutate = { it.copy(rpcToken = nextToken) },
+                    notifyOverlay = false,
+                    syncRpc = true
+                )
+                showMessage(scope, "已重置 Access Token")
+            },
+            onCopyText = { label, text ->
+                copyToClipboard(scope, label, text)
+            }
+        )
+    }
+
+    private fun resolveActiveAliasFromPackageManager(): Int {
+        return try {
+            val candidates = listOf(
+                "$packageName.LauncherLightAlias" to ClickGlobalSettings.LAUNCHER_LIGHT,
+                "$packageName.LauncherDarkAlias" to ClickGlobalSettings.LAUNCHER_DARK,
+                "$packageName.LauncherSystemAlias" to ClickGlobalSettings.LAUNCHER_SYSTEM
+            )
+            for ((cls, mode) in candidates) {
+                val st = packageManager.getComponentEnabledSetting(ComponentName(this, cls))
+                if (st == PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
+                    return mode
+                }
+            }
+            ClickGlobalSettings.LAUNCHER_SYSTEM
+        } catch (_: Throwable) {
+            ClickGlobalSettings.LAUNCHER_SYSTEM
+        }
+    }
+
+    private fun reconcileLauncherIconMode() {
+        val currentSettings = ClickConfigStore.loadSettings(this)
+        val resolvedMode = if (ClickConfigStore.hasLauncherIconModePref(this)) {
+            currentSettings.launcherIconMode
+        } else {
+            val detected = resolveActiveAliasFromPackageManager()
+            ClickConfigStore.saveSettings(
+                this,
+                currentSettings.copy(launcherIconMode = detected)
+            )
+            detected
+        }
+        applyLauncherIconComponents(resolvedMode)
+    }
+
+    private fun applyLauncherIconComponents(mode: Int) {
+        val entries = listOf(
+            ClickGlobalSettings.LAUNCHER_SYSTEM to ComponentName(this, "$packageName.LauncherSystemAlias"),
+            ClickGlobalSettings.LAUNCHER_DARK to ComponentName(this, "$packageName.LauncherDarkAlias"),
+            ClickGlobalSettings.LAUNCHER_LIGHT to ComponentName(this, "$packageName.LauncherLightAlias")
+        )
+        val safeMode = mode.coerceIn(
+            ClickGlobalSettings.LAUNCHER_SYSTEM,
+            ClickGlobalSettings.LAUNCHER_LIGHT
+        )
+        for ((entryMode, component) in entries) {
+            val desiredState = if (entryMode == safeMode) {
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+            } else {
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+            }
+            if (packageManager.getComponentEnabledSetting(component) != desiredState) {
+                packageManager.setComponentEnabledSetting(
+                    component,
+                    desiredState,
+                    PackageManager.DONT_KILL_APP
+                )
+            }
+        }
+    }
+
+    private fun switchLauncherIcon(
+        scope: kotlinx.coroutines.CoroutineScope,
+        mode: Int
+    ) {
+        val safeMode = mode.coerceIn(
+            ClickGlobalSettings.LAUNCHER_SYSTEM,
+            ClickGlobalSettings.LAUNCHER_LIGHT
+        )
+        try {
+            applyLauncherIconComponents(safeMode)
+            saveCurrentSettings(
+                mutate = { it.copy(launcherIconMode = safeMode) },
+                notifyOverlay = false
+            )
+            val modeLabel = when (safeMode) {
+                ClickGlobalSettings.LAUNCHER_DARK -> "深色"
+                ClickGlobalSettings.LAUNCHER_LIGHT -> "浅色"
+                else -> "跟随系统"
+            }
+            showMessage(scope, "桌面图标已设为「$modeLabel」，返回桌面后生效")
+        } catch (t: Throwable) {
+            showMessage(scope, "切换图标失败: ${t.message ?: "未知错误"}")
+        }
+    }
+
+    private fun openOverlayPermissionSettings() {
         val intent = Intent(
             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
             Uri.parse("package:$packageName")
@@ -221,269 +986,58 @@ class MainActivity : AppCompatActivity() {
         overlayPermLauncher.launch(intent)
     }
 
-    private fun handleShizukuAction() {
-        when (ShizukuController.connectionState.value) {
-            ShizukuConnectionState.SHIZUKU_NOT_RUNNING -> {
-                ShizukuController.evaluateShizukuState()
-                if (ShizukuController.connectionState.value == ShizukuConnectionState.SHIZUKU_NOT_RUNNING) {
-                    val shizukuLaunch = packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
-                    if (shizukuLaunch != null) {
-                        startActivity(shizukuLaunch)
-                    } else {
-                        showSnackbar("未检测到 Shizuku App，请先安装并激活 Shizuku")
-                    }
-                }
-            }
-            ShizukuConnectionState.NO_PERMISSION -> ShizukuController.requestPermission()
-            else -> {
-                ShizukuController.evaluateShizukuState()
-                showSnackbar("已刷新 Shizuku 硬件能力探测")
+    @SuppressLint("BatteryLife")
+    private fun openBatteryOptimizationSettings(scope: kotlinx.coroutines.CoroutineScope) {
+        try {
+            val intent = Intent(
+                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:$packageName")
+            )
+            batteryOptLauncher.launch(intent)
+        } catch (_: Throwable) {
+            try {
+                batteryOptLauncher.launch(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: Throwable) {
+                showMessage(scope, "请在系统应用信息中将本应用设为「无限制」省电策略")
             }
         }
     }
 
-    private fun requestNotificationPermission() {
+    @SuppressLint("WrongConstant")
+    private fun requestAddQuickSettingsTile(scope: kotlinx.coroutines.CoroutineScope) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
-    }
-
-    private fun toggleOverlayService() {
-        if (OverlayStateHub.overlayVisible.value) {
-            startService(Intent(this, OverlayService::class.java).apply {
-                action = OverlayService.ACTION_STOP_OVERLAY
-            })
-            return
-        }
-        if (!Settings.canDrawOverlays(this)) {
-            showSnackbar("请先开启「悬浮窗显示权限」")
-            return
-        }
-        if (!ShizukuController.isServiceConnected()) {
-            ShizukuController.evaluateShizukuState()
-            showSnackbar("请先启动并授权 Shizuku 服务")
-            return
-        }
-        val intent = Intent(this, OverlayService::class.java).apply {
-            action = OverlayService.ACTION_START_OVERLAY
-        }
-        ContextCompat.startForegroundService(this, intent)
-    }
-
-    private fun persistGlobalSettingsAuto(notifyOverlay: Boolean) {
-        val clampedInterval = intervalMs.coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS)
-        val clampedPress = pressDurationMs.coerceIn(ClickTarget.MIN_PRESS_MS, ClickTarget.MAX_PRESS_MS)
-        val old = ClickConfigStore.loadSettings(this)
-        ClickConfigStore.saveSettings(
-            this,
-            ClickGlobalSettings(
-                defaultIntervalMs = clampedInterval,
-                defaultPressDurationMs = clampedPress,
-                defaultMicroJitter = microJitter,
-                jitterRadiusPx = old.jitterRadiusPx,
-                selfCheckPassed = old.selfCheckPassed,
-                autoLockOnStart = autoLockOnStart,
-                autoCollapseBar = autoCollapseBar
-            )
-        )
-        if (notifyOverlay) {
-            notifyOverlayRefreshSettings()
-        }
-    }
-
-    private fun applyDefaultsToCurrentPresetTargets() {
-        val targets = ClickConfigStore.loadTargets(this)
-        if (targets.isEmpty()) {
-            showSnackbar("当前方案暂无连点位，请先添加点位")
-            return
-        }
-        for (t in targets) {
-            t.intervalMs = intervalMs
-            t.pressDurationMs = pressDurationMs
-            t.microJitter = microJitter
-        }
-        ClickConfigStore.saveTargets(this, targets)
-        reloadPresetsState()
-        notifyOverlayRefreshSettings()
-        showSnackbar("已自动应用至当前方案的 ${targets.size} 个点位")
-    }
-
-    private fun selectPreset(presetId: String) {
-        val preset = ClickConfigStore.setActivePresetId(this, presetId)
-        reloadPresetsState()
-        notifyOverlayRefreshSettings()
-        showSnackbar("已切换至「${preset.name}」")
-    }
-
-    private fun createPreset(name: String, copyCurrent: Boolean) {
-        val initialTargets = if (copyCurrent) ClickConfigStore.loadTargets(this) else emptyList()
-        val created = ClickConfigStore.createPreset(this, name, initialTargets, activate = true)
-        reloadPresetsState()
-        notifyOverlayRefreshSettings()
-        showSnackbar("已新建并启用「${created.name}」")
-    }
-
-    private fun renamePreset(presetId: String, newName: String) {
-        if (ClickConfigStore.renamePreset(this, presetId, newName)) {
-            reloadPresetsState()
-            notifyOverlayRefreshSettings()
-        }
-    }
-
-    private fun deletePreset(presetId: String) {
-        if (ClickConfigStore.deletePreset(this, presetId)) {
-            reloadPresetsState()
-            notifyOverlayRefreshSettings()
-            showSnackbar("已删除方案")
+            val sbm = getSystemService(StatusBarManager::class.java)
+            if (sbm == null) {
+                showMessage(scope, "当前系统不支持自动添加磁贴，请在下拉栏手动编辑添加")
+                return
+            }
+            try {
+                sbm.requestAddTileService(
+                    ComponentName(this, QuickTileService::class.java),
+                    getString(R.string.tile_label),
+                    Icon.createWithResource(this, R.drawable.ic_tile),
+                    mainExecutor
+                ) { resultCode ->
+                    val msg = when (resultCode) {
+                        StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ADDED -> "已添加到下拉快捷设置磁贴"
+                        StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ALREADY_ADDED -> "磁贴已在状态栏中"
+                        else -> "已取消添加（或可在下拉栏手工添加）"
+                    }
+                    showMessage(scope, msg)
+                }
+            } catch (_: Throwable) {
+                showMessage(scope, "请在系统下拉通知栏点击编辑，添加「零断触悬浮窗」磁贴")
+            }
         } else {
-            showSnackbar("至少保留 1 个预设方案")
+            showMessage(scope, "请下拉系统状态栏点击编辑，添加「零断触悬浮窗」快捷磁贴")
         }
-    }
-
-    private fun upsertPresetTarget(
-        existingTargetId: Int?,
-        x: Float,
-        y: Float,
-        targetIntervalMs: Long,
-        targetPressMs: Long,
-        targetJitter: Boolean,
-        targetEnabled: Boolean
-    ) {
-        val clampedX = x.coerceIn(0f, (screenWidthPx - 1).coerceAtLeast(1).toFloat())
-        val clampedY = y.coerceIn(0f, (screenHeightPx - 1).coerceAtLeast(1).toFloat())
-        val clampedInterval = targetIntervalMs.coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS)
-        val clampedPress = targetPressMs.coerceIn(ClickTarget.MIN_PRESS_MS, ClickTarget.MAX_PRESS_MS)
-
-        val list = ClickConfigStore.loadTargets(this)
-        val idx = existingTargetId?.let { id -> list.indexOfFirst { it.id == id } } ?: -1
-        if (idx >= 0) {
-            val t = list[idx]
-            t.x = clampedX
-            t.y = clampedY
-            t.intervalMs = clampedInterval
-            t.pressDurationMs = clampedPress
-            t.microJitter = targetJitter
-            t.enabled = targetEnabled
-        } else {
-            val nextId = (list.maxOfOrNull { it.id } ?: 0) + 1
-            list += ClickTarget(
-                id = nextId,
-                index = list.size + 1,
-                x = clampedX,
-                y = clampedY,
-                intervalMs = clampedInterval,
-                pressDurationMs = clampedPress,
-                microJitter = targetJitter,
-                enabled = targetEnabled
-            )
-        }
-        ClickConfigStore.saveTargets(this, list)
-        reloadPresetsState()
-        notifyOverlayRefreshSettings()
-    }
-
-    private fun togglePresetTargetEnabled(targetId: Int, enabled: Boolean) {
-        val list = ClickConfigStore.loadTargets(this)
-        val target = list.firstOrNull { it.id == targetId } ?: return
-        target.enabled = enabled
-        ClickConfigStore.saveTargets(this, list)
-        reloadPresetsState()
-        notifyOverlayRefreshSettings()
-    }
-
-    private fun deletePresetTarget(targetId: Int) {
-        val list = ClickConfigStore.loadTargets(this)
-        if (list.removeAll { it.id == targetId }) {
-            ClickConfigStore.saveTargets(this, list)
-            reloadPresetsState()
-            notifyOverlayRefreshSettings()
-        }
-    }
-
-    private fun notifyOverlayRefreshSettings() {
-        if (OverlayStateHub.overlayVisible.value) {
-            startService(Intent(this, OverlayService::class.java).apply {
-                action = OverlayService.ACTION_REFRESH_SETTINGS
-            })
-        }
-    }
-
-    private fun releaseNativeGrab() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            ShizukuController.shutdownEngine()
-            ShizukuController.refreshCapabilitiesAsync()
-        }
-        showSnackbar("已释放触控独占")
-    }
-
-    private fun launchTouchSelfCheckFlow() {
-        if (!ShizukuController.isServiceConnected()) {
-            showSnackbar("请先连接 Shizuku 服务")
-            return
-        }
-
-        lifecycleScope.launch(Dispatchers.IO) {
-            val rc = ShizukuController.startSelfCheckGrab(SELF_CHECK_TIMEOUT_MS)
-            withContext(Dispatchers.Main) {
-                if (rc != 0) {
-                    showSnackbar("无法开启 EVIOCGRAB 自检 (err=$rc)，请确认设备节点权限")
-                    return@withContext
-                }
-                startSelfCheckCountdown()
-            }
-        }
-    }
-
-    private fun startSelfCheckCountdown() {
-        selfCheckTimer?.cancel()
-        selfCheckRemainingMs = SELF_CHECK_TIMEOUT_MS.toLong()
-        selfCheckTimer = object : CountDownTimer(SELF_CHECK_TIMEOUT_MS.toLong(), 100L) {
-            override fun onTick(millisUntilFinished: Long) {
-                selfCheckRemainingMs = millisUntilFinished.coerceAtLeast(1L)
-            }
-
-            override fun onFinish() {
-                selfCheckRemainingMs = 0L
-                lifecycleScope.launch(Dispatchers.IO) {
-                    ShizukuController.cancelSelfCheckAndUngrab()
-                }
-                ClickConfigStore.markSelfCheckPassed(this@MainActivity, false)
-                selfCheckPassed = false
-                showSnackbar("5 秒未确认，已自动安全回滚原厂触控")
-            }
-        }.start()
-    }
-
-    private fun confirmTouchSelfCheck() {
-        selfCheckTimer?.cancel()
-        selfCheckTimer = null
-        selfCheckRemainingMs = 0L
-        lifecycleScope.launch(Dispatchers.IO) {
-            val ok = ShizukuController.confirmSelfCheck()
-            withContext(Dispatchers.Main) {
-                selfCheckPassed = ok
-                if (ok) {
-                    showSnackbar("自检通过！零断触原生合流通道已解锁")
-                } else {
-                    showSnackbar("确认超时，内核已自动回滚至原厂触控")
-                }
-            }
-        }
-    }
-
-    private fun rollbackTouchSelfCheck() {
-        selfCheckTimer?.cancel()
-        selfCheckTimer = null
-        selfCheckRemainingMs = 0L
-        lifecycleScope.launch(Dispatchers.IO) {
-            ShizukuController.cancelSelfCheckAndUngrab()
-        }
-        ClickConfigStore.markSelfCheckPassed(this, false)
-        selfCheckPassed = false
-        showSnackbar("已手动安全回滚至原厂触控")
     }
 
     companion object {
-        private const val SELF_CHECK_TIMEOUT_MS = 5000
+        const val EXTRA_OPEN_TAB = "open_tab"
+        private const val SELF_CHECK_TIMEOUT_MS = 5000L
+
+        @Volatile
+        var isResumedInForeground: Boolean = false
     }
 }

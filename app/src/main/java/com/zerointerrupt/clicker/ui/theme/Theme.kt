@@ -5,6 +5,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
+import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
@@ -12,6 +13,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 
 private val FallbackLightColorScheme = lightColorScheme(
@@ -37,6 +39,11 @@ private val FallbackLightColorScheme = lightColorScheme(
     onSurface = Color(0xFF181C20),
     surfaceVariant = Color(0xFFDDE3EA),
     onSurfaceVariant = Color(0xFF41474D),
+    surfaceContainerLowest = Color(0xFFFFFFFF),
+    surfaceContainerLow = Color(0xFFF1F4F9),
+    surfaceContainer = Color(0xFFEBEEF3),
+    surfaceContainerHigh = Color(0xFFE5E8ED),
+    surfaceContainerHighest = Color(0xFFDFE3E8),
     outline = Color(0xFF71787E),
     outlineVariant = Color(0xFFC1C7CE)
 )
@@ -64,6 +71,11 @@ private val FallbackDarkColorScheme = darkColorScheme(
     onSurface = Color(0xFFE0E2E8),
     surfaceVariant = Color(0xFF41474D),
     onSurfaceVariant = Color(0xFFC1C7CE),
+    surfaceContainerLowest = Color(0xFF0B0F13),
+    surfaceContainerLow = Color(0xFF181C20),
+    surfaceContainer = Color(0xFF1C2024),
+    surfaceContainerHigh = Color(0xFF262A2F),
+    surfaceContainerHighest = Color(0xFF31353A),
     outline = Color(0xFF8B9198),
     outlineVariant = Color(0xFF41474D)
 )
@@ -75,6 +87,24 @@ private val ExpressiveShapes = Shapes(
     large = RoundedCornerShape(24.dp),
     extraLarge = RoundedCornerShape(28.dp)
 )
+
+private val ExpressiveTypography = Typography().run {
+    copy(
+        displaySmall = displaySmall.withTabular(),
+        headlineSmall = headlineSmall.withTabular(),
+        titleLarge = titleLarge.withTabular(),
+        titleMedium = titleMedium.withTabular(),
+        titleSmall = titleSmall.withTabular(),
+        bodyLarge = bodyLarge.withTabular(),
+        bodyMedium = bodyMedium.withTabular(),
+        bodySmall = bodySmall.withTabular(),
+        labelLarge = labelLarge.withTabular(),
+        labelMedium = labelMedium.withTabular(),
+        labelSmall = labelSmall.withTabular()
+    )
+}
+
+fun TextStyle.withTabular(): TextStyle = copy(fontFeatureSettings = "tnum")
 
 @Composable
 fun ZeroInterruptTheme(
@@ -94,6 +124,7 @@ fun ZeroInterruptTheme(
     MaterialTheme(
         colorScheme = colorScheme,
         shapes = ExpressiveShapes,
+        typography = ExpressiveTypography,
         content = content
     )
 }

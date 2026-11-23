@@ -10,8 +10,10 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.SoundEffectConstants
 import android.view.View
 import android.view.ViewConfiguration
 import android.widget.FrameLayout
@@ -30,9 +32,9 @@ import kotlin.math.roundToInt
  * 1. Compact initial state (isToolsExpanded = false):
  *    [ Top edge-dock (< / >) ] -> [ Play / Stop ] -> [ Switch Preset (1..N) ] -> [ Expand tools (v, rotated 90 deg) ]
  * 2. Tools expanded state (isToolsExpanded = true):
- *    Unfolds +, -, Lock, Tune, Close above the symmetric collapse tools chevron (^).
+ *    Unfolds +, -, Lock, Record, Close above the symmetric collapse tools chevron (^).
  * 3. Edge-docked collapsed state (isCollapsed = true):
- *    Ultra-slim 26dp x 74dp edge-docked tab with live TouchMux LED + inward chevron.
+ *    Ultra-slim 20dp x 80dp edge-docked tab with live TouchMux LED + inward chevron.
  *
  * Every touch target uses Android native Material RippleDrawable for classic ripple wave feedback.
  */
@@ -50,7 +52,7 @@ class ControlBarView(
         fun onAddTarget()
         fun onRemoveTarget()
         fun onToggleLockEdit()
-        fun onToggleTunePanel()
+        fun onStartMacroRecord()
         fun onCloseOverlay()
         fun onCollapseRequested()
         fun onExpandRequested()
@@ -63,18 +65,21 @@ class ControlBarView(
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
 
     private val expandedWidthPx = (52f * density).roundToInt()
+    private val edgeMarginPx = (12f * density).roundToInt()
+    private val morphHostWidthPx = expandedWidthPx + edgeMarginPx
     private val btnSizePx = (38f * density).roundToInt()
-    private val capHeightPx = (30f * density).roundToInt()
+    // Outer radius = 26dp semicircle, padPx = 5dp -> cap width = 42dp -> concentric cap radius = 21dp.
+    private val capHeightPx = (34f * density).roundToInt()
     private val padPx = (5f * density).roundToInt()
     private val gapPx = (4f * density).roundToInt()
 
     // Top cap + Play + Switch + Bottom cap + 3 gaps + outer vertical padding
     private val compactBarHeightPx = padPx * 2 + capHeightPx * 2 + btnSizePx * 2 + gapPx * 3
-    // Unfolded height includes 5 secondary tool buttons (+, -, lock, tune, close) each + gapPx
+    // Unfolded height includes 5 secondary tool buttons (+, -, lock, record, close) each + gapPx
     private val fullBarHeightPx = compactBarHeightPx + (btnSizePx + gapPx) * 5
 
-    private val collapsedWidthPx = (26f * density).roundToInt()
-    private val collapsedHeightPx = (74f * density).roundToInt()
+    private val collapsedWidthPx = (20f * density).roundToInt()
+    private val collapsedHeightPx = (80f * density).roundToInt()
 
     private var colors: OverlayThemeColors = initialColors
     private var isCollapsedState: Boolean = false
@@ -83,7 +88,6 @@ class ControlBarView(
     private var runningState: Boolean = false
     private var lockedState: Boolean = false
     private var engineModeState: Int = TouchMuxUserService.MODE_IDLE
-    private var tunePanelOpenState: Boolean = false
     private var activePresetIndex: Int = 0
     private var totalPresetCount: Int = 1
 
@@ -100,8 +104,8 @@ class ControlBarView(
     private val removeBg = ovalGradient()
     private val lockBtn: ImageView
     private val lockBg = ovalGradient()
-    private val tuneBtn: ImageView
-    private val tuneBg = ovalGradient()
+    private val recordBtn: ImageView
+    private val recordBg = ovalGradient()
     private val closeBtn: ImageView
     private val closeBg = ovalGradient()
     private val footerExpandView: ExpandToolsFooterView
@@ -124,7 +128,7 @@ class ControlBarView(
 
         headerCollapseView = ExpandedHeaderView(context).apply {
             isClickable = true
-            setOnClickListener { listener.onCollapseRequested() }
+            setRobustClickListener(recoverWhenIdle = false) { listener.onCollapseRequested() }
         }
         expandedContainer.addView(
             headerCollapseView,
@@ -133,7 +137,7 @@ class ControlBarView(
             }
         )
 
-        playStopBtn = createActionButton(R.drawable.ic_play, playStopBg) { listener.onTogglePlayStop() }
+        playStopBtn = createActionButton(R.drawable.ic_play, playStopBg, recoverWhenIdle = true) { listener.onTogglePlayStop() }
         expandedContainer.addView(
             playStopBtn,
             LinearLayout.LayoutParams(btnSizePx, btnSizePx).apply {
@@ -144,7 +148,7 @@ class ControlBarView(
         switchPresetBtn = PresetSwitchButtonView(context).apply {
             isClickable = true
             background = initialColors.createRippleDrawable(switchPresetBg)
-            setOnClickListener { listener.onSwitchPreset() }
+            setRobustClickListener(recoverWhenIdle = false) { listener.onSwitchPreset() }
         }
         expandedContainer.addView(
             switchPresetBtn,
@@ -162,10 +166,10 @@ class ControlBarView(
         addBtn = createActionButton(R.drawable.ic_add, addBg) { listener.onAddTarget() }
         removeBtn = createActionButton(R.drawable.ic_remove, removeBg) { listener.onRemoveTarget() }
         lockBtn = createActionButton(R.drawable.ic_lock_open, lockBg) { listener.onToggleLockEdit() }
-        tuneBtn = createActionButton(R.drawable.ic_tune, tuneBg) { listener.onToggleTunePanel() }
+        recordBtn = createActionButton(R.drawable.ic_record, recordBg) { listener.onStartMacroRecord() }
         closeBtn = createActionButton(R.drawable.ic_close, closeBg) { listener.onCloseOverlay() }
 
-        listOf(addBtn, removeBtn, lockBtn, tuneBtn, closeBtn).forEach { btn ->
+        listOf(addBtn, removeBtn, lockBtn, recordBtn, closeBtn).forEach { btn ->
             secondaryToolsContainer.addView(
                 btn,
                 LinearLayout.LayoutParams(btnSizePx, btnSizePx).apply {
@@ -183,7 +187,7 @@ class ControlBarView(
 
         footerExpandView = ExpandToolsFooterView(context).apply {
             isClickable = true
-            setOnClickListener { listener.onToggleToolsExpanded() }
+            setRobustClickListener(recoverWhenIdle = false) { listener.onToggleToolsExpanded() }
         }
         expandedContainer.addView(
             footerExpandView,
@@ -193,13 +197,121 @@ class ControlBarView(
         collapsedPillView = CollapsedEdgePillView(context).apply {
             isClickable = true
             visibility = View.GONE
-            setOnClickListener { listener.onExpandRequested() }
+            setRobustClickListener(recoverWhenIdle = true) { listener.onExpandRequested() }
         }
 
-        addView(expandedContainer, LayoutParams(expandedWidthPx, LayoutParams.WRAP_CONTENT))
-        addView(collapsedPillView, LayoutParams(collapsedWidthPx, collapsedHeightPx))
+        addView(
+            expandedContainer,
+            LayoutParams(expandedWidthPx, LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START)
+        )
+        addView(
+            collapsedPillView,
+            LayoutParams(collapsedWidthPx, collapsedHeightPx, Gravity.TOP or Gravity.START)
+        )
 
         applyThemeColors(initialColors)
+    }
+
+    private var hasActiveTouch = false
+    private var externalCancelInProgress = false
+    private var pendingTouchIdleCallback: (() -> Unit)? = null
+
+    fun hasActiveTouchGesture(): Boolean = hasActiveTouch
+
+    fun runWhenTouchIdle(onIdle: () -> Unit) {
+        if (!hasActiveTouch) {
+            onIdle()
+            return
+        }
+        pendingTouchIdleCallback = onIdle
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                hasActiveTouch = true
+                externalCancelInProgress = false
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                externalCancelInProgress =
+                    (ev.actionMasked == MotionEvent.ACTION_CANCEL) && !isDragging
+                val handled = try {
+                    super.dispatchTouchEvent(ev)
+                } finally {
+                    externalCancelInProgress = false
+                }
+                hasActiveTouch = false
+                val idleCallback = pendingTouchIdleCallback
+                pendingTouchIdleCallback = null
+                idleCallback?.invoke()
+                return handled
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun View.setRobustClickListener(
+        recoverWhenIdle: Boolean = false,
+        onClick: () -> Unit
+    ) {
+        var downTimeMs = 0L
+        var downRawX = 0f
+        var downRawY = 0f
+        var isDown = false
+        var movedBeyondSlop = false
+
+        setOnClickListener { onClick() }
+        setOnTouchListener { v, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downTimeMs = SystemClock.uptimeMillis()
+                    downRawX = event.rawX
+                    downRawY = event.rawY
+                    isDown = true
+                    movedBeyondSlop = false
+                    false
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (isDragging || hypot(event.rawX - downRawX, event.rawY - downRawY) >= touchSlop) {
+                        movedBeyondSlop = true
+                        isDown = false
+                    }
+                    false
+                }
+                MotionEvent.ACTION_UP -> {
+                    isDown = false
+                    false
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    val wasDown = isDown
+                    val wasMoved = movedBeyondSlop
+                    isDown = false
+                    movedBeyondSlop = false
+                    if (wasDown &&
+                        !wasMoved &&
+                        !isDragging &&
+                        externalCancelInProgress &&
+                        (recoverWhenIdle || runningState) &&
+                        v.isAttachedToWindow &&
+                        v.isShown &&
+                        this@ControlBarView.alpha > 0.1f
+                    ) {
+                        val elapsedMs = SystemClock.uptimeMillis() - downTimeMs
+                        val hasValidCancelCoords = (event.rawX != 0f || event.rawY != 0f)
+                        val cancelDistOk = !hasValidCancelCoords ||
+                            hypot(event.rawX - downRawX, event.rawY - downRawY) < touchSlop * 2f
+                        if (elapsedMs in 0L..600L && cancelDistOk) {
+                            v.playSoundEffect(SoundEffectConstants.CLICK)
+                            onClick()
+                        }
+                    }
+                    // Return false so View.onTouchEvent(ACTION_CANCEL) still clears pressed/ripple cleanly
+                    false
+                }
+                else -> false
+            }
+        }
     }
 
     private fun ovalGradient(): GradientDrawable = GradientDrawable().apply {
@@ -209,6 +321,7 @@ class ControlBarView(
     private fun createActionButton(
         iconRes: Int,
         bgDrawable: GradientDrawable,
+        recoverWhenIdle: Boolean = false,
         onClick: () -> Unit
     ): ImageView {
         val iv = ImageView(context)
@@ -218,28 +331,33 @@ class ControlBarView(
         iv.setImageDrawable(ContextCompat.getDrawable(context, iconRes))
         iv.isClickable = true
         iv.background = colors.createRippleDrawable(bgDrawable)
-        iv.setOnClickListener { onClick() }
+        iv.setRobustClickListener(recoverWhenIdle = recoverWhenIdle, onClick = onClick)
         return iv
     }
 
     fun applyThemeColors(newColors: OverlayThemeColors) {
         colors = newColors
+        val outerRadiusPx = expandedWidthPx * 0.5f
         expandedContainer.background = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
-            cornerRadius = 24f * density
+            cornerRadius = outerRadiusPx
             setColor(newColors.surfaceContainerHigh)
             setStroke((1f * density).roundToInt().coerceAtLeast(1), newColors.outlineVariant)
         }
 
         val rippleTint = ColorStateList.valueOf(newColors.ripple)
-        listOf(playStopBtn, switchPresetBtn, addBtn, removeBtn, lockBtn, tuneBtn, closeBtn).forEach { btn ->
+        listOf(playStopBtn, switchPresetBtn, addBtn, removeBtn, lockBtn, recordBtn, closeBtn).forEach { btn ->
             (btn.background as? RippleDrawable)?.setColor(rippleTint)
         }
 
-        val capCornerRadius = capHeightPx * 0.5f
-        val capRadii = FloatArray(8) { capCornerRadius }
-        headerCollapseView.foreground = newColors.createRippleDrawable(null, maskCornerRadii = capRadii)
-        footerExpandView.foreground = newColors.createRippleDrawable(null, maskCornerRadii = capRadii)
+        val capW = (expandedWidthPx - padPx * 2).toFloat()
+        val capH = capHeightPx.toFloat()
+        val outerCapR = capW * 0.5f
+        val innerCapR = (capH - outerCapR).coerceAtLeast(8f * density)
+        val topCapRadii = floatArrayOf(outerCapR, outerCapR, outerCapR, outerCapR, innerCapR, innerCapR, innerCapR, innerCapR)
+        val bottomCapRadii = floatArrayOf(innerCapR, innerCapR, innerCapR, innerCapR, outerCapR, outerCapR, outerCapR, outerCapR)
+        headerCollapseView.foreground = newColors.createRippleDrawable(null, maskCornerRadii = topCapRadii)
+        footerExpandView.foreground = newColors.createRippleDrawable(null, maskCornerRadii = bottomCapRadii)
         updateCollapsedPillForeground()
 
         redrawButtonStates()
@@ -250,13 +368,24 @@ class ControlBarView(
     }
 
     private fun updateCollapsedPillForeground() {
-        val r = 16f * density
+        val r = 14f * density
         val radii = if (dockRightState) {
             floatArrayOf(r, r, 0f, 0f, 0f, 0f, r, r)
         } else {
             floatArrayOf(0f, 0f, r, r, r, r, 0f, 0f)
         }
         collapsedPillView.foreground = colors.createRippleDrawable(null, maskCornerRadii = radii)
+    }
+
+    private fun updateCollapsedPillPlacement(dockRight: Boolean, topMarginPx: Int) {
+        val lp = collapsedPillView.layoutParams as? LayoutParams ?: return
+        val desiredGravity = Gravity.TOP or if (dockRight) Gravity.END else Gravity.START
+        val clampedTop = topMarginPx.coerceAtLeast(0)
+        if (lp.gravity != desiredGravity || lp.topMargin != clampedTop) {
+            lp.gravity = desiredGravity
+            lp.topMargin = clampedTop
+            collapsedPillView.layoutParams = lp
+        }
     }
 
     fun syncWindowPosition(lpX: Int, lpY: Int) {
@@ -274,6 +403,10 @@ class ControlBarView(
 
     fun getExpandedWidthPx(): Int = expandedWidthPx
 
+    fun getEdgeMarginPx(): Int = edgeMarginPx
+
+    fun getMorphHostWidthPx(): Int = morphHostWidthPx
+
     fun getExpandedBarHeightPx(): Int = if (isToolsExpandedState) fullBarHeightPx else compactBarHeightPx
 
     fun getCollapsedWidthPx(): Int = collapsedWidthPx
@@ -288,6 +421,63 @@ class ControlBarView(
         footerExpandView.invalidate()
     }
 
+    private fun linearRamp(value: Float, edge0: Float, edge1: Float): Float =
+        ((value - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
+
+    fun prepareMorphLayout(
+        dockRight: Boolean,
+        pillTopMarginPx: Int,
+        initiallyCollapsed: Boolean
+    ) {
+        isCollapsedState = false
+        val dockChanged = dockRightState != dockRight
+        dockRightState = dockRight
+        if (dockChanged) {
+            updateCollapsedPillForeground()
+        }
+        updateCollapsedPillPlacement(dockRight, pillTopMarginPx)
+        expandedContainer.visibility = View.VISIBLE
+        collapsedPillView.visibility = View.VISIBLE
+        applyMorphProgress(if (initiallyCollapsed) 0f else 1f, dockRight, pillTopMarginPx)
+        if (dockChanged) {
+            headerCollapseView.invalidate()
+            collapsedPillView.invalidate()
+        }
+    }
+
+    /**
+     * Pure local GPU transform inside the locked morphHostWidthPx (expandedWidthPx + edgeMarginPx)
+     * host window: zero WindowManager IPC calls during animation, strictly monotonic, 100% mirror-symmetric.
+     */
+    fun applyMorphProgress(progress: Float, dockRight: Boolean, pillTopMarginPx: Int) {
+        val p = progress.coerceIn(0f, 1f)
+        val expandedH = getExpandedBarHeightPx().toFloat().coerceAtLeast(1f)
+        val pillCenterY = (pillTopMarginPx + collapsedHeightPx * 0.5f).coerceIn(0f, expandedH)
+        val sign = if (dockRight) -1f else 1f
+
+        // Direct linear-in-progress mapping so outer M3 velocity curve is never double-eased or stalled mid-flight.
+        expandedContainer.translationX = if (dockRight) {
+            edgeMarginPx * (1f - p)
+        } else {
+            edgeMarginPx * p
+        }
+        expandedContainer.pivotX = if (dockRight) expandedWidthPx.toFloat() else 0f
+        expandedContainer.pivotY = pillCenterY
+
+        expandedContainer.scaleX = 0.42f + 0.58f * p
+        expandedContainer.scaleY = 0.52f + 0.48f * p
+        expandedContainer.alpha = linearRamp(p, 0.06f, 0.52f)
+
+        val peelT = linearRamp(p, 0.0f, 0.45f)
+        collapsedPillView.pivotX = if (dockRight) collapsedWidthPx.toFloat() else 0f
+        collapsedPillView.pivotY = collapsedHeightPx * 0.5f
+        collapsedPillView.translationX = sign * (edgeMarginPx * 0.36f) * peelT
+        collapsedPillView.scaleX = 1f
+        collapsedPillView.scaleY = 1f
+        collapsedPillView.alpha = 1f - linearRamp(p, 0.12f, 0.48f)
+        collapsedPillView.setExpandMorph(peelT)
+    }
+
     fun setCollapsed(collapsed: Boolean, dockRight: Boolean) {
         isCollapsedState = collapsed
         val dockChanged = dockRightState != dockRight
@@ -295,8 +485,18 @@ class ControlBarView(
         if (dockChanged) {
             updateCollapsedPillForeground()
         }
+        updateCollapsedPillPlacement(dockRight, topMarginPx = 0)
         expandedContainer.visibility = if (collapsed) View.GONE else View.VISIBLE
+        expandedContainer.translationX = 0f
+        expandedContainer.alpha = 1f
+        expandedContainer.scaleX = 1f
+        expandedContainer.scaleY = 1f
         collapsedPillView.visibility = if (collapsed) View.VISIBLE else View.GONE
+        collapsedPillView.translationX = 0f
+        collapsedPillView.alpha = 1f
+        collapsedPillView.scaleX = 1f
+        collapsedPillView.scaleY = 1f
+        collapsedPillView.setExpandMorph(0f)
         headerCollapseView.invalidate()
         footerExpandView.invalidate()
         collapsedPillView.invalidate()
@@ -306,6 +506,10 @@ class ControlBarView(
         if (dockRightState != dockRight) {
             dockRightState = dockRight
             updateCollapsedPillForeground()
+            updateCollapsedPillPlacement(
+                dockRight,
+                if (isCollapsedState) 0 else (collapsedPillView.layoutParams as? LayoutParams)?.topMargin ?: 0
+            )
             headerCollapseView.invalidate()
             collapsedPillView.invalidate()
         }
@@ -315,14 +519,12 @@ class ControlBarView(
         isRunning: Boolean,
         isLocked: Boolean,
         engineMode: Int,
-        tunePanelOpen: Boolean,
         presetIndex: Int,
         presetCount: Int
     ) {
         runningState = isRunning
         lockedState = isLocked
         engineModeState = engineMode
-        tunePanelOpenState = tunePanelOpen
         activePresetIndex = presetIndex
         totalPresetCount = presetCount.coerceAtLeast(1)
         redrawButtonStates()
@@ -368,20 +570,15 @@ class ControlBarView(
             lockBg.setColor(neutralBg)
         }
 
-        if (tunePanelOpenState) {
-            tuneBtn.setColorFilter(colors.onPrimaryContainer)
-            tuneBg.setColor(colors.primaryContainer)
-        } else {
-            tuneBtn.setColorFilter(neutralFg)
-            tuneBg.setColor(neutralBg)
-        }
+        recordBg.setColor(ColorUtils.setAlphaComponent(colors.tertiaryContainer, 220))
+        recordBtn.setColorFilter(colors.onTertiaryContainer)
 
         closeBg.setColor(ColorUtils.setAlphaComponent(colors.errorContainer, 110))
         closeBtn.setColorFilter(colors.error)
     }
 
     private fun statusLedColor(): Int = when {
-        engineModeState == TouchMuxUserService.MODE_NATIVE_MUX -> colors.activeRunningGreen
+        TouchMuxUserService.isNativeMode(engineModeState) -> colors.activeRunningGreen
         engineModeState == TouchMuxUserService.MODE_SHIZUKU_FALLBACK -> colors.primary
         else -> colors.tertiary
     }
@@ -497,6 +694,7 @@ class ControlBarView(
             strokeJoin = Paint.Join.ROUND
             strokeWidth = 1.9f * density
         }
+        private val bgPath = Path()
         private val bgRect = RectF()
 
         override fun onDraw(canvas: Canvas) {
@@ -505,14 +703,19 @@ class ControlBarView(
             val h = height.toFloat()
             if (w <= 0f || h <= 0f) return
 
+            val outerR = w * 0.5f
+            val innerR = (h - outerR).coerceAtLeast(8f * density)
+            val radii = floatArrayOf(outerR, outerR, outerR, outerR, innerR, innerR, innerR, innerR)
             bgPaint.color = ColorUtils.setAlphaComponent(colors.surfaceContainerHighest, 185)
             bgRect.set(0f, 0f, w, h)
-            canvas.drawRoundRect(bgRect, h * 0.5f, h * 0.5f, bgPaint)
+            bgPath.reset()
+            bgPath.addRoundRect(bgRect, radii, Path.Direction.CW)
+            canvas.drawPath(bgPath, bgPaint)
 
             val ledColor = statusLedColor()
-            val cy = h * 0.5f
-            val ledX = if (dockRightState) w * 0.30f else w * 0.70f
-            val chevronX = if (dockRightState) w * 0.68f else w * 0.32f
+            val cy = h * 0.53f
+            val ledX = if (dockRightState) w * 0.31f else w * 0.69f
+            val chevronX = if (dockRightState) w * 0.67f else w * 0.33f
 
             if (runningState) {
                 ledHaloPaint.color = ColorUtils.setAlphaComponent(ledColor, 85)
@@ -547,6 +750,7 @@ class ControlBarView(
             strokeJoin = Paint.Join.ROUND
             strokeWidth = 1.9f * density
         }
+        private val bgPath = Path()
         private val bgRect = RectF()
 
         override fun onDraw(canvas: Canvas) {
@@ -555,16 +759,21 @@ class ControlBarView(
             val h = height.toFloat()
             if (w <= 0f || h <= 0f) return
 
+            val outerR = w * 0.5f
+            val innerR = (h - outerR).coerceAtLeast(8f * density)
+            val radii = floatArrayOf(innerR, innerR, innerR, innerR, outerR, outerR, outerR, outerR)
             bgPaint.color = ColorUtils.setAlphaComponent(
                 if (isToolsExpandedState) colors.primaryContainer else colors.surfaceContainerHighest,
                 if (isToolsExpandedState) 210 else 185
             )
             bgRect.set(0f, 0f, w, h)
-            canvas.drawRoundRect(bgRect, h * 0.5f, h * 0.5f, bgPaint)
+            bgPath.reset()
+            bgPath.addRoundRect(bgRect, radii, Path.Direction.CW)
+            canvas.drawPath(bgPath, bgPaint)
 
             strokePaint.color = if (isToolsExpandedState) colors.onPrimaryContainer else colors.onSurfaceVariant
             val cx = w * 0.5f
-            val cy = h * 0.5f
+            val cy = h * 0.47f
             // Exact 90-degree rotation of the top horizontal chevron (aw <-> ah)
             val halfW = 4.6f * density
             val depthH = 3.5f * density
@@ -581,24 +790,29 @@ class ControlBarView(
     }
 
     /**
-     * Ultra-compact edge-docked capsule visible when edge-collapsed.
+     * Sleek MP4-inspired Material 3 edge dock capsule:
+     * Flush against the docked screen boundary with smooth rounded inner caps and subtle Monet fill.
      */
     private inner class CollapsedEdgePillView(context: Context) : View(context) {
         private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-        private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 1.1f * density
-        }
         private val haloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         private val ledPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         private val chevronPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
             strokeJoin = Paint.Join.ROUND
-            strokeWidth = 1.9f * density
+            strokeWidth = 1.85f * density
         }
-        private val path = Path()
-        private val rect = RectF()
+        private val fillPath = Path()
+        private var expandMorph: Float = 0f
+
+        fun setExpandMorph(morph: Float) {
+            val clamped = morph.coerceIn(0f, 1f)
+            if (expandMorph != clamped) {
+                expandMorph = clamped
+                invalidate()
+            }
+        }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
@@ -606,51 +820,55 @@ class ControlBarView(
             val h = height.toFloat()
             if (w <= 0f || h <= 0f) return
 
-            val inset = 0.8f * density
-            val r = 16f * density
+            val sign = if (dockRightState) -1f else 1f
+            val wallX = if (dockRightState) w else 0f
+            val visibleW = w
+            val innerX = wallX + sign * visibleW
+            val outerCornerR = 14f * density
+            val wallCornerR = (4f * expandMorph) * density
+            val vPad = 0f
+
+            val leftX = minOf(wallX, innerX)
+            val rightX = maxOf(wallX, innerX)
             val radii = if (dockRightState) {
-                floatArrayOf(r, r, 0f, 0f, 0f, 0f, r, r)
+                floatArrayOf(
+                    outerCornerR, outerCornerR,
+                    wallCornerR, wallCornerR,
+                    wallCornerR, wallCornerR,
+                    outerCornerR, outerCornerR
+                )
             } else {
-                floatArrayOf(0f, 0f, r, r, r, r, 0f, 0f)
+                floatArrayOf(
+                    wallCornerR, wallCornerR,
+                    outerCornerR, outerCornerR,
+                    outerCornerR, outerCornerR,
+                    wallCornerR, wallCornerR
+                )
             }
 
-            path.reset()
-            rect.set(
-                if (dockRightState) inset else -inset,
-                inset,
-                if (dockRightState) w + inset else w - inset,
-                h - inset
-            )
-            path.addRoundRect(rect, radii, Path.Direction.CW)
+            fillPath.reset()
+            fillPath.addRoundRect(leftX, vPad, rightX, h - vPad, radii, Path.Direction.CW)
+            fillPaint.color = colors.secondaryContainer
+            canvas.drawPath(fillPath, fillPaint)
 
-            fillPaint.color = colors.surfaceContainerHigh
-            canvas.drawPath(path, fillPaint)
-
-            borderPaint.color = colors.outlineVariant
-            canvas.drawPath(path, borderPaint)
-
-            val cx = w * 0.5f
-            val ledY = h * 0.34f
+            val cx = wallX + sign * (visibleW * 0.50f)
+            val ledY = h * 0.36f
             val ledColor = statusLedColor()
             if (runningState) {
                 haloPaint.color = ColorUtils.setAlphaComponent(ledColor, 95)
-                canvas.drawCircle(cx, ledY, 7.2f * density, haloPaint)
+                canvas.drawCircle(cx, ledY, 5.5f * density, haloPaint)
             }
             ledPaint.color = ledColor
-            canvas.drawCircle(cx, ledY, 4.0f * density, ledPaint)
+            canvas.drawCircle(cx, ledY, 3.0f * density, ledPaint)
 
-            // Expand chevron pointing inward from the docked edge
-            chevronPaint.color = colors.onSurface
-            val chevY = h * 0.66f
-            val aw = 3.5f * density
-            val ah = 4.6f * density
-            if (dockRightState) {
-                canvas.drawLine(cx + aw * 0.5f, chevY - ah, cx - aw * 0.6f, chevY, chevronPaint)
-                canvas.drawLine(cx + aw * 0.5f, chevY + ah, cx - aw * 0.6f, chevY, chevronPaint)
-            } else {
-                canvas.drawLine(cx - aw * 0.5f, chevY - ah, cx + aw * 0.6f, chevY, chevronPaint)
-                canvas.drawLine(cx - aw * 0.5f, chevY + ah, cx + aw * 0.6f, chevY, chevronPaint)
-            }
+            chevronPaint.color = colors.onSecondaryContainer
+            val chevY = h * 0.60f
+            val aw = 2.8f * density
+            val ah = 4.0f * density
+            val tipX = cx + sign * aw * 0.55f
+            val tailX = cx - sign * aw * 0.45f
+            canvas.drawLine(tailX, chevY - ah, tipX, chevY, chevronPaint)
+            canvas.drawLine(tailX, chevY + ah, tipX, chevY, chevronPaint)
         }
     }
 }
