@@ -99,6 +99,9 @@ object ShizukuController {
     private val _clickingCompletedEvents = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
     val clickingCompletedEvents: SharedFlow<Unit> = _clickingCompletedEvents.asSharedFlow()
 
+    private val _targetTriggerEvents = MutableSharedFlow<Int>(extraBufferCapacity = 8)
+    val targetTriggerEvents: SharedFlow<Int> = _targetTriggerEvents.asSharedFlow()
+
     private val serviceCallback = object : ITouchMuxCallback.Stub() {
         override fun onVolumeKeyToggleRequested() {
             _volumeKeyToggleEvents.tryEmit(Unit)
@@ -119,6 +122,10 @@ object ShizukuController {
         override fun onClickingCompleted() {
             _clickingCompletedEvents.tryEmit(Unit)
             refreshCapabilitiesAsync()
+        }
+
+        override fun onTargetTriggerEvent(eventType: Int) {
+            _targetTriggerEvents.tryEmit(eventType)
         }
     }
 
@@ -437,6 +444,65 @@ object ShizukuController {
         try {
             svc.setVolumeKeyControlEnabled(enabled)
         } catch (_: Throwable) {
+        }
+    }
+
+    fun setTargetTriggerConfig(
+        mode: Int,
+        zoneXs: FloatArray,
+        zoneYs: FloatArray,
+        zoneRadii: FloatArray,
+        excludeLeft: Int,
+        excludeTop: Int,
+        excludeRight: Int,
+        excludeBottom: Int,
+        touchSlopPx: Float
+    ) {
+        val ctx = appContext ?: return
+        val svc = service ?: return
+        try {
+            if (mode != ClickGlobalSettings.TARGET_TRIGGER_OFF && _engineSnapshot.value.touchDeviceInfo.isEmpty()) {
+                svc.probeCapabilities(ctx.applicationInfo.nativeLibraryDir)
+            }
+            val metrics = getDisplayScreenMetrics(ctx)
+            svc.setTargetTriggerConfig(
+                mode,
+                zoneXs,
+                zoneYs,
+                zoneRadii,
+                metrics.widthPx,
+                metrics.heightPx,
+                metrics.rotation,
+                excludeLeft,
+                excludeTop,
+                excludeRight,
+                excludeBottom,
+                touchSlopPx
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun clearTargetTriggerConfigAsync() {
+        val svc = service ?: return
+        scope.launch {
+            try {
+                svc.setTargetTriggerConfig(
+                    ClickGlobalSettings.TARGET_TRIGGER_OFF,
+                    FloatArray(0),
+                    FloatArray(0),
+                    FloatArray(0),
+                    1080,
+                    2400,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    48f
+                )
+            } catch (_: Throwable) {
+            }
         }
     }
 

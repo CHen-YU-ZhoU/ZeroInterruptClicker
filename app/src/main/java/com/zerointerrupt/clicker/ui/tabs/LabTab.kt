@@ -139,14 +139,6 @@ fun LabTab(
 
                 HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
 
-                LabSwitchRow(
-                    title = "音量减键控制",
-                    checked = state.volumeKeyToggleEnabled,
-                    onCheckedChange = callbacks.onVolumeKeyToggleChange
-                )
-
-                HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
-
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -174,6 +166,50 @@ fun LabTab(
                         Text("添加", fontWeight = FontWeight.SemiBold)
                     }
                 }
+            }
+        }
+
+        ExpressiveCard {
+            Column(
+                modifier = Modifier.padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text(
+                    text = "启动方式",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+
+                LabSwitchRow(
+                    title = "悬浮窗",
+                    checked = true,
+                    enabled = false,
+                    onCheckedChange = {}
+                )
+
+                HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
+
+                LabSwitchRow(
+                    title = "长按目标区域",
+                    checked = state.targetLongPressTriggerEnabled,
+                    onCheckedChange = callbacks.onTargetLongPressTriggerChange
+                )
+
+                HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
+
+                LabSwitchRow(
+                    title = "点击目标区域",
+                    checked = state.targetTapTriggerEnabled,
+                    onCheckedChange = callbacks.onTargetTapTriggerChange
+                )
+
+                HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
+
+                LabSwitchRow(
+                    title = "双敲音量减键",
+                    checked = state.volumeKeyToggleEnabled,
+                    onCheckedChange = callbacks.onVolumeKeyToggleChange
+                )
             }
         }
 
@@ -600,7 +636,8 @@ private fun DiagLine(label: String, value: String) {
 private fun LabSwitchRow(
     title: String,
     checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -617,7 +654,8 @@ private fun LabSwitchRow(
         )
         CheckSwitch(
             checked = checked,
-            onCheckedChange = onCheckedChange
+            onCheckedChange = onCheckedChange,
+            enabled = enabled
         )
     }
 }

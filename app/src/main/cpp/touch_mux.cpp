@@ -68,6 +68,8 @@ constexpr int32_t kAndroidActionPointerIndexShift = 8;
 constexpr int64_t kSwipeStepNs = 4000000LL;               // 4ms high-density interpolation (~250Hz)
 constexpr int64_t kVolDoubleTapWindowNs = 420000000LL;    // 420ms double-tap window
 constexpr int64_t kVolEmergencyHoldNs = 3000000000LL;     // 3.0s hold for EVIOCGRAB emergency release
+constexpr int64_t kTargetLongPressNs = 350000000LL;       // 350ms hold threshold for target-zone long press
+constexpr int64_t kTargetTapDebounceNs = 120000000LL;     // 120ms debounce for target-zone tap trigger
 
 constexpr size_t kBitFieldBytes(size_t maxBit) {
     return (maxBit + 7) / 8 + 1;
@@ -232,6 +234,13 @@ TouchMuxEngine::TouchMuxEngine()
 }
 
 TouchMuxEngine::~TouchMuxEngine() {
+    {
+        std::lock_guard<std::mutex> lock(targetTriggerMutex_);
+        cfgTtMode_ = TargetTriggerMode::OFF;
+        cfgTtZones_.clear();
+        ++cfgTtVersion_;
+    }
+    stopTouchTriggerWatchThread();
     stopRecording(true);
     shutdown();
     stopKeyWatchThread();
@@ -620,6 +629,632 @@ void TouchMuxEngine::setCallbacks(EngineCallbacks callbacks) {
 
 void TouchMuxEngine::setVolumeKeyControlEnabled(bool enabled) {
     volumeKeyControlEnabled_.store(enabled);
+}
+
+void TouchMuxEngine::setTargetTriggerConfig(int32_t mode,
+                                            const std::vector<TargetTriggerZone>& zones,
+                                            int displayW,
+                                            int displayH,
+                                            int rotation,
+                                            int excludeLeft,
+                                            int excludeTop,
+                                            int excludeRight,
+                                            int excludeBottom,
+                                            float touchSlopPx) {
+    TargetTriggerMode safeMode = TargetTriggerMode::OFF;
+    if (mode == static_cast<int32_t>(TargetTriggerMode::TAP)) {
+        safeMode = TargetTriggerMode::TAP;
+    } else if (mode == static_cast<int32_t>(TargetTriggerMode::LONG_PRESS)) {
+        safeMode = TargetTriggerMode::LONG_PRESS;
+    }
+    {
+        std::lock_guard<std::mutex> lock(targetTriggerMutex_);
+        cfgTtMode_ = safeMode;
+        cfgTtZones_ = zones;
+        cfgTtDisplayW_ = std::max(1, displayW);
+        cfgTtDisplayH_ = std::max(1, displayH);
+        cfgTtRotation_ = rotation;
+        cfgTtExL_ = excludeLeft;
+        cfgTtExT_ = excludeTop;
+        cfgTtExR_ = excludeRight;
+        cfgTtExB_ = excludeBottom;
+        cfgTtSlopPx_ = std::clamp(touchSlopPx, 12.0f, 160.0f);
+        ++cfgTtVersion_;
+    }
+    if (threadRunning_.load()) {
+        signalWake();
+    }
+    syncTouchTriggerWatcherState();
+}
+
+void TouchMuxEngine::emitTargetTriggerEvent(TargetTriggerEvent ev) {
+    std::function<void(int32_t)> cb;
+    {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        cb = callbacks_.onTargetTriggerEvent;
+    }
+    if (cb) {
+        cb(static_cast<int32_t>(ev));
+    }
+}
+
+void TouchMuxEngine::resetEngineTriggerSlots(bool emitHoldEnd) {
+    for (int s = 0; s < kMaxPhysSlots; ++s) {
+        if (emitHoldEnd && engTriggerSlots_[s].holdFired) {
+            emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
+        }
+        engTriggerSlots_[s] = TriggerSlotTrack{};
+        engPhysPendingDown_[s] = false;
+        engPhysPendingUp_[s] = false;
+    }
+}
+
+void TouchMuxEngine::syncEngineTargetTriggerConfig() {
+    TargetTriggerMode nextMode = TargetTriggerMode::OFF;
+    std::vector<TargetTriggerZone> nextZones;
+    int nextExL = 0, nextExT = 0, nextExR = 0, nextExB = 0;
+    float nextSlop = 48.0f;
+    uint64_t nextVer = 0;
+    {
+        std::lock_guard<std::mutex> lock(targetTriggerMutex_);
+        if (cfgTtVersion_ == activeTtVersion_) {
+            return;
+        }
+        nextMode = cfgTtMode_;
+        nextZones = cfgTtZones_;
+        nextExL = cfgTtExL_;
+        nextExT = cfgTtExT_;
+        nextExR = cfgTtExR_;
+        nextExB = cfgTtExB_;
+        nextSlop = cfgTtSlopPx_;
+        nextVer = cfgTtVersion_;
+    }
+
+    const bool modeChanged = (nextMode != activeTtMode_);
+    activeTtMode_ = nextMode;
+    activeTtZones_ = std::move(nextZones);
+    activeTtExL_ = nextExL;
+    activeTtExT_ = nextExT;
+    activeTtExR_ = nextExR;
+    activeTtExB_ = nextExB;
+    activeTtSlopPx_ = nextSlop;
+    activeTtVersion_ = nextVer;
+
+    if (activeTtMode_ == TargetTriggerMode::OFF || activeTtZones_.empty() || modeChanged) {
+        resetEngineTriggerSlots(true);
+    }
+}
+
+void TouchMuxEngine::processEngineTriggerSynFrame(int64_t nowNs) {
+    if (activeTtMode_ == TargetTriggerMode::OFF || activeTtZones_.empty()) {
+        for (int s = 0; s < kMaxPhysSlots; ++s) {
+            engPhysPendingDown_[s] = false;
+            engPhysPendingUp_[s] = false;
+        }
+        return;
+    }
+
+    auto insideExclude = [&](float x, float y) -> bool {
+        if (activeTtExR_ <= activeTtExL_ || activeTtExB_ <= activeTtExT_) return false;
+        return x >= static_cast<float>(activeTtExL_ - 8) &&
+               x <= static_cast<float>(activeTtExR_ + 8) &&
+               y >= static_cast<float>(activeTtExT_ - 8) &&
+               y <= static_cast<float>(activeTtExB_ + 8);
+    };
+    auto insideAnyZone = [&](float x, float y) -> bool {
+        for (const auto& z : activeTtZones_) {
+            const float dx = x - z.x;
+            const float dy = y - z.y;
+            if ((dx * dx + dy * dy) <= (z.radiusPx * z.radiusPx)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto anyHoldActive = [&]() -> bool {
+        for (int k = 0; k < kMaxPhysSlots; ++k) {
+            if (engTriggerSlots_[k].active && engTriggerSlots_[k].holdFired) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool timerDirty = false;
+    for (int s = 0; s < kMaxPhysSlots; ++s) {
+        auto& tr = engTriggerSlots_[s];
+        float lx = 0.0f;
+        float ly = 0.0f;
+        rawToLogical(engPhysRawX_[s], engPhysRawY_[s], lx, ly);
+
+        if (engPhysPendingDown_[s]) {
+            engPhysPendingDown_[s] = false;
+            if (tr.holdFired) {
+                emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
+            }
+            tr = TriggerSlotTrack{};
+            tr.active = true;
+            tr.downX = lx;
+            tr.downY = ly;
+            tr.curX = lx;
+            tr.curY = ly;
+            tr.downNs = nowNs;
+            if (!insideExclude(lx, ly) && insideAnyZone(lx, ly)) {
+                if (activeTtMode_ == TargetTriggerMode::LONG_PRESS) {
+                    tr.candidate = !anyHoldActive() && !activeClickingRunning_ && !activeRawMacroRunning_;
+                    if (tr.candidate) {
+                        timerDirty = true;
+                    }
+                } else {
+                    tr.candidate = true;
+                }
+            }
+        } else if (tr.active && !engPhysPendingUp_[s]) {
+            tr.curX = lx;
+            tr.curY = ly;
+            if (tr.candidate && !tr.holdFired && !tr.movedTooFar) {
+                if (std::hypot(tr.curX - tr.downX, tr.curY - tr.downY) > activeTtSlopPx_) {
+                    tr.movedTooFar = true;
+                    timerDirty = true;
+                }
+            }
+        }
+
+        if (engPhysPendingUp_[s]) {
+            engPhysPendingUp_[s] = false;
+            if (tr.active) {
+                if (activeTtMode_ == TargetTriggerMode::TAP && tr.candidate && !tr.movedTooFar) {
+                    if (std::hypot(lx - tr.downX, ly - tr.downY) <= activeTtSlopPx_ &&
+                        (nowNs - engLastTapTriggerNs_) >= kTargetTapDebounceNs) {
+                        engLastTapTriggerNs_ = nowNs;
+                        emitTargetTriggerEvent(TargetTriggerEvent::TAP);
+                    }
+                }
+                if (tr.holdFired) {
+                    emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
+                }
+                if (tr.candidate) {
+                    timerDirty = true;
+                }
+            }
+            tr = TriggerSlotTrack{};
+        }
+    }
+
+    if (timerDirty) {
+        rearmTimerFd();
+    }
+}
+
+void TouchMuxEngine::stepEngineTargetLongPress(int64_t nowNs) {
+    if (activeTtMode_ != TargetTriggerMode::LONG_PRESS || activeTtZones_.empty()) {
+        return;
+    }
+    for (int s = 0; s < kMaxPhysSlots; ++s) {
+        auto& tr = engTriggerSlots_[s];
+        if (!tr.active || !tr.candidate || tr.movedTooFar || tr.holdFired) {
+            continue;
+        }
+        if (nowNs >= tr.downNs + kTargetLongPressNs) {
+            if (activeClickingRunning_ || activeRawMacroRunning_) {
+                tr.candidate = false;
+                continue;
+            }
+            tr.holdFired = true;
+            tr.suppressed = true;
+            int u = physToMuxSlot_[s];
+            if (u >= 0) {
+                emitSlotUp(u);
+                physToMuxSlot_[s] = -1;
+                emitSyncAndFlush();
+            }
+            emitTargetTriggerEvent(TargetTriggerEvent::HOLD_START);
+            break;
+        }
+    }
+}
+
+void TouchMuxEngine::stopTouchTriggerWatchThread() {
+    std::lock_guard<std::mutex> lifeLock(ttWatchLifecycleMutex_);
+    if (ttWatchRunning_.exchange(false)) {
+        if (ttWatchWakeFd_ >= 0) {
+            uint64_t val = 1;
+            ssize_t ignored = write(ttWatchWakeFd_, &val, sizeof(val));
+            (void)ignored;
+        }
+    }
+    if (ttWatchThread_.joinable()) {
+        ttWatchThread_.join();
+    }
+    if (ttWatchWakeFd_ >= 0) {
+        close(ttWatchWakeFd_);
+        ttWatchWakeFd_ = -1;
+    }
+}
+
+void TouchMuxEngine::syncTouchTriggerWatcherState() {
+    std::lock_guard<std::mutex> lifeLock(ttWatchLifecycleMutex_);
+    bool shouldRun = false;
+    {
+        std::lock_guard<std::mutex> cfgLock(targetTriggerMutex_);
+        shouldRun = (cfgTtMode_ != TargetTriggerMode::OFF) &&
+                    !cfgTtZones_.empty() &&
+                    !threadRunning_.load() &&
+                    !recRunning_.load();
+    }
+
+    if (!shouldRun) {
+        if (ttWatchRunning_.exchange(false)) {
+            if (ttWatchWakeFd_ >= 0) {
+                uint64_t val = 1;
+                ssize_t ignored = write(ttWatchWakeFd_, &val, sizeof(val));
+                (void)ignored;
+            }
+        }
+        if (ttWatchThread_.joinable()) {
+            ttWatchThread_.join();
+        }
+        if (ttWatchWakeFd_ >= 0) {
+            close(ttWatchWakeFd_);
+            ttWatchWakeFd_ = -1;
+        }
+        return;
+    }
+
+    if (ttWatchRunning_.load()) {
+        if (ttWatchWakeFd_ >= 0) {
+            uint64_t val = 1;
+            ssize_t ignored = write(ttWatchWakeFd_, &val, sizeof(val));
+            (void)ignored;
+        }
+        return;
+    }
+
+    if (ttWatchThread_.joinable()) {
+        ttWatchThread_.join();
+    }
+    if (ttWatchWakeFd_ >= 0) {
+        close(ttWatchWakeFd_);
+        ttWatchWakeFd_ = -1;
+    }
+    ttWatchWakeFd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (ttWatchWakeFd_ < 0) {
+        return;
+    }
+    ttWatchRunning_.store(true);
+    ttWatchThread_ = std::thread(&TouchMuxEngine::touchTriggerWatchLoop, this);
+}
+
+void TouchMuxEngine::touchTriggerWatchLoop() {
+    DeviceDesc desc{};
+    int err = 0;
+    if (!findBestTouchscreen(desc, err)) {
+        ttWatchRunning_.store(false);
+        return;
+    }
+    int fd = open(desc.path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        ttWatchRunning_.store(false);
+        return;
+    }
+
+    struct input_event drainBuf[64];
+    while (read(fd, drainBuf, sizeof(drainBuf)) > 0) {
+    }
+
+    int curSlot = 0;
+    if (desc.isTypeB) {
+        struct input_absinfo absSlotNow {};
+        if (ioctl(fd, EVIOCGABS(ABS_MT_SLOT), &absSlotNow) == 0) {
+            curSlot = std::clamp(absSlotNow.value, 0, kMaxPhysSlots - 1);
+        }
+    }
+
+    TriggerSlotTrack slots[kMaxPhysSlots]{};
+    bool pendingDown[kMaxPhysSlots]{};
+    bool pendingUp[kMaxPhysSlots]{};
+    int32_t rawX[kMaxPhysSlots]{};
+    int32_t rawY[kMaxPhysSlots]{};
+    const int32_t midX = (desc.absX.minimum + desc.absX.maximum) / 2;
+    const int32_t midY = (desc.absY.minimum + desc.absY.maximum) / 2;
+    for (int s = 0; s < kMaxPhysSlots; ++s) {
+        rawX[s] = midX;
+        rawY[s] = midY;
+    }
+
+    TargetTriggerMode mode = TargetTriggerMode::OFF;
+    std::vector<TargetTriggerZone> zones;
+    int dispW = 1080, dispH = 2400, rot = 0;
+    int exL = 0, exT = 0, exR = 0, exB = 0;
+    float slopPx = 48.0f;
+    uint64_t loadedVer = 0;
+    int64_t lastTapNs = 0;
+
+    auto reloadCfg = [&]() {
+        std::lock_guard<std::mutex> lock(targetTriggerMutex_);
+        if (cfgTtVersion_ == loadedVer) return;
+        const bool modeChanged = (cfgTtMode_ != mode);
+        mode = cfgTtMode_;
+        zones = cfgTtZones_;
+        dispW = cfgTtDisplayW_;
+        dispH = cfgTtDisplayH_;
+        rot = cfgTtRotation_;
+        exL = cfgTtExL_;
+        exT = cfgTtExT_;
+        exR = cfgTtExR_;
+        exB = cfgTtExB_;
+        slopPx = cfgTtSlopPx_;
+        loadedVer = cfgTtVersion_;
+        if (mode == TargetTriggerMode::OFF || zones.empty() || modeChanged) {
+            for (int s = 0; s < kMaxPhysSlots; ++s) {
+                if (slots[s].holdFired) {
+                    emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
+                }
+                slots[s] = TriggerSlotTrack{};
+                pendingDown[s] = false;
+                pendingUp[s] = false;
+            }
+        }
+    };
+    reloadCfg();
+
+    auto insideExclude = [&](float x, float y) -> bool {
+        if (exR <= exL || exB <= exT) return false;
+        return x >= static_cast<float>(exL - 8) &&
+               x <= static_cast<float>(exR + 8) &&
+               y >= static_cast<float>(exT - 8) &&
+               y <= static_cast<float>(exB + 8);
+    };
+    auto insideAnyZone = [&](float x, float y) -> bool {
+        for (const auto& z : zones) {
+            const float dx = x - z.x;
+            const float dy = y - z.y;
+            if ((dx * dx + dy * dy) <= (z.radiusPx * z.radiusPx)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto anyHoldActive = [&]() -> bool {
+        for (int k = 0; k < kMaxPhysSlots; ++k) {
+            if (slots[k].active && slots[k].holdFired) return true;
+        }
+        return false;
+    };
+
+    auto commitSyn = [&](int64_t nowNs) {
+        if (mode == TargetTriggerMode::OFF || zones.empty()) {
+            for (int s = 0; s < kMaxPhysSlots; ++s) {
+                pendingDown[s] = false;
+                pendingUp[s] = false;
+            }
+            return;
+        }
+        for (int s = 0; s < kMaxPhysSlots; ++s) {
+            auto& tr = slots[s];
+            float lx = 0.0f, ly = 0.0f;
+            rawToLogicalDesc(desc, dispW, dispH, rot, rawX[s], rawY[s], lx, ly);
+
+            if (pendingDown[s]) {
+                pendingDown[s] = false;
+                if (tr.holdFired) {
+                    emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
+                }
+                tr = TriggerSlotTrack{};
+                tr.active = true;
+                tr.downX = lx;
+                tr.downY = ly;
+                tr.curX = lx;
+                tr.curY = ly;
+                tr.downNs = nowNs;
+                if (!insideExclude(lx, ly) && insideAnyZone(lx, ly)) {
+                    tr.candidate = (mode != TargetTriggerMode::LONG_PRESS) || !anyHoldActive();
+                }
+            } else if (tr.active && !pendingUp[s]) {
+                tr.curX = lx;
+                tr.curY = ly;
+                if (tr.candidate && !tr.holdFired && !tr.movedTooFar) {
+                    if (std::hypot(tr.curX - tr.downX, tr.curY - tr.downY) > slopPx) {
+                        tr.movedTooFar = true;
+                    }
+                }
+            }
+
+            if (pendingUp[s]) {
+                pendingUp[s] = false;
+                if (tr.active) {
+                    if (mode == TargetTriggerMode::TAP && tr.candidate && !tr.movedTooFar) {
+                        if (std::hypot(lx - tr.downX, ly - tr.downY) <= slopPx &&
+                            (nowNs - lastTapNs) >= kTargetTapDebounceNs) {
+                            lastTapNs = nowNs;
+                            emitTargetTriggerEvent(TargetTriggerEvent::TAP);
+                        }
+                    }
+                    if (tr.holdFired) {
+                        emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
+                    }
+                }
+                tr = TriggerSlotTrack{};
+            }
+        }
+    };
+
+    TypeAContact taCur{};
+    std::vector<TypeAContact> taContacts;
+    auto commitTypeA = [&](int64_t nowNs) {
+        bool usedSlot[kMaxPhysSlots]{};
+        int assigned[16]{};
+        const size_t cnt = std::min<size_t>(taContacts.size(), 16);
+        for (size_t c = 0; c < cnt; ++c) {
+            assigned[c] = -1;
+            int bestS = -1;
+            int64_t bestD2 = std::numeric_limits<int64_t>::max();
+            for (int s = 0; s < kMaxPhysSlots; ++s) {
+                if (usedSlot[s] || !slots[s].active) continue;
+                int64_t dx = static_cast<int64_t>(taContacts[c].x) - rawX[s];
+                int64_t dy = static_cast<int64_t>(taContacts[c].y) - rawY[s];
+                int64_t d2 = dx * dx + dy * dy;
+                if (d2 < bestD2) {
+                    bestD2 = d2;
+                    bestS = s;
+                }
+            }
+            if (bestS >= 0) {
+                usedSlot[bestS] = true;
+                assigned[c] = bestS;
+            }
+        }
+        for (int s = 0; s < kMaxPhysSlots; ++s) {
+            if (slots[s].active && !usedSlot[s]) pendingUp[s] = true;
+        }
+        for (size_t c = 0; c < cnt; ++c) {
+            int s = assigned[c];
+            if (s < 0) {
+                for (int k = 0; k < kMaxPhysSlots; ++k) {
+                    if (!slots[k].active && !usedSlot[k]) {
+                        s = k;
+                        usedSlot[k] = true;
+                        pendingDown[s] = true;
+                        break;
+                    }
+                }
+            }
+            if (s >= 0) {
+                rawX[s] = taContacts[c].x;
+                rawY[s] = taContacts[c].y;
+            }
+        }
+        taContacts.clear();
+        taCur = TypeAContact{};
+        commitSyn(nowNs);
+    };
+
+    struct pollfd pfds[2] = {
+        {ttWatchWakeFd_, POLLIN, 0},
+        {fd, POLLIN, 0}
+    };
+    struct input_event evBuf[64];
+
+    LOGI("touchTriggerWatchLoop started on %s (non-grabbed)", desc.path.c_str());
+
+    while (ttWatchRunning_.load()) {
+        int timeoutMs = -1;
+        if (mode == TargetTriggerMode::LONG_PRESS && !zones.empty()) {
+            const int64_t nowCheck = nowMonotonicNs();
+            for (int s = 0; s < kMaxPhysSlots; ++s) {
+                const auto& tr = slots[s];
+                if (tr.active && tr.candidate && !tr.movedTooFar && !tr.holdFired) {
+                    int64_t remMs = (tr.downNs + kTargetLongPressNs - nowCheck + 999999LL) / 1000000LL;
+                    int clamped = static_cast<int>(std::clamp<int64_t>(remMs, 1, 50));
+                    if (timeoutMs < 0 || clamped < timeoutMs) {
+                        timeoutMs = clamped;
+                    }
+                }
+            }
+        }
+
+        int rc = poll(pfds, 2, timeoutMs);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        if (pfds[0].revents & POLLIN) {
+            uint64_t drained = 0;
+            while (read(ttWatchWakeFd_, &drained, sizeof(drained)) > 0) {}
+            if (!ttWatchRunning_.load()) break;
+            reloadCfg();
+            if (mode == TargetTriggerMode::OFF || zones.empty()) break;
+        }
+
+        if (pfds[1].revents & POLLIN) {
+            while (ttWatchRunning_.load()) {
+                ssize_t n = read(fd, evBuf, sizeof(evBuf));
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    if (errno == EINTR) continue;
+                    ttWatchRunning_.store(false);
+                    break;
+                }
+                if (n == 0) break;
+
+                const size_t count = static_cast<size_t>(n) / sizeof(struct input_event);
+                for (size_t i = 0; i < count; ++i) {
+                    const auto& ev = evBuf[i];
+                    if (!desc.isTypeB) {
+                        if (ev.type == EV_ABS) {
+                            if (ev.code == ABS_MT_POSITION_X) {
+                                taCur.hasX = true;
+                                taCur.x = ev.value;
+                            } else if (ev.code == ABS_MT_POSITION_Y) {
+                                taCur.hasY = true;
+                                taCur.y = ev.value;
+                            }
+                        } else if (ev.type == EV_SYN && ev.code == SYN_MT_REPORT) {
+                            if (taCur.hasX || taCur.hasY) taContacts.push_back(taCur);
+                            taCur = TypeAContact{};
+                        } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+                            commitTypeA(nowMonotonicNs());
+                        } else if (ev.type == EV_SYN && ev.code == SYN_DROPPED) {
+                            taContacts.clear();
+                            taCur = TypeAContact{};
+                            commitTypeA(nowMonotonicNs());
+                        }
+                        continue;
+                    }
+
+                    if (ev.type == EV_SYN) {
+                        if (ev.code == SYN_REPORT) {
+                            commitSyn(nowMonotonicNs());
+                        } else if (ev.code == SYN_DROPPED) {
+                            for (int s = 0; s < kMaxPhysSlots; ++s) {
+                                if (slots[s].active) pendingUp[s] = true;
+                            }
+                            commitSyn(nowMonotonicNs());
+                        }
+                    } else if (ev.type == EV_ABS) {
+                        if (ev.code == ABS_MT_SLOT) {
+                            curSlot = std::clamp(ev.value, 0, kMaxPhysSlots - 1);
+                        } else if (ev.code == ABS_MT_TRACKING_ID) {
+                            if (ev.value >= 0) {
+                                pendingDown[curSlot] = true;
+                                pendingUp[curSlot] = false;
+                            } else if (slots[curSlot].active || pendingDown[curSlot]) {
+                                pendingUp[curSlot] = true;
+                            }
+                        } else if (ev.code == ABS_MT_POSITION_X) {
+                            rawX[curSlot] = ev.value;
+                            if (!slots[curSlot].active && !pendingDown[curSlot]) {
+                                pendingDown[curSlot] = true;
+                            }
+                        } else if (ev.code == ABS_MT_POSITION_Y) {
+                            rawY[curSlot] = ev.value;
+                            if (!slots[curSlot].active && !pendingDown[curSlot]) {
+                                pendingDown[curSlot] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (mode == TargetTriggerMode::LONG_PRESS && !zones.empty()) {
+            const int64_t nowNs = nowMonotonicNs();
+            for (int s = 0; s < kMaxPhysSlots; ++s) {
+                auto& tr = slots[s];
+                if (tr.active && tr.candidate && !tr.movedTooFar && !tr.holdFired &&
+                    nowNs >= tr.downNs + kTargetLongPressNs) {
+                    tr.holdFired = true;
+                    emitTargetTriggerEvent(TargetTriggerEvent::HOLD_START);
+                    break;
+                }
+            }
+        }
+    }
+
+    close(fd);
+    ttWatchRunning_.store(false);
+    LOGI("touchTriggerWatchLoop exited.");
 }
 
 void TouchMuxEngine::ensureKeyWatchThread() {
@@ -1085,6 +1720,8 @@ int TouchMuxEngine::initAndGrab(int displayW,
         }
     }
 
+    stopTouchTriggerWatchThread();
+
     if (workerThread_.joinable()) {
         workerThread_.join();
     }
@@ -1292,6 +1929,25 @@ int TouchMuxEngine::initAndGrab(int displayW,
     activeBackend_.store(static_cast<int32_t>(chosenBackend));
 
     physCurrentSlot_ = 0;
+    if (desc.isTypeB) {
+        struct input_absinfo absSlotNow {};
+        if (ioctl(physFd_, EVIOCGABS(ABS_MT_SLOT), &absSlotNow) == 0) {
+            physCurrentSlot_ = std::clamp(absSlotNow.value, 0, kMaxPhysSlots - 1);
+        }
+    }
+    const int32_t initMidX = (desc.absX.minimum + desc.absX.maximum) / 2;
+    const int32_t initMidY = (desc.absY.minimum + desc.absY.maximum) / 2;
+    for (int s = 0; s < kMaxPhysSlots; ++s) {
+        engTriggerSlots_[s] = TriggerSlotTrack{};
+        engPhysPendingDown_[s] = false;
+        engPhysPendingUp_[s] = false;
+        engPhysRawX_[s] = initMidX;
+        engPhysRawY_[s] = initMidY;
+    }
+    activeTtMode_ = TargetTriggerMode::OFF;
+    activeTtZones_.clear();
+    activeTtVersion_ = 0;
+    engLastTapTriggerNs_ = 0;
     std::fill(std::begin(physToMuxSlot_), std::end(physToMuxSlot_), -1);
     for (auto& s : muxSlots_) {
         s = MuxSlotState{};
@@ -1371,6 +2027,7 @@ void TouchMuxEngine::shutdown() {
     selfCheckPending_.store(false);
     activeBackend_.store(static_cast<int32_t>(MuxBackendMode::NONE));
     engineState_.store(static_cast<int32_t>(EngineState::IDLE));
+    syncTouchTriggerWatcherState();
 }
 
 void TouchMuxEngine::setDisplayMetrics(int displayW, int displayH, int rotation) {
@@ -2246,6 +2903,8 @@ void TouchMuxEngine::handleWakeSignal() {
     while (read(wakeFd_, &drained, sizeof(drained)) > 0) {
     }
 
+    syncEngineTargetTriggerConfig();
+
     std::vector<NativeClickTarget> nextTargets;
     std::vector<NativeRawMacroEvent> nextRawEvents;
     std::vector<RpcCommand> pendingRpc;
@@ -2569,9 +3228,54 @@ void TouchMuxEngine::handleTypeAFrameEnd() {
         int32_t prs = c.pressure > 0 ? c.pressure : muxSlots_[slot].pressure;
         emitSlotMove(slot, rx, ry, maj, prs, false, 0.0f, 0.0f);
     }
+    if (activeTtMode_ != TargetTriggerMode::OFF && !activeTtZones_.empty()) {
+        bool usedSlot[kMaxPhysSlots]{};
+        int assigned[16]{};
+        const size_t cnt = std::min<size_t>(typeAFrameContacts_.size(), 16);
+        for (size_t c = 0; c < cnt; ++c) {
+            assigned[c] = -1;
+            int bestS = -1;
+            int64_t bestD2 = std::numeric_limits<int64_t>::max();
+            for (int s = 0; s < kMaxPhysSlots; ++s) {
+                if (usedSlot[s] || !engTriggerSlots_[s].active) continue;
+                int64_t dx = static_cast<int64_t>(typeAFrameContacts_[c].x) - engPhysRawX_[s];
+                int64_t dy = static_cast<int64_t>(typeAFrameContacts_[c].y) - engPhysRawY_[s];
+                int64_t d2 = dx * dx + dy * dy;
+                if (d2 < bestD2) {
+                    bestD2 = d2;
+                    bestS = s;
+                }
+            }
+            if (bestS >= 0) {
+                usedSlot[bestS] = true;
+                assigned[c] = bestS;
+            }
+        }
+        for (int s = 0; s < kMaxPhysSlots; ++s) {
+            if (engTriggerSlots_[s].active && !usedSlot[s]) engPhysPendingUp_[s] = true;
+        }
+        for (size_t c = 0; c < cnt; ++c) {
+            int s = assigned[c];
+            if (s < 0) {
+                for (int k = 0; k < kMaxPhysSlots; ++k) {
+                    if (!engTriggerSlots_[k].active && !usedSlot[k]) {
+                        s = k;
+                        usedSlot[k] = true;
+                        engPhysPendingDown_[s] = true;
+                        break;
+                    }
+                }
+            }
+            if (s >= 0) {
+                if (typeAFrameContacts_[c].hasX) engPhysRawX_[s] = typeAFrameContacts_[c].x;
+                if (typeAFrameContacts_[c].hasY) engPhysRawY_[s] = typeAFrameContacts_[c].y;
+            }
+        }
+    }
     typeAFrameContacts_.clear();
     typeACurrent_ = TypeAContact{};
     emitSyncAndFlush();
+    processEngineTriggerSynFrame(nowMonotonicNs());
 }
 
 void TouchMuxEngine::handlePhysicalEvents() {
@@ -2622,6 +3326,7 @@ void TouchMuxEngine::handlePhysicalEvents() {
             if (ev.type == EV_SYN) {
                 if (ev.code == SYN_REPORT) {
                     emitSyncAndFlush();
+                    processEngineTriggerSynFrame(nowMonotonicNs());
                 } else if (ev.code == SYN_DROPPED) {
                     LOGW("SYN_DROPPED on physical touchscreen; resetting physical slots.");
                     for (int p = 0; p < kMaxPhysSlots; ++p) {
@@ -2630,8 +3335,12 @@ void TouchMuxEngine::handlePhysicalEvents() {
                             emitSlotUp(u);
                             physToMuxSlot_[p] = -1;
                         }
+                        if (engTriggerSlots_[p].active) {
+                            engPhysPendingUp_[p] = true;
+                        }
                     }
                     emitSyncAndFlush();
+                    processEngineTriggerSynFrame(nowMonotonicNs());
                 }
                 continue;
             }
@@ -2645,6 +3354,9 @@ void TouchMuxEngine::handlePhysicalEvents() {
                     physCurrentSlot_ = std::clamp(ev.value, 0, kMaxPhysSlots - 1);
                 } else if (ev.code == ABS_MT_TRACKING_ID) {
                     if (ev.value >= 0) {
+                        engPhysPendingDown_[physCurrentSlot_] = true;
+                        engPhysPendingUp_[physCurrentSlot_] = false;
+                        engTriggerSlots_[physCurrentSlot_].suppressed = false;
                         int u = physToMuxSlot_[physCurrentSlot_];
                         if (u < 0) {
                             u = allocatePhysicalSlot(physCurrentSlot_);
@@ -2659,6 +3371,9 @@ void TouchMuxEngine::handlePhysicalEvents() {
                             hybridDirty_ = true;
                         }
                     } else {
+                        if (engTriggerSlots_[physCurrentSlot_].active || engPhysPendingDown_[physCurrentSlot_]) {
+                            engPhysPendingUp_[physCurrentSlot_] = true;
+                        }
                         int u = physToMuxSlot_[physCurrentSlot_];
                         if (u >= 0) {
                             emitSlotUp(u);
@@ -2666,6 +3381,19 @@ void TouchMuxEngine::handlePhysicalEvents() {
                         }
                     }
                 } else {
+                    if (ev.code == ABS_MT_POSITION_X) {
+                        engPhysRawX_[physCurrentSlot_] = ev.value;
+                    } else if (ev.code == ABS_MT_POSITION_Y) {
+                        engPhysRawY_[physCurrentSlot_] = ev.value;
+                    }
+                    if (engTriggerSlots_[physCurrentSlot_].suppressed) {
+                        continue;
+                    }
+                    if (!engTriggerSlots_[physCurrentSlot_].active &&
+                        !engPhysPendingDown_[physCurrentSlot_] &&
+                        (ev.code == ABS_MT_POSITION_X || ev.code == ABS_MT_POSITION_Y)) {
+                        engPhysPendingDown_[physCurrentSlot_] = true;
+                    }
                     int u = physToMuxSlot_[physCurrentSlot_];
                     if (u < 0 && (ev.code == ABS_MT_POSITION_X || ev.code == ABS_MT_POSITION_Y)) {
                         u = allocatePhysicalSlot(physCurrentSlot_);
@@ -3251,6 +3979,7 @@ void TouchMuxEngine::handleTimerEvents() {
         return;
     }
 
+    stepEngineTargetLongPress(now);
     stepRpcGestures(now);
     stepVirtualTargets(now);
     stepRawMacro(now);
@@ -3270,6 +3999,14 @@ void TouchMuxEngine::rearmTimerFd() {
 
     if (selfCheckPending_.load() && selfCheckDeadlineNs_ > 0) {
         considerDeadline(selfCheckDeadlineNs_);
+    }
+    if (activeTtMode_ == TargetTriggerMode::LONG_PRESS && !activeTtZones_.empty()) {
+        for (int s = 0; s < kMaxPhysSlots; ++s) {
+            const auto& tr = engTriggerSlots_[s];
+            if (tr.active && tr.candidate && !tr.movedTooFar && !tr.holdFired) {
+                considerDeadline(tr.downNs + kTargetLongPressNs);
+            }
+        }
     }
     for (const auto& rg : rpcGestures_) {
         if (!rg.isHold) {
@@ -3377,6 +4114,7 @@ bool TouchMuxEngine::startRecording(int displayW,
         LOGW("startRecording called while active TouchMux session running; shutting down session first.");
         shutdown();
     }
+    stopTouchTriggerWatchThread();
 
     // Reclaim any stale :touchmux daemon (e.g. after app update or Shizuku rebind) that could still
     // hold EVIOCGRAB on the physical touchscreen and starve non-grabbed O_RDONLY listeners.
@@ -3529,6 +4267,7 @@ std::string TouchMuxEngine::stopRecording(bool cancel) {
     }
 
     if (cancel || !hadStart || snapshot.empty()) {
+        syncTouchTriggerWatcherState();
         return "";
     }
 
@@ -3556,6 +4295,7 @@ std::string TouchMuxEngine::stopRecording(bool cancel) {
         oss << "]}";
     }
     oss << "]}";
+    syncTouchTriggerWatcherState();
     return oss.str();
 }
 

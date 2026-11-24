@@ -58,6 +58,7 @@ struct JniCallbackRefs {
     jmethodID midEmergencyUngrab = nullptr;
     jmethodID midSlotChanged = nullptr;
     jmethodID midClickingCompleted = nullptr;
+    jmethodID midTargetTriggerEvent = nullptr;
 } gCbRefs;
 
 void releaseGlobalRefsLocked(JNIEnv* env) {
@@ -95,6 +96,7 @@ void releaseGlobalRefsLocked(JNIEnv* env) {
     gCbRefs.midEmergencyUngrab = nullptr;
     gCbRefs.midSlotChanged = nullptr;
     gCbRefs.midClickingCompleted = nullptr;
+    gCbRefs.midTargetTriggerEvent = nullptr;
 }
 
 touchmux::TouchMuxEngine& getOrCreateEngine() {
@@ -200,6 +202,7 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeRegisterCallbac
         gCbRefs.midEmergencyUngrab = env->GetMethodID(cls, "onNativeEmergencyUngrab", "()V");
         gCbRefs.midSlotChanged = env->GetMethodID(cls, "onNativeSlotStatesChanged", "()V");
         gCbRefs.midClickingCompleted = env->GetMethodID(cls, "onNativeClickingCompleted", "()V");
+        gCbRefs.midTargetTriggerEvent = env->GetMethodID(cls, "onNativeTargetTriggerEvent", "(I)V");
         env->DeleteLocalRef(cls);
     }
 
@@ -283,6 +286,21 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeRegisterCallbac
         }
     };
 
+    cbs.onTargetTriggerEvent = [](int32_t eventType) {
+        JNIEnv* cbEnv = getAttachedJniEnv();
+        if (cbEnv == nullptr) return;
+        std::lock_guard<std::mutex> lock(gCbRefs.mutex);
+        if (gCbRefs.serviceObj == nullptr || gCbRefs.midTargetTriggerEvent == nullptr) return;
+        cbEnv->CallVoidMethod(
+            gCbRefs.serviceObj,
+            gCbRefs.midTargetTriggerEvent,
+            static_cast<jint>(eventType)
+        );
+        if (cbEnv->ExceptionCheck()) {
+            cbEnv->ExceptionClear();
+        }
+    };
+
     engine.setCallbacks(std::move(cbs));
 }
 
@@ -292,6 +310,56 @@ Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeSetVolumeKeyEna
     jobject /* thiz */,
     jboolean enabled) {
     getOrCreateEngine().setVolumeKeyControlEnabled(enabled == JNI_TRUE);
+}
+
+JNIEXPORT void JNICALL
+Java_com_zerointerrupt_clicker_shizuku_TouchMuxUserService_nativeSetTargetTriggerConfig(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jint mode,
+    jfloatArray zoneXs,
+    jfloatArray zoneYs,
+    jfloatArray zoneRadii,
+    jint displayW,
+    jint displayH,
+    jint rotation,
+    jint excludeLeft,
+    jint excludeTop,
+    jint excludeRight,
+    jint excludeBottom,
+    jfloat touchSlopPx) {
+    const jsize count = (zoneXs && zoneYs && zoneRadii) ? env->GetArrayLength(zoneXs) : 0;
+    std::vector<touchmux::TargetTriggerZone> zones;
+    if (count > 0 &&
+        env->GetArrayLength(zoneYs) == count &&
+        env->GetArrayLength(zoneRadii) == count) {
+        jfloat* xPtr = env->GetFloatArrayElements(zoneXs, nullptr);
+        jfloat* yPtr = env->GetFloatArrayElements(zoneYs, nullptr);
+        jfloat* rPtr = env->GetFloatArrayElements(zoneRadii, nullptr);
+        zones.reserve(static_cast<size_t>(count));
+        for (jsize i = 0; i < count; ++i) {
+            touchmux::TargetTriggerZone z;
+            z.x = xPtr[i];
+            z.y = yPtr[i];
+            z.radiusPx = rPtr[i];
+            zones.push_back(z);
+        }
+        env->ReleaseFloatArrayElements(zoneXs, xPtr, JNI_ABORT);
+        env->ReleaseFloatArrayElements(zoneYs, yPtr, JNI_ABORT);
+        env->ReleaseFloatArrayElements(zoneRadii, rPtr, JNI_ABORT);
+    }
+    getOrCreateEngine().setTargetTriggerConfig(
+        static_cast<int32_t>(mode),
+        zones,
+        displayW,
+        displayH,
+        rotation,
+        excludeLeft,
+        excludeTop,
+        excludeRight,
+        excludeBottom,
+        touchSlopPx
+    );
 }
 
 JNIEXPORT jint JNICALL

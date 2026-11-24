@@ -5,4 +5,5 @@ interface ITouchMuxCallback {
     oneway void onEmergencyUngrabTriggered();
     oneway void onSlotStatesChanged(in int[] slots);
     oneway void onClickingCompleted();
+    oneway void onTargetTriggerEvent(int eventType);
 }

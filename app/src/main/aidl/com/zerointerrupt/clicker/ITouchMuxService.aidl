@@ -38,6 +38,20 @@ interface ITouchMuxService {
     int[] getSlotStates();
     void setPreferredBackend(int preferredBackend);
     void setVolumeKeyControlEnabled(boolean enabled);
+    void setTargetTriggerConfig(
+        int mode,
+        in float[] zoneXs,
+        in float[] zoneYs,
+        in float[] zoneRadii,
+        int displayWidth,
+        int displayHeight,
+        int rotation,
+        int excludeLeft,
+        int excludeTop,
+        int excludeRight,
+        int excludeBottom,
+        float touchSlopPx
+    );
     void registerCallback(ITouchMuxCallback callback);
     void injectRpcTap(float x, float y, long durationMs);
     void injectRpcSwipe(float x1, float y1, float x2, float y2, long durationMs);

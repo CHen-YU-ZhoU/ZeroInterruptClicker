@@ -27,6 +27,7 @@ import android.util.TypedValue
 import android.view.Display
 import android.view.Gravity
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewTreeObserver
 import android.view.WindowManager
 import android.view.animation.LinearInterpolator
@@ -46,6 +47,7 @@ import com.zerointerrupt.clicker.model.ClickConfigStore
 import com.zerointerrupt.clicker.model.ClickGlobalSettings
 import com.zerointerrupt.clicker.model.ClickTarget
 import com.zerointerrupt.clicker.model.ExecutionMode
+import com.zerointerrupt.clicker.shizuku.ShizukuConnectionState
 import com.zerointerrupt.clicker.shizuku.ShizukuController
 import com.zerointerrupt.clicker.shizuku.TouchMuxUserService
 import com.zerointerrupt.clicker.ui.MainActivity
@@ -59,6 +61,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
@@ -166,12 +170,16 @@ class OverlayService : Service(), ControlBarView.Listener {
     private var lastAutoLockOnStart: Boolean = true
     private var showMacroTrajectoriesPref: Boolean = true
     private var isClicking: Boolean = false
+    private var clickingStartedByTargetHold: Boolean = false
     private var runSessionSeq: Long = 0L
     private var pendingAutoLockStartRunnable: Runnable? = null
     private var engineMode: Int = TouchMuxUserService.MODE_IDLE
+    private val clickEngineMutex = Mutex()
 
     private var engineCollectJob: Job? = null
+    private var connectionCollectJob: Job? = null
     private var volumeToggleJob: Job? = null
+    private var targetTriggerJob: Job? = null
     private var emergencyUngrabJob: Job? = null
     private var clickingCompletedJob: Job? = null
 
@@ -207,6 +215,14 @@ class OverlayService : Service(), ControlBarView.Listener {
             }
         }
 
+        connectionCollectJob = serviceScope.launch {
+            ShizukuController.connectionState.collect { state ->
+                if (state == ShizukuConnectionState.CONNECTED && normalOverlayAttached) {
+                    syncTargetTriggerConfig(preArmNative = true)
+                }
+            }
+        }
+
         volumeToggleJob = serviceScope.launch {
             ShizukuController.volumeKeyToggleEvents.collect {
                 if (ClickConfigStore.loadSettings(this@OverlayService).volumeKeyToggleEnabled) {
@@ -215,9 +231,16 @@ class OverlayService : Service(), ControlBarView.Listener {
             }
         }
 
+        targetTriggerJob = serviceScope.launch {
+            ShizukuController.targetTriggerEvents.collect { eventType ->
+                handleTargetTriggerEvent(eventType)
+            }
+        }
+
         emergencyUngrabJob = serviceScope.launch {
             ShizukuController.emergencyUngrabEvents.collect {
                 isClicking = false
+                clickingStartedByTargetHold = false
                 OverlayStateHub.setClickingRunning(this@OverlayService, false)
                 applyLockMode(false)
                 refreshAnchorVisuals()
@@ -234,6 +257,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             ShizukuController.clickingCompletedEvents.collect {
                 if (isClicking) {
                     isClicking = false
+                    clickingStartedByTargetHold = false
                     OverlayStateHub.setClickingRunning(this@OverlayService, false)
                     refreshAnchorVisuals()
                     refreshControlBarState()
@@ -325,6 +349,7 @@ class OverlayService : Service(), ControlBarView.Listener {
                     } else {
                         cancelAutoCollapse()
                     }
+                    syncTargetTriggerConfig(preArmNative = true)
                 } else {
                     lastAutoLockOnStart = settings.autoLockOnStart
                 }
@@ -358,9 +383,12 @@ class OverlayService : Service(), ControlBarView.Listener {
         cancelBarSprings()
         displayManager.unregisterDisplayListener(displayListener)
         engineCollectJob?.cancel()
+        connectionCollectJob?.cancel()
         volumeToggleJob?.cancel()
+        targetTriggerJob?.cancel()
         emergencyUngrabJob?.cancel()
         clickingCompletedJob?.cancel()
+        ShizukuController.clearTargetTriggerConfigAsync()
         stopClickingInternal()
         dismissTunePanel()
         removeAllAnchorWindows()
@@ -588,6 +616,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         syncSwipeConnectorLayer()
         attachAllAnchors()
         refreshControlBarState()
+        syncTargetTriggerConfig()
     }
 
     private fun persistCurrentTargets() {
@@ -906,6 +935,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             }
             swapToNewControlBarWindow(restingBar, restingLp) {
                 ClickConfigStore.saveControlBarCollapseState(this@OverlayService, true, dockRight)
+                syncTargetTriggerConfig()
             }
         } else {
             currentMorphProgress = 1f
@@ -925,6 +955,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             swapToNewControlBarWindow(restingBar, restingLp) {
                 ClickConfigStore.saveControlBarCollapseState(this@OverlayService, false, dockRight)
                 ClickConfigStore.saveControlBarPosition(this@OverlayService, restingLp.x, restingLp.y)
+                syncTargetTriggerConfig()
                 scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
             }
         }
@@ -1166,6 +1197,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         selectedTargetId = targetId
         persistCurrentTargets()
         refreshAnchorVisuals()
+        syncTargetTriggerConfig()
         if (isClicking) {
             pushTargetsToServiceAsync()
         }
@@ -1261,6 +1293,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         refreshLockedAlphasIfNeeded()
         refreshAnchorVisuals()
         refreshControlBarState()
+        syncTargetTriggerConfig(preArmNative = locked)
     }
 
     private fun scheduleAutoCollapse(delayMs: Long) {
@@ -1521,6 +1554,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         bar.syncWindowPosition(lp.x, lp.y)
         windowManager.updateViewLayout(bar, lp)
         animateBarToolsUnfold(bar)
+        syncTargetTriggerConfig()
         scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
     }
 
@@ -1585,6 +1619,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             stopClickingInternal()
             return
         }
+        clickingStartedByTargetHold = false
         if (!hasRunnablePayload()) {
             Toast.makeText(
                 this,
@@ -1632,22 +1667,27 @@ class OverlayService : Service(), ControlBarView.Listener {
         refreshControlBarState()
 
         serviceScope.launch(Dispatchers.IO) {
-            val mode = if (isRawSnapshot) {
-                ShizukuController.startRawMacro(
-                    rawMacroJson = rawJsonSnapshot,
-                    loopCount = loopSnapshot
-                )
-            } else {
-                ShizukuController.startClicking(
-                    targets = snapshot,
-                    executionMode = modeSnapshot,
-                    presetLoopCount = loopSnapshot
-                )
+            val mode = clickEngineMutex.withLock {
+                if (expectedSeq != runSessionSeq) return@withLock RUN_CANCELLED_SENTINEL
+                if (isRawSnapshot) {
+                    ShizukuController.startRawMacro(
+                        rawMacroJson = rawJsonSnapshot,
+                        loopCount = loopSnapshot
+                    )
+                } else {
+                    ShizukuController.startClicking(
+                        targets = snapshot,
+                        executionMode = modeSnapshot,
+                        presetLoopCount = loopSnapshot
+                    )
+                }
             }
+            if (mode == RUN_CANCELLED_SENTINEL) return@launch
             withContext(Dispatchers.Main) {
                 if (expectedSeq != runSessionSeq || !isClicking) return@withContext
                 if (mode < 0) {
                     isClicking = false
+                    clickingStartedByTargetHold = false
                     OverlayStateHub.setClickingRunning(this@OverlayService, false)
                     refreshAnchorVisuals()
                     refreshControlBarState()
@@ -1669,6 +1709,7 @@ class OverlayService : Service(), ControlBarView.Listener {
     private fun stopClickingInternal() {
         pendingAutoLockStartRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingAutoLockStartRunnable = null
+        clickingStartedByTargetHold = false
         runSessionSeq++
         if (!isClicking) return
         cancelAutoCollapse()
@@ -1677,10 +1718,138 @@ class OverlayService : Service(), ControlBarView.Listener {
         refreshAnchorVisuals()
         refreshControlBarState()
         serviceScope.launch(Dispatchers.IO) {
-            ShizukuController.stopClicking()
+            clickEngineMutex.withLock {
+                ShizukuController.stopClicking()
+            }
         }
         if (!isBarCollapsed) {
             scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+        }
+    }
+
+    private fun handleTargetTriggerEvent(eventType: Int) {
+        val settings = ClickConfigStore.loadSettings(this)
+        when (eventType) {
+            TouchMuxUserService.TARGET_EVENT_TAP -> {
+                if (!settings.targetTapTriggerEnabled ||
+                    !normalOverlayAttached ||
+                    !isLocked ||
+                    activeIsRawMacro ||
+                    macroRecordOverlay?.isActive() == true
+                ) {
+                    return
+                }
+                clickingStartedByTargetHold = false
+                onTogglePlayStop()
+            }
+            TouchMuxUserService.TARGET_EVENT_HOLD_START -> {
+                if (!settings.targetLongPressTriggerEnabled ||
+                    !normalOverlayAttached ||
+                    !isLocked ||
+                    activeIsRawMacro ||
+                    macroRecordOverlay?.isActive() == true
+                ) {
+                    return
+                }
+                if (isClicking || pendingAutoLockStartRunnable != null) return
+                if (!hasRunnablePayload()) {
+                    Toast.makeText(this, "请至少启用一个手势锚点", Toast.LENGTH_SHORT).show()
+                    return
+                }
+                if (!ShizukuController.isServiceConnected()) {
+                    ShizukuController.evaluateShizukuState()
+                    Toast.makeText(this, "Shizuku 触控服务尚未连接，请在主界面授权并连接", Toast.LENGTH_SHORT).show()
+                    return
+                }
+                clickingStartedByTargetHold = true
+                startClickingInternal()
+            }
+            TouchMuxUserService.TARGET_EVENT_HOLD_END -> {
+                if (!clickingStartedByTargetHold) return
+                clickingStartedByTargetHold = false
+                if (isClicking || pendingAutoLockStartRunnable != null) {
+                    stopClickingInternal()
+                }
+            }
+        }
+    }
+
+    private fun syncTargetTriggerConfig(preArmNative: Boolean = false) {
+        val settings = ClickConfigStore.loadSettings(this)
+        val mode = if (normalOverlayAttached &&
+            isLocked &&
+            !activeIsRawMacro &&
+            macroRecordOverlay?.isActive() != true
+        ) {
+            settings.targetTriggerMode
+        } else {
+            ClickGlobalSettings.TARGET_TRIGGER_OFF
+        }
+        if (mode == ClickGlobalSettings.TARGET_TRIGGER_OFF) {
+            ShizukuController.clearTargetTriggerConfigAsync()
+            return
+        }
+
+        val zones = buildExpandedDisplayEntries()
+            .map { it.target }
+            .filter { it.enabled && (it.actionType == ActionType.TAP || it.actionType == ActionType.HOLD) }
+        if (zones.isEmpty()) {
+            ShizukuController.clearTargetTriggerConfigAsync()
+            return
+        }
+
+        val density = resources.displayMetrics.density
+        val zoneRadiusPx = 21f * density
+        val xs = FloatArray(zones.size) { zones[it].x }
+        val ys = FloatArray(zones.size) { zones[it].y }
+        val rs = FloatArray(zones.size) { zoneRadiusPx }
+
+        val bar = controlBarView
+        val lp = controlBarLp
+        val exL: Int
+        val exT: Int
+        val exR: Int
+        val exB: Int
+        if (bar != null && lp != null) {
+            val w = if (bar.width > 0) bar.width else bar.getCurrentWidthPx()
+            val h = if (bar.height > 0) bar.height else bar.getCurrentHeightPx()
+            exL = lp.x
+            exT = lp.y
+            exR = lp.x + w
+            exB = lp.y + h
+        } else {
+            exL = 0
+            exT = 0
+            exR = 0
+            exB = 0
+        }
+        val slopPx = maxOf(
+            ViewConfiguration.get(this).scaledTouchSlop.toFloat(),
+            18f * density
+        )
+
+        serviceScope.launch(Dispatchers.IO) {
+            if (preArmNative) {
+                val snap = ShizukuController.engineSnapshot.value
+                if (settings.selfCheckPassed &&
+                    settings.preferredBackend != ClickGlobalSettings.BACKEND_FALLBACK &&
+                    snap.touchDeviceReadable &&
+                    (snap.uinputWritable || snap.uhidWritable || snap.fallbackReady)
+                ) {
+                    ShizukuController.ensureNativeIfVerified()
+                }
+            }
+            ShizukuController.setTargetTriggerConfig(
+                mode = mode,
+                zoneXs = xs,
+                zoneYs = ys,
+                zoneRadii = rs,
+                excludeLeft = exL,
+                excludeTop = exT,
+                excludeRight = exR,
+                excludeBottom = exB,
+                touchSlopPx = slopPx
+            )
         }
     }
 
@@ -1760,6 +1929,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         selectedTargetId = targets.lastOrNull()?.id ?: -1
         persistCurrentTargets()
         refreshAnchorVisuals()
+        syncTargetTriggerConfig()
         if (targets.isEmpty()) {
             dismissTunePanel()
             scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
@@ -1790,6 +1960,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         attachAllAnchors()
         attachControlBar()
         OverlayStateHub.setOverlayVisible(this, true)
+        syncTargetTriggerConfig(preArmNative = true)
         scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
     }
 
@@ -1806,6 +1977,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         if (isClicking) {
             stopClickingInternal()
         }
+        ShizukuController.clearTargetTriggerConfigAsync()
         cancelAutoCollapse()
         resumeOverlayAfterRecord = normalOverlayAttached
         if (normalOverlayAttached) {
@@ -1940,11 +2112,13 @@ class OverlayService : Service(), ControlBarView.Listener {
             val targetX = if (dockRight) (screenW - w).coerceAtLeast(0) else 0
             animateControlBarPosX(targetX) {
                 ClickConfigStore.saveControlBarCollapseState(this, true, dockRight)
+                syncTargetTriggerConfig()
             }
         } else {
             bar.syncWindowPosition(lp.x, lp.y)
             ClickConfigStore.saveControlBarPosition(this, lp.x, lp.y)
             ClickConfigStore.saveControlBarCollapseState(this, false, dockRight)
+            syncTargetTriggerConfig()
             scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
         }
     }
@@ -2000,6 +2174,7 @@ class OverlayService : Service(), ControlBarView.Listener {
             }
         }
         swipeConnectorView?.updateExpandedSwipes(buildExpandedDisplayEntries(), isClicking, isLocked)
+        syncTargetTriggerConfig()
 
         serviceScope.launch(Dispatchers.IO) {
             ShizukuController.updateDisplayMetrics()
@@ -2448,5 +2623,6 @@ class OverlayService : Service(), ControlBarView.Listener {
         private const val REQUEST_CODE_OPEN_PRESETS = 2002
         private const val IDLE_COLLAPSE_DELAY_MS = 4500L
         private const val START_COLLAPSE_DELAY_MS = 1500L
+        private const val RUN_CANCELLED_SENTINEL = -9999
     }
 }

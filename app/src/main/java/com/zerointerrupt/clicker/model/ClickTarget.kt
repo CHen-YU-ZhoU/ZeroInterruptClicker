@@ -485,15 +485,28 @@ data class ClickGlobalSettings(
     val dynamicColor: Boolean = true,
     val launcherIconMode: Int = LAUNCHER_SYSTEM,
     val volumeKeyToggleEnabled: Boolean = true,
+    val targetLongPressTriggerEnabled: Boolean = false,
+    val targetTapTriggerEnabled: Boolean = false,
     val proModeEnabled: Boolean = false,
     val preferredBackend: Int = BACKEND_AUTO,
     val rpcBridgeEnabled: Boolean = false,
     val rpcToken: String = ""
 ) {
+    val targetTriggerMode: Int
+        get() = when {
+            targetLongPressTriggerEnabled -> TARGET_TRIGGER_LONG_PRESS
+            targetTapTriggerEnabled -> TARGET_TRIGGER_TAP
+            else -> TARGET_TRIGGER_OFF
+        }
+
     companion object {
         const val DEFAULT_LOCKED_ALPHA = 0.65f
         const val MIN_LOCKED_ALPHA = 0.35f
         const val MAX_LOCKED_ALPHA = 0.75f
+
+        const val TARGET_TRIGGER_OFF = 0
+        const val TARGET_TRIGGER_TAP = 1
+        const val TARGET_TRIGGER_LONG_PRESS = 2
 
         const val TIER_CASUAL = 0
         const val TIER_STANDARD = 1
@@ -546,6 +559,8 @@ object ClickConfigStore {
     private const val KEY_DYNAMIC_COLOR = "dynamic_color"
     private const val KEY_LAUNCHER_ICON_MODE = "launcher_icon_mode"
     private const val KEY_VOL_KEY_TOGGLE = "volume_key_toggle_enabled"
+    private const val KEY_TARGET_LONG_PRESS_TRIGGER = "target_long_press_trigger_enabled"
+    private const val KEY_TARGET_TAP_TRIGGER = "target_tap_trigger_enabled"
     private const val KEY_PRO_MODE = "pro_mode_enabled"
     private const val KEY_PREFERRED_BACKEND = "preferred_backend"
     private const val KEY_RPC_BRIDGE_ENABLED = "rpc_bridge_enabled"
@@ -598,6 +613,10 @@ object ClickConfigStore {
             .coerceIn(ClickTarget.MIN_INTERVAL_MS, ClickTarget.MAX_INTERVAL_MS)
         val customPress = prefs.getLong(KEY_CUSTOM_PRESS, defPress)
             .coerceIn(ClickTarget.MIN_PRESS_MS, ClickTarget.MAX_PRESS_MS)
+        val rawLongPressTrigger = prefs.getBoolean(KEY_TARGET_LONG_PRESS_TRIGGER, false)
+        val rawTapTrigger = prefs.getBoolean(KEY_TARGET_TAP_TRIGGER, false)
+        val safeLongPressTrigger = rawLongPressTrigger
+        val safeTapTrigger = if (safeLongPressTrigger) false else rawTapTrigger
         return ClickGlobalSettings(
             defaultIntervalMs = defInterval,
             defaultPressDurationMs = defPress,
@@ -618,6 +637,8 @@ object ClickConfigStore {
             launcherIconMode = prefs.getInt(KEY_LAUNCHER_ICON_MODE, ClickGlobalSettings.LAUNCHER_SYSTEM)
                 .coerceIn(ClickGlobalSettings.LAUNCHER_SYSTEM, ClickGlobalSettings.LAUNCHER_LIGHT),
             volumeKeyToggleEnabled = prefs.getBoolean(KEY_VOL_KEY_TOGGLE, true),
+            targetLongPressTriggerEnabled = safeLongPressTrigger,
+            targetTapTriggerEnabled = safeTapTrigger,
             proModeEnabled = prefs.getBoolean(KEY_PRO_MODE, false),
             preferredBackend = prefs.getInt(KEY_PREFERRED_BACKEND, ClickGlobalSettings.BACKEND_AUTO)
                 .coerceIn(ClickGlobalSettings.BACKEND_AUTO, ClickGlobalSettings.BACKEND_FALLBACK),
@@ -628,6 +649,8 @@ object ClickConfigStore {
 
     fun saveSettings(context: Context, settings: ClickGlobalSettings) {
         val safeToken = settings.rpcToken.ifBlank { generateRpcToken() }
+        val safeLongPressTrigger = settings.targetLongPressTriggerEnabled
+        val safeTapTrigger = if (safeLongPressTrigger) false else settings.targetTapTriggerEnabled
         context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit()
             .putLong(KEY_DEFAULT_INTERVAL, settings.defaultIntervalMs)
             .putLong(KEY_DEFAULT_PRESS, settings.defaultPressDurationMs)
@@ -657,6 +680,8 @@ object ClickConfigStore {
                 )
             )
             .putBoolean(KEY_VOL_KEY_TOGGLE, settings.volumeKeyToggleEnabled)
+            .putBoolean(KEY_TARGET_LONG_PRESS_TRIGGER, safeLongPressTrigger)
+            .putBoolean(KEY_TARGET_TAP_TRIGGER, safeTapTrigger)
             .putBoolean(KEY_PRO_MODE, settings.proModeEnabled)
             .putInt(KEY_PREFERRED_BACKEND, settings.preferredBackend)
             .putBoolean(KEY_RPC_BRIDGE_ENABLED, settings.rpcBridgeEnabled)

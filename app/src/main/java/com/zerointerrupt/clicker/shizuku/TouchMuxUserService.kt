@@ -53,6 +53,20 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
     private val volumeKeyEnabled = AtomicBoolean(true)
     private var statusDetail: String = "Idle"
 
+    private val targetTriggerCfgLock = Any()
+    private var cachedTriggerMode: Int = 0
+    private var cachedTriggerXs: FloatArray = FloatArray(0)
+    private var cachedTriggerYs: FloatArray = FloatArray(0)
+    private var cachedTriggerRadii: FloatArray = FloatArray(0)
+    private var cachedTriggerDispW: Int = 1080
+    private var cachedTriggerDispH: Int = 2400
+    private var cachedTriggerRotation: Int = 0
+    private var cachedTriggerExL: Int = 0
+    private var cachedTriggerExT: Int = 0
+    private var cachedTriggerExR: Int = 0
+    private var cachedTriggerExB: Int = 0
+    private var cachedTriggerSlopPx: Float = 48f
+
     private val watchdogExecutor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val rpcFallbackExecutor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private var selfCheckWatchdogTask: ScheduledFuture<*>? = null
@@ -122,6 +136,20 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         slotBuf: IntArray
     )
     private external fun nativeSetVolumeKeyEnabled(enabled: Boolean)
+    private external fun nativeSetTargetTriggerConfig(
+        mode: Int,
+        zoneXs: FloatArray,
+        zoneYs: FloatArray,
+        zoneRadii: FloatArray,
+        displayW: Int,
+        displayH: Int,
+        rotation: Int,
+        excludeLeft: Int,
+        excludeTop: Int,
+        excludeRight: Int,
+        excludeBottom: Int,
+        touchSlopPx: Float
+    )
     private external fun nativeInitAndGrab(
         displayW: Int,
         displayH: Int,
@@ -257,6 +285,24 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                     slotStatesBuf
                 )
                 nativeSetVolumeKeyEnabled(volumeKeyEnabled.get())
+                synchronized(targetTriggerCfgLock) {
+                    if (cachedTriggerMode != 0) {
+                        nativeSetTargetTriggerConfig(
+                            cachedTriggerMode,
+                            cachedTriggerXs,
+                            cachedTriggerYs,
+                            cachedTriggerRadii,
+                            cachedTriggerDispW,
+                            cachedTriggerDispH,
+                            cachedTriggerRotation,
+                            cachedTriggerExL,
+                            cachedTriggerExT,
+                            cachedTriggerExR,
+                            cachedTriggerExB,
+                            cachedTriggerSlopPx
+                        )
+                    }
+                }
             } catch (t: Throwable) {
                 callbacksRegistered.set(false)
                 Log.w(TAG, "nativeRegisterCallbacks failed: ${t.message}")
@@ -356,6 +402,12 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         notifyRemoteCallbacks { it.onClickingCompleted() }
     }
 
+    @Keep
+    @Suppress("unused")
+    fun onNativeTargetTriggerEvent(eventType: Int) {
+        notifyRemoteCallbacks { it.onTargetTriggerEvent(eventType) }
+    }
+
     private inline fun notifyRemoteCallbacks(action: (ITouchMuxCallback) -> Unit) {
         synchronized(callbackBroadcastLock) {
             val count = remoteCallbacks.beginBroadcast()
@@ -434,6 +486,61 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         if (nativeLoaded.get()) {
             try {
                 nativeSetVolumeKeyEnabled(enabled)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    override fun setTargetTriggerConfig(
+        mode: Int,
+        zoneXs: FloatArray?,
+        zoneYs: FloatArray?,
+        zoneRadii: FloatArray?,
+        displayWidth: Int,
+        displayHeight: Int,
+        rotation: Int,
+        excludeLeft: Int,
+        excludeTop: Int,
+        excludeRight: Int,
+        excludeBottom: Int,
+        touchSlopPx: Float
+    ) {
+        val xs = zoneXs ?: FloatArray(0)
+        val ys = zoneYs ?: FloatArray(0)
+        val rs = zoneRadii ?: FloatArray(0)
+        val safeW = displayWidth.coerceAtLeast(1)
+        val safeH = displayHeight.coerceAtLeast(1)
+        val safeSlop = touchSlopPx.coerceIn(12f, 160f)
+        synchronized(targetTriggerCfgLock) {
+            cachedTriggerMode = mode
+            cachedTriggerXs = xs.copyOf()
+            cachedTriggerYs = ys.copyOf()
+            cachedTriggerRadii = rs.copyOf()
+            cachedTriggerDispW = safeW
+            cachedTriggerDispH = safeH
+            cachedTriggerRotation = rotation
+            cachedTriggerExL = excludeLeft
+            cachedTriggerExT = excludeTop
+            cachedTriggerExR = excludeRight
+            cachedTriggerExB = excludeBottom
+            cachedTriggerSlopPx = safeSlop
+        }
+        if (nativeLoaded.get()) {
+            try {
+                nativeSetTargetTriggerConfig(
+                    mode,
+                    xs,
+                    ys,
+                    rs,
+                    safeW,
+                    safeH,
+                    rotation,
+                    excludeLeft,
+                    excludeTop,
+                    excludeRight,
+                    excludeBottom,
+                    safeSlop
+                )
             } catch (_: Throwable) {
             }
         }
@@ -2123,6 +2230,10 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         const val MODE_NATIVE_UHID = 2
         const val MODE_HYBRID_EVDEV_INJECT = 3
         const val MODE_SHIZUKU_FALLBACK = 4
+
+        const val TARGET_EVENT_TAP = 1
+        const val TARGET_EVENT_HOLD_START = 2
+        const val TARGET_EVENT_HOLD_END = 3
 
         fun isNativeMode(mode: Int): Boolean =
             mode == MODE_NATIVE_UINPUT || mode == MODE_NATIVE_UHID || mode == MODE_HYBRID_EVDEV_INJECT

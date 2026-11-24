@@ -44,6 +44,24 @@ enum class BackendPref : int32_t {
     HYBRID = 3
 };
 
+enum class TargetTriggerMode : int32_t {
+    OFF = 0,
+    TAP = 1,
+    LONG_PRESS = 2
+};
+
+enum class TargetTriggerEvent : int32_t {
+    TAP = 1,
+    HOLD_START = 2,
+    HOLD_END = 3
+};
+
+struct TargetTriggerZone {
+    float x = 0.0f;
+    float y = 0.0f;
+    float radiusPx = 56.0f;
+};
+
 struct NativeClickTarget {
     int32_t id = 0;
     float x = 0.0f;
@@ -112,6 +130,7 @@ struct EngineCallbacks {
     std::function<void()> onEmergencyUngrab;
     std::function<void(const int32_t slots[kMaxUinputSlots])> onSlotStatesChanged;
     std::function<void()> onClickingCompleted;
+    std::function<void(int32_t eventType)> onTargetTriggerEvent;
 };
 
 class TouchMuxEngine {
@@ -127,6 +146,16 @@ public:
 
     void setCallbacks(EngineCallbacks callbacks);
     void setVolumeKeyControlEnabled(bool enabled);
+    void setTargetTriggerConfig(int32_t mode,
+                                const std::vector<TargetTriggerZone>& zones,
+                                int displayW,
+                                int displayH,
+                                int rotation,
+                                int excludeLeft,
+                                int excludeTop,
+                                int excludeRight,
+                                int excludeBottom,
+                                float touchSlopPx);
 
     int initAndGrab(int displayW,
                     int displayH,
@@ -300,6 +329,15 @@ private:
     void ensureKeyWatchThread();
     void stopKeyWatchThread();
     void keyWatchLoop();
+
+    void emitTargetTriggerEvent(TargetTriggerEvent ev);
+    void syncEngineTargetTriggerConfig();
+    void resetEngineTriggerSlots(bool emitHoldEnd);
+    void processEngineTriggerSynFrame(int64_t nowNs);
+    void stepEngineTargetLongPress(int64_t nowNs);
+    void syncTouchTriggerWatcherState();
+    void stopTouchTriggerWatchThread();
+    void touchTriggerWatchLoop();
 
     void engineLoop();
     void handleWakeSignal();
@@ -516,6 +554,55 @@ private:
     int32_t recActiveFingers_ = 0;
     int32_t recStrokeSeq_ = 0;
     std::vector<RecordedStroke> recStrokes_;
+
+    // Target-zone tap/long-press trigger state
+    struct TriggerSlotTrack {
+        bool active = false;
+        bool candidate = false;
+        bool movedTooFar = false;
+        bool holdFired = false;
+        bool suppressed = false;
+        float downX = 0.0f;
+        float downY = 0.0f;
+        float curX = 0.0f;
+        float curY = 0.0f;
+        int64_t downNs = 0;
+    };
+
+    mutable std::mutex targetTriggerMutex_;
+    TargetTriggerMode cfgTtMode_ = TargetTriggerMode::OFF;
+    std::vector<TargetTriggerZone> cfgTtZones_;
+    int cfgTtDisplayW_ = 1080;
+    int cfgTtDisplayH_ = 2400;
+    int cfgTtRotation_ = 0;
+    int cfgTtExL_ = 0;
+    int cfgTtExT_ = 0;
+    int cfgTtExR_ = 0;
+    int cfgTtExB_ = 0;
+    float cfgTtSlopPx_ = 48.0f;
+    uint64_t cfgTtVersion_ = 0;
+
+    // Worker-thread-only target trigger state (used inside engineLoop)
+    TargetTriggerMode activeTtMode_ = TargetTriggerMode::OFF;
+    std::vector<TargetTriggerZone> activeTtZones_;
+    int activeTtExL_ = 0;
+    int activeTtExT_ = 0;
+    int activeTtExR_ = 0;
+    int activeTtExB_ = 0;
+    float activeTtSlopPx_ = 48.0f;
+    uint64_t activeTtVersion_ = 0;
+    TriggerSlotTrack engTriggerSlots_[kMaxPhysSlots]{};
+    bool engPhysPendingDown_[kMaxPhysSlots]{};
+    bool engPhysPendingUp_[kMaxPhysSlots]{};
+    int32_t engPhysRawX_[kMaxPhysSlots]{};
+    int32_t engPhysRawY_[kMaxPhysSlots]{};
+    int64_t engLastTapTriggerNs_ = 0;
+
+    // Non-grabbed fallback target trigger watcher thread (used when engineLoop is idle)
+    std::mutex ttWatchLifecycleMutex_;
+    std::thread ttWatchThread_;
+    std::atomic<bool> ttWatchRunning_{false};
+    int ttWatchWakeFd_ = -1;
 };
 
 }  // namespace touchmux

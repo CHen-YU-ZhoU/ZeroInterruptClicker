@@ -90,6 +90,8 @@ class MainActivity : ComponentActivity() {
             dynamicColor = true,
             launcherIconMode = ClickGlobalSettings.LAUNCHER_SYSTEM,
             volumeKeyToggleEnabled = true,
+            targetLongPressTriggerEnabled = false,
+            targetTapTriggerEnabled = false,
             proModeEnabled = false,
             preferredBackend = ClickGlobalSettings.BACKEND_AUTO,
             rpcBridgeEnabled = false,
@@ -293,6 +295,8 @@ class MainActivity : ComponentActivity() {
             dynamicColor = settings.dynamicColor,
             launcherIconMode = settings.launcherIconMode,
             volumeKeyToggleEnabled = settings.volumeKeyToggleEnabled,
+            targetLongPressTriggerEnabled = settings.targetLongPressTriggerEnabled,
+            targetTapTriggerEnabled = settings.targetTapTriggerEnabled,
             proModeEnabled = settings.proModeEnabled,
             preferredBackend = settings.preferredBackend,
             rpcBridgeEnabled = settings.rpcBridgeEnabled,
@@ -335,6 +339,7 @@ class MainActivity : ComponentActivity() {
     private fun showMessage(scope: kotlinx.coroutines.CoroutineScope, message: String) {
         if (!::snackbarHostState.isInitialized) return
         scope.launch {
+            snackbarHostState.currentSnackbarData?.dismiss()
             snackbarHostState.showSnackbar(message)
         }
     }
@@ -841,6 +846,28 @@ class MainActivity : ComponentActivity() {
                 saveCurrentSettings({ it.copy(volumeKeyToggleEnabled = enabled) }, notifyOverlay = false)
                 scope.launch(Dispatchers.IO) {
                     ShizukuController.setVolumeKeyControlEnabled(enabled)
+                }
+            },
+            onTargetLongPressTriggerChange = { enabled ->
+                val cur = ClickConfigStore.loadSettings(this)
+                if (enabled && cur.targetTapTriggerEnabled) {
+                    showMessage(scope, "连点和长按仅可打开一个")
+                } else {
+                    saveCurrentSettings(
+                        mutate = { it.copy(targetLongPressTriggerEnabled = enabled) },
+                        notifyOverlay = true
+                    )
+                }
+            },
+            onTargetTapTriggerChange = { enabled ->
+                val cur = ClickConfigStore.loadSettings(this)
+                if (enabled && cur.targetLongPressTriggerEnabled) {
+                    showMessage(scope, "连点和长按仅可打开一个")
+                } else {
+                    saveCurrentSettings(
+                        mutate = { it.copy(targetTapTriggerEnabled = enabled) },
+                        notifyOverlay = true
+                    )
                 }
             },
             onRequestAddQuickTile = {
