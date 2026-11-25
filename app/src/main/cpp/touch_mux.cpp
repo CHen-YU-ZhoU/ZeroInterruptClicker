@@ -68,8 +68,7 @@ constexpr int32_t kAndroidActionPointerIndexShift = 8;
 constexpr int64_t kSwipeStepNs = 4000000LL;               // 4ms high-density interpolation (~250Hz)
 constexpr int64_t kVolDoubleTapWindowNs = 420000000LL;    // 420ms double-tap window
 constexpr int64_t kVolEmergencyHoldNs = 3000000000LL;     // 3.0s hold for EVIOCGRAB emergency release
-constexpr int64_t kTargetLongPressNs = 350000000LL;       // 350ms hold threshold for target-zone long press
-constexpr int64_t kTargetTapDebounceNs = 120000000LL;     // 120ms debounce for target-zone tap trigger
+constexpr int64_t kTargetTapDebounceNs = 60000000LL;      // 60ms debounce for ultra-responsive target-zone tap toggle
 
 constexpr size_t kBitFieldBytes(size_t maxBit) {
     return (maxBit + 7) / 8 + 1;
@@ -679,14 +678,133 @@ void TouchMuxEngine::emitTargetTriggerEvent(TargetTriggerEvent ev) {
 }
 
 void TouchMuxEngine::resetEngineTriggerSlots(bool emitHoldEnd) {
+    const int64_t nowNs = nowMonotonicNs();
     for (int s = 0; s < kMaxPhysSlots; ++s) {
         if (emitHoldEnd && engTriggerSlots_[s].holdFired) {
-            emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
+            if (triggerInstantStop(nowNs)) {
+                emitTargetTriggerEvent(TargetTriggerEvent::NATIVE_HOLD_STOPPED);
+            } else {
+                emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
+            }
         }
         engTriggerSlots_[s] = TriggerSlotTrack{};
         engPhysPendingDown_[s] = false;
         engPhysPendingUp_[s] = false;
     }
+}
+
+void TouchMuxEngine::buildSequentialStages(const std::vector<NativeClickTarget>& list, int64_t startNs) {
+    stages_.clear();
+    activeStageIdx_ = 0;
+    for (const auto& t : list) {
+        if (!t.enabled) continue;
+        if (stages_.empty() || stages_.back().stageIndex != t.stageIndex) {
+            StageRuntime st;
+            st.stageIndex = t.stageIndex;
+            st.durationMs = std::max<int64_t>(0, t.stageDurationMs);
+            st.gapMs = std::clamp<int64_t>(t.stageGapMs, 0, 60000);
+            st.repeatCount = std::max<int32_t>(0, t.stageRepeatCount);
+            st.startDelayUntilNs = startNs;
+            stages_.push_back(std::move(st));
+        }
+        VirtualTargetRuntime rt;
+        rt.config = t;
+        rt.nextDeadlineNs = startNs;
+        stages_.back().targets.push_back(rt);
+    }
+}
+
+bool TouchMuxEngine::triggerInstantStart(int64_t nowNs) {
+    if (activeClickingRunning_ || activeRawMacroRunning_) {
+        return false;
+    }
+    std::vector<NativeClickTarget> nextTargets;
+    ExecutionMode nextExecMode = ExecutionMode::CONCURRENT;
+    int32_t nextPresetLoopCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (cfgTargets_.empty()) {
+            return false;
+        }
+        bool anyEnabled = false;
+        for (const auto& t : cfgTargets_) {
+            if (t.enabled) {
+                anyEnabled = true;
+                break;
+            }
+        }
+        if (!anyEnabled) {
+            return false;
+        }
+        nextTargets = cfgTargets_;
+        nextExecMode = cfgExecutionMode_;
+        nextPresetLoopCount = cfgPresetLoopCount_;
+        activeDisplayW_ = cfgDisplayW_;
+        activeDisplayH_ = cfgDisplayH_;
+        activeRotation_ = cfgRotation_;
+        activeJitterRadiusPx_ = cfgJitterRadiusPx_;
+        cfgRawMacroRunning_ = false;
+        cfgClickingRunning_ = true;
+    }
+
+    activeExecutionMode_ = nextExecMode;
+    activePresetLoopCount_ = nextPresetLoopCount;
+    seqCompletedLoops_ = 0;
+    releaseAllVirtualTargetSlots();
+    virtualTargets_.clear();
+    stages_.clear();
+    activeStageIdx_ = 0;
+
+    if (nextExecMode == ExecutionMode::SEQUENTIAL) {
+        buildSequentialStages(nextTargets, nowNs);
+    } else {
+        virtualTargets_.reserve(nextTargets.size());
+        for (const auto& nt : nextTargets) {
+            if (!nt.enabled) continue;
+            VirtualTargetRuntime fresh;
+            fresh.config = nt;
+            fresh.isPressed = false;
+            fresh.muxSlot = -1;
+            fresh.nextDeadlineNs = nowNs + static_cast<int64_t>(virtualTargets_.size()) * 500000LL;
+            virtualTargets_.push_back(fresh);
+        }
+    }
+
+    const bool hasPayload = (nextExecMode == ExecutionMode::SEQUENTIAL)
+                                ? !stages_.empty()
+                                : !virtualTargets_.empty();
+    if (!hasPayload) {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        cfgClickingRunning_ = false;
+        return false;
+    }
+
+    activeClickingRunning_ = true;
+    stepVirtualTargets(nowNs);
+    rearmTimerFd();
+    publishSlotSnapshotIfChanged(nowNs);
+    return true;
+}
+
+bool TouchMuxEngine::triggerInstantStop(int64_t nowNs) {
+    if (!activeClickingRunning_ && !activeRawMacroRunning_) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        cfgClickingRunning_ = false;
+        cfgRawMacroRunning_ = false;
+    }
+    activeClickingRunning_ = false;
+    activeRawMacroRunning_ = false;
+    seqCompletedLoops_ = 0;
+    releaseAllVirtualTargetSlots();
+    releaseAllRawMacroSlots();
+    releaseCarriedHoldSlots();
+    emitSyncAndFlush();
+    rearmTimerFd();
+    publishSlotSnapshotIfChanged(nowNs);
+    return true;
 }
 
 void TouchMuxEngine::syncEngineTargetTriggerConfig() {
@@ -760,7 +878,6 @@ void TouchMuxEngine::processEngineTriggerSynFrame(int64_t nowNs) {
         return false;
     };
 
-    bool timerDirty = false;
     for (int s = 0; s < kMaxPhysSlots; ++s) {
         auto& tr = engTriggerSlots_[s];
         float lx = 0.0f;
@@ -770,7 +887,11 @@ void TouchMuxEngine::processEngineTriggerSynFrame(int64_t nowNs) {
         if (engPhysPendingDown_[s]) {
             engPhysPendingDown_[s] = false;
             if (tr.holdFired) {
-                emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
+                if (triggerInstantStop(nowNs)) {
+                    emitTargetTriggerEvent(TargetTriggerEvent::NATIVE_HOLD_STOPPED);
+                } else {
+                    emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
+                }
             }
             tr = TriggerSlotTrack{};
             tr.active = true;
@@ -781,9 +902,21 @@ void TouchMuxEngine::processEngineTriggerSynFrame(int64_t nowNs) {
             tr.downNs = nowNs;
             if (!insideExclude(lx, ly) && insideAnyZone(lx, ly)) {
                 if (activeTtMode_ == TargetTriggerMode::LONG_PRESS) {
-                    tr.candidate = !anyHoldActive() && !activeClickingRunning_ && !activeRawMacroRunning_;
-                    if (tr.candidate) {
-                        timerDirty = true;
+                    if (!anyHoldActive() && !activeClickingRunning_ && !activeRawMacroRunning_) {
+                        tr.candidate = true;
+                        tr.holdFired = true;
+                        tr.suppressed = true;
+                        int u = physToMuxSlot_[s];
+                        if (u >= 0) {
+                            emitSlotUp(u);
+                            physToMuxSlot_[s] = -1;
+                        }
+                        emitSyncAndFlush();
+                        if (triggerInstantStart(nowNs)) {
+                            emitTargetTriggerEvent(TargetTriggerEvent::NATIVE_HOLD_STARTED);
+                        } else {
+                            emitTargetTriggerEvent(TargetTriggerEvent::HOLD_START);
+                        }
                     }
                 } else {
                     tr.candidate = true;
@@ -792,10 +925,9 @@ void TouchMuxEngine::processEngineTriggerSynFrame(int64_t nowNs) {
         } else if (tr.active && !engPhysPendingUp_[s]) {
             tr.curX = lx;
             tr.curY = ly;
-            if (tr.candidate && !tr.holdFired && !tr.movedTooFar) {
+            if (activeTtMode_ == TargetTriggerMode::TAP && tr.candidate && !tr.movedTooFar) {
                 if (std::hypot(tr.curX - tr.downX, tr.curY - tr.downY) > activeTtSlopPx_) {
                     tr.movedTooFar = true;
-                    timerDirty = true;
                 }
             }
         }
@@ -807,49 +939,31 @@ void TouchMuxEngine::processEngineTriggerSynFrame(int64_t nowNs) {
                     if (std::hypot(lx - tr.downX, ly - tr.downY) <= activeTtSlopPx_ &&
                         (nowNs - engLastTapTriggerNs_) >= kTargetTapDebounceNs) {
                         engLastTapTriggerNs_ = nowNs;
-                        emitTargetTriggerEvent(TargetTriggerEvent::TAP);
+                        emitSyncAndFlush();
+                        if (activeClickingRunning_ || activeRawMacroRunning_) {
+                            if (triggerInstantStop(nowNs)) {
+                                emitTargetTriggerEvent(TargetTriggerEvent::NATIVE_TAP_STOPPED);
+                            } else {
+                                emitTargetTriggerEvent(TargetTriggerEvent::TAP);
+                            }
+                        } else {
+                            if (triggerInstantStart(nowNs)) {
+                                emitTargetTriggerEvent(TargetTriggerEvent::NATIVE_TAP_STARTED);
+                            } else {
+                                emitTargetTriggerEvent(TargetTriggerEvent::TAP);
+                            }
+                        }
                     }
                 }
                 if (tr.holdFired) {
-                    emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
-                }
-                if (tr.candidate) {
-                    timerDirty = true;
+                    if (triggerInstantStop(nowNs)) {
+                        emitTargetTriggerEvent(TargetTriggerEvent::NATIVE_HOLD_STOPPED);
+                    } else {
+                        emitTargetTriggerEvent(TargetTriggerEvent::HOLD_END);
+                    }
                 }
             }
             tr = TriggerSlotTrack{};
-        }
-    }
-
-    if (timerDirty) {
-        rearmTimerFd();
-    }
-}
-
-void TouchMuxEngine::stepEngineTargetLongPress(int64_t nowNs) {
-    if (activeTtMode_ != TargetTriggerMode::LONG_PRESS || activeTtZones_.empty()) {
-        return;
-    }
-    for (int s = 0; s < kMaxPhysSlots; ++s) {
-        auto& tr = engTriggerSlots_[s];
-        if (!tr.active || !tr.candidate || tr.movedTooFar || tr.holdFired) {
-            continue;
-        }
-        if (nowNs >= tr.downNs + kTargetLongPressNs) {
-            if (activeClickingRunning_ || activeRawMacroRunning_) {
-                tr.candidate = false;
-                continue;
-            }
-            tr.holdFired = true;
-            tr.suppressed = true;
-            int u = physToMuxSlot_[s];
-            if (u >= 0) {
-                emitSlotUp(u);
-                physToMuxSlot_[s] = -1;
-                emitSyncAndFlush();
-            }
-            emitTargetTriggerEvent(TargetTriggerEvent::HOLD_START);
-            break;
         }
     }
 }
@@ -1048,12 +1162,20 @@ void TouchMuxEngine::touchTriggerWatchLoop() {
                 tr.curY = ly;
                 tr.downNs = nowNs;
                 if (!insideExclude(lx, ly) && insideAnyZone(lx, ly)) {
-                    tr.candidate = (mode != TargetTriggerMode::LONG_PRESS) || !anyHoldActive();
+                    if (mode == TargetTriggerMode::LONG_PRESS) {
+                        if (!anyHoldActive()) {
+                            tr.candidate = true;
+                            tr.holdFired = true;
+                            emitTargetTriggerEvent(TargetTriggerEvent::HOLD_START);
+                        }
+                    } else {
+                        tr.candidate = true;
+                    }
                 }
             } else if (tr.active && !pendingUp[s]) {
                 tr.curX = lx;
                 tr.curY = ly;
-                if (tr.candidate && !tr.holdFired && !tr.movedTooFar) {
+                if (mode == TargetTriggerMode::TAP && tr.candidate && !tr.movedTooFar) {
                     if (std::hypot(tr.curX - tr.downX, tr.curY - tr.downY) > slopPx) {
                         tr.movedTooFar = true;
                     }
@@ -1138,22 +1260,7 @@ void TouchMuxEngine::touchTriggerWatchLoop() {
     LOGI("touchTriggerWatchLoop started on %s (non-grabbed)", desc.path.c_str());
 
     while (ttWatchRunning_.load()) {
-        int timeoutMs = -1;
-        if (mode == TargetTriggerMode::LONG_PRESS && !zones.empty()) {
-            const int64_t nowCheck = nowMonotonicNs();
-            for (int s = 0; s < kMaxPhysSlots; ++s) {
-                const auto& tr = slots[s];
-                if (tr.active && tr.candidate && !tr.movedTooFar && !tr.holdFired) {
-                    int64_t remMs = (tr.downNs + kTargetLongPressNs - nowCheck + 999999LL) / 1000000LL;
-                    int clamped = static_cast<int>(std::clamp<int64_t>(remMs, 1, 50));
-                    if (timeoutMs < 0 || clamped < timeoutMs) {
-                        timeoutMs = clamped;
-                    }
-                }
-            }
-        }
-
-        int rc = poll(pfds, 2, timeoutMs);
+        int rc = poll(pfds, 2, -1);
         if (rc < 0) {
             if (errno == EINTR) continue;
             break;
@@ -1234,19 +1341,6 @@ void TouchMuxEngine::touchTriggerWatchLoop() {
                             }
                         }
                     }
-                }
-            }
-        }
-
-        if (mode == TargetTriggerMode::LONG_PRESS && !zones.empty()) {
-            const int64_t nowNs = nowMonotonicNs();
-            for (int s = 0; s < kMaxPhysSlots; ++s) {
-                auto& tr = slots[s];
-                if (tr.active && tr.candidate && !tr.movedTooFar && !tr.holdFired &&
-                    nowNs >= tr.downNs + kTargetLongPressNs) {
-                    tr.holdFired = true;
-                    emitTargetTriggerEvent(TargetTriggerEvent::HOLD_START);
-                    break;
                 }
             }
         }
@@ -3035,27 +3129,6 @@ void TouchMuxEngine::handleWakeSignal() {
         }
     }
 
-    auto buildSequentialStages = [&](const std::vector<NativeClickTarget>& list, int64_t startNs) {
-        stages_.clear();
-        activeStageIdx_ = 0;
-        for (const auto& t : list) {
-            if (!t.enabled) continue;
-            if (stages_.empty() || stages_.back().stageIndex != t.stageIndex) {
-                StageRuntime st;
-                st.stageIndex = t.stageIndex;
-                st.durationMs = std::max<int64_t>(0, t.stageDurationMs);
-                st.gapMs = std::clamp<int64_t>(t.stageGapMs, 0, 60000);
-                st.repeatCount = std::max<int32_t>(0, t.stageRepeatCount);
-                st.startDelayUntilNs = startNs;
-                stages_.push_back(std::move(st));
-            }
-            VirtualTargetRuntime rt;
-            rt.config = t;
-            rt.nextDeadlineNs = startNs;
-            stages_.back().targets.push_back(rt);
-        }
-    };
-
     // Handle raw macro playback mode
     if (nextRawRunning) {
         if (activeClickingRunning_) {
@@ -3274,8 +3347,8 @@ void TouchMuxEngine::handleTypeAFrameEnd() {
     }
     typeAFrameContacts_.clear();
     typeACurrent_ = TypeAContact{};
-    emitSyncAndFlush();
     processEngineTriggerSynFrame(nowMonotonicNs());
+    emitSyncAndFlush();
 }
 
 void TouchMuxEngine::handlePhysicalEvents() {
@@ -3325,8 +3398,8 @@ void TouchMuxEngine::handlePhysicalEvents() {
             // Type-B physical touchscreen handling
             if (ev.type == EV_SYN) {
                 if (ev.code == SYN_REPORT) {
-                    emitSyncAndFlush();
                     processEngineTriggerSynFrame(nowMonotonicNs());
+                    emitSyncAndFlush();
                 } else if (ev.code == SYN_DROPPED) {
                     LOGW("SYN_DROPPED on physical touchscreen; resetting physical slots.");
                     for (int p = 0; p < kMaxPhysSlots; ++p) {
@@ -3339,8 +3412,8 @@ void TouchMuxEngine::handlePhysicalEvents() {
                             engPhysPendingUp_[p] = true;
                         }
                     }
-                    emitSyncAndFlush();
                     processEngineTriggerSynFrame(nowMonotonicNs());
+                    emitSyncAndFlush();
                 }
                 continue;
             }
@@ -3979,7 +4052,6 @@ void TouchMuxEngine::handleTimerEvents() {
         return;
     }
 
-    stepEngineTargetLongPress(now);
     stepRpcGestures(now);
     stepVirtualTargets(now);
     stepRawMacro(now);
@@ -3999,14 +4071,6 @@ void TouchMuxEngine::rearmTimerFd() {
 
     if (selfCheckPending_.load() && selfCheckDeadlineNs_ > 0) {
         considerDeadline(selfCheckDeadlineNs_);
-    }
-    if (activeTtMode_ == TargetTriggerMode::LONG_PRESS && !activeTtZones_.empty()) {
-        for (int s = 0; s < kMaxPhysSlots; ++s) {
-            const auto& tr = engTriggerSlots_[s];
-            if (tr.active && tr.candidate && !tr.movedTooFar && !tr.holdFired) {
-                considerDeadline(tr.downNs + kTargetLongPressNs);
-            }
-        }
     }
     for (const auto& rg : rpcGestures_) {
         if (!rg.isHold) {

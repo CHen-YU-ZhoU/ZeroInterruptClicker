@@ -405,6 +405,18 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
     @Keep
     @Suppress("unused")
     fun onNativeTargetTriggerEvent(eventType: Int) {
+        when (eventType) {
+            TARGET_EVENT_NATIVE_TAP_STARTED,
+            TARGET_EVENT_NATIVE_HOLD_STARTED -> {
+                clickingActive.set(true)
+                statusDetail = "Running (${backendLabel(currentMode.get())})"
+            }
+            TARGET_EVENT_NATIVE_TAP_STOPPED,
+            TARGET_EVENT_NATIVE_HOLD_STOPPED -> {
+                clickingActive.set(false)
+                statusDetail = "Armed (${backendLabel(currentMode.get())})"
+            }
+        }
         notifyRemoteCallbacks { it.onTargetTriggerEvent(eventType) }
     }
 
@@ -2234,6 +2246,10 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         const val TARGET_EVENT_TAP = 1
         const val TARGET_EVENT_HOLD_START = 2
         const val TARGET_EVENT_HOLD_END = 3
+        const val TARGET_EVENT_NATIVE_TAP_STARTED = 4
+        const val TARGET_EVENT_NATIVE_TAP_STOPPED = 5
+        const val TARGET_EVENT_NATIVE_HOLD_STARTED = 6
+        const val TARGET_EVENT_NATIVE_HOLD_STOPPED = 7
 
         fun isNativeMode(mode: Int): Boolean =
             mode == MODE_NATIVE_UINPUT || mode == MODE_NATIVE_UHID || mode == MODE_HYBRID_EVDEV_INJECT

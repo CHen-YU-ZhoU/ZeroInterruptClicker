@@ -610,10 +610,10 @@ fun PresetsTab(
             defaultPressMs = state.pressDurationMs,
             defaultJitter = state.microJitter,
             onDismiss = { showNewTargetDialog = false },
-            onSave = { x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs ->
+            onSave = { x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs, triggerTargetZone ->
                 callbacks.onSavePresetTarget(
                     null, x, y, intervalMs, pressMs, jitter, enabled,
-                    actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs
+                    actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs, triggerTargetZone
                 )
                 showNewTargetDialog = false
             }
@@ -633,10 +633,10 @@ fun PresetsTab(
             defaultPressMs = state.pressDurationMs,
             defaultJitter = state.microJitter,
             onDismiss = { editingTarget = null },
-            onSave = { x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs ->
+            onSave = { x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs, triggerTargetZone ->
                 callbacks.onSavePresetTarget(
                     target.id, x, y, intervalMs, pressMs, jitter, enabled,
-                    actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs
+                    actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs, triggerTargetZone
                 )
                 editingTarget = null
             }

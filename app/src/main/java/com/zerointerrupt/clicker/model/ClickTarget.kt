@@ -52,7 +52,8 @@ data class ClickTarget(
     var swipeDurationMs: Long = DEFAULT_SWIPE_DURATION_MS,
     var repeatCount: Int = DEFAULT_REPEAT_COUNT,
     var refPresetId: String = "",
-    var subDurationMs: Long = DEFAULT_SUB_DURATION_MS
+    var subDurationMs: Long = DEFAULT_SUB_DURATION_MS,
+    var triggerTargetZone: Boolean = true
 ) : Parcelable {
 
     constructor(parcel: Parcel) : this(
@@ -74,7 +75,8 @@ data class ClickTarget(
         swipeDurationMs = parcel.readLong(),
         repeatCount = parcel.readInt().coerceIn(MIN_REPEAT_COUNT, MAX_REPEAT_COUNT),
         refPresetId = parcel.readString().orEmpty(),
-        subDurationMs = parcel.readLong().coerceIn(MIN_SUB_DURATION_MS, MAX_SUB_DURATION_MS)
+        subDurationMs = parcel.readLong().coerceIn(MIN_SUB_DURATION_MS, MAX_SUB_DURATION_MS),
+        triggerTargetZone = parcel.readByte().toInt() != 0
     )
 
     override fun writeToParcel(parcel: Parcel, flags: Int) {
@@ -97,6 +99,7 @@ data class ClickTarget(
         parcel.writeInt(repeatCount.coerceIn(MIN_REPEAT_COUNT, MAX_REPEAT_COUNT))
         parcel.writeString(refPresetId)
         parcel.writeLong(subDurationMs.coerceIn(MIN_SUB_DURATION_MS, MAX_SUB_DURATION_MS))
+        parcel.writeByte(if (triggerTargetZone) 1 else 0)
     }
 
     override fun describeContents(): Int = 0
@@ -730,7 +733,8 @@ object ClickConfigStore {
                     .coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT),
                 refPresetId = obj.optString("refPresetId", ""),
                 subDurationMs = obj.optLong("subDurationMs", ClickTarget.DEFAULT_SUB_DURATION_MS)
-                    .coerceIn(ClickTarget.MIN_SUB_DURATION_MS, ClickTarget.MAX_SUB_DURATION_MS)
+                    .coerceIn(ClickTarget.MIN_SUB_DURATION_MS, ClickTarget.MAX_SUB_DURATION_MS),
+                triggerTargetZone = obj.optBoolean("triggerTargetZone", true)
             )
         }
         return result
@@ -759,6 +763,7 @@ object ClickConfigStore {
                 put("repeatCount", t.repeatCount.coerceIn(ClickTarget.MIN_REPEAT_COUNT, ClickTarget.MAX_REPEAT_COUNT))
                 if (t.refPresetId.isNotBlank()) put("refPresetId", t.refPresetId)
                 put("subDurationMs", t.subDurationMs.coerceIn(ClickTarget.MIN_SUB_DURATION_MS, ClickTarget.MAX_SUB_DURATION_MS))
+                put("triggerTargetZone", t.triggerTargetZone)
             }
             array.put(obj)
         }

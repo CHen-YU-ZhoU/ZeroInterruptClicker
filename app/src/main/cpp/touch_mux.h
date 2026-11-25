@@ -53,7 +53,11 @@ enum class TargetTriggerMode : int32_t {
 enum class TargetTriggerEvent : int32_t {
     TAP = 1,
     HOLD_START = 2,
-    HOLD_END = 3
+    HOLD_END = 3,
+    NATIVE_TAP_STARTED = 4,
+    NATIVE_TAP_STOPPED = 5,
+    NATIVE_HOLD_STARTED = 6,
+    NATIVE_HOLD_STOPPED = 7
 };
 
 struct TargetTriggerZone {
@@ -334,7 +338,9 @@ private:
     void syncEngineTargetTriggerConfig();
     void resetEngineTriggerSlots(bool emitHoldEnd);
     void processEngineTriggerSynFrame(int64_t nowNs);
-    void stepEngineTargetLongPress(int64_t nowNs);
+    void buildSequentialStages(const std::vector<NativeClickTarget>& list, int64_t startNs);
+    bool triggerInstantStart(int64_t nowNs);
+    bool triggerInstantStop(int64_t nowNs);
     void syncTouchTriggerWatcherState();
     void stopTouchTriggerWatchThread();
     void touchTriggerWatchLoop();

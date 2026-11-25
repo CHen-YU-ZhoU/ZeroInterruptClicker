@@ -122,7 +122,8 @@ data class MainScreenCallbacks(
         swipeDurationMs: Long,
         repeatCount: Int,
         refPresetId: String,
-        subDurationMs: Long
+        subDurationMs: Long,
+        triggerTargetZone: Boolean
     ) -> Unit,
     val onTogglePresetTargetEnabled: (Int, Boolean) -> Unit,
     val onDeletePresetTarget: (Int) -> Unit,

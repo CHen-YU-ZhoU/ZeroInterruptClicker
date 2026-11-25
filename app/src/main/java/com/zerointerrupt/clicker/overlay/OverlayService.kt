@@ -568,10 +568,10 @@ class OverlayService : Service(), ControlBarView.Listener {
         val metrics = ShizukuController.getDisplayScreenMetrics(this)
         val stored = preset.targets.map { t -> t.copy().also { it.remapToScreen(metrics.widthPx, metrics.heightPx) } }
         val currentSig = targets.map {
-            listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled, it.actionType, it.endX, it.endY, it.swipeDurationMs, it.repeatCount, it.refPresetId, it.subDurationMs)
+            listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled, it.actionType, it.endX, it.endY, it.swipeDurationMs, it.repeatCount, it.refPresetId, it.subDurationMs, it.triggerTargetZone)
         }
         val storedSig = stored.map {
-            listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled, it.actionType, it.endX, it.endY, it.swipeDurationMs, it.repeatCount, it.refPresetId, it.subDurationMs)
+            listOf(it.id, it.x, it.y, it.intervalMs, it.pressDurationMs, it.microJitter, it.enabled, it.actionType, it.endX, it.endY, it.swipeDurationMs, it.repeatCount, it.refPresetId, it.subDurationMs, it.triggerTargetZone)
         }
         val presetSwitched = activePresetId != preset.id
         val rawChanged = activeIsRawMacro != preset.isRawMacro || activeRawMacroJson != preset.rawMacroJson
@@ -1710,7 +1710,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         pendingAutoLockStartRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingAutoLockStartRunnable = null
         clickingStartedByTargetHold = false
-        runSessionSeq++
+        val stopSeq = ++runSessionSeq
         if (!isClicking) return
         cancelAutoCollapse()
         isClicking = false
@@ -1718,8 +1718,11 @@ class OverlayService : Service(), ControlBarView.Listener {
         refreshAnchorVisuals()
         refreshControlBarState()
         serviceScope.launch(Dispatchers.IO) {
+            ShizukuController.stopClicking()
             clickEngineMutex.withLock {
-                ShizukuController.stopClicking()
+                if (stopSeq == runSessionSeq && !isClicking) {
+                    ShizukuController.stopClicking()
+                }
             }
         }
         if (!isBarCollapsed) {
@@ -1730,6 +1733,49 @@ class OverlayService : Service(), ControlBarView.Listener {
     private fun handleTargetTriggerEvent(eventType: Int) {
         val settings = ClickConfigStore.loadSettings(this)
         when (eventType) {
+            TouchMuxUserService.TARGET_EVENT_NATIVE_HOLD_STARTED,
+            TouchMuxUserService.TARGET_EVENT_NATIVE_TAP_STARTED -> {
+                val isHold = eventType == TouchMuxUserService.TARGET_EVENT_NATIVE_HOLD_STARTED
+                val allowed = if (isHold) settings.targetLongPressTriggerEnabled else settings.targetTapTriggerEnabled
+                if (!allowed ||
+                    !normalOverlayAttached ||
+                    !isLocked ||
+                    activeIsRawMacro ||
+                    macroRecordOverlay?.isActive() == true
+                ) {
+                    stopClickingInternal()
+                    return
+                }
+                pendingAutoLockStartRunnable?.let { mainHandler.removeCallbacks(it) }
+                pendingAutoLockStartRunnable = null
+                cancelAutoCollapse()
+                runSessionSeq++
+                clickingStartedByTargetHold = isHold
+                if (!isClicking) {
+                    isClicking = true
+                    OverlayStateHub.setClickingRunning(this, true)
+                    refreshAnchorVisuals()
+                    refreshControlBarState()
+                    scheduleAutoCollapse(START_COLLAPSE_DELAY_MS)
+                }
+            }
+            TouchMuxUserService.TARGET_EVENT_NATIVE_HOLD_STOPPED,
+            TouchMuxUserService.TARGET_EVENT_NATIVE_TAP_STOPPED -> {
+                pendingAutoLockStartRunnable?.let { mainHandler.removeCallbacks(it) }
+                pendingAutoLockStartRunnable = null
+                clickingStartedByTargetHold = false
+                runSessionSeq++
+                if (isClicking) {
+                    cancelAutoCollapse()
+                    isClicking = false
+                    OverlayStateHub.setClickingRunning(this, false)
+                    refreshAnchorVisuals()
+                    refreshControlBarState()
+                    if (!isBarCollapsed) {
+                        scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+                    }
+                }
+            }
             TouchMuxUserService.TARGET_EVENT_TAP -> {
                 if (!settings.targetTapTriggerEnabled ||
                     !normalOverlayAttached ||
@@ -1792,14 +1838,18 @@ class OverlayService : Service(), ControlBarView.Listener {
 
         val zones = buildExpandedDisplayEntries()
             .map { it.target }
-            .filter { it.enabled && (it.actionType == ActionType.TAP || it.actionType == ActionType.HOLD) }
+            .filter {
+                it.enabled &&
+                    it.triggerTargetZone &&
+                    (it.actionType == ActionType.TAP || it.actionType == ActionType.HOLD)
+            }
         if (zones.isEmpty()) {
             ShizukuController.clearTargetTriggerConfigAsync()
             return
         }
 
         val density = resources.displayMetrics.density
-        val zoneRadiusPx = 21f * density
+        val zoneRadiusPx = 32f * density
         val xs = FloatArray(zones.size) { zones[it].x }
         val ys = FloatArray(zones.size) { zones[it].y }
         val rs = FloatArray(zones.size) { zoneRadiusPx }
@@ -1825,8 +1875,13 @@ class OverlayService : Service(), ControlBarView.Listener {
         }
         val slopPx = maxOf(
             ViewConfiguration.get(this).scaledTouchSlop.toFloat(),
-            18f * density
+            32f * density
         )
+
+        val targetsSnapshot = targets.map { it.copy() }
+        val modeSnapshot = activeExecutionMode
+        val loopSnapshot = activePresetLoopCount
+        val hasEnabledPayload = targetsSnapshot.any { it.enabled }
 
         serviceScope.launch(Dispatchers.IO) {
             if (preArmNative) {
@@ -1838,6 +1893,13 @@ class OverlayService : Service(), ControlBarView.Listener {
                 ) {
                     ShizukuController.ensureNativeIfVerified()
                 }
+            }
+            if (hasEnabledPayload) {
+                ShizukuController.updateTargets(
+                    targets = targetsSnapshot,
+                    executionMode = modeSnapshot,
+                    presetLoopCount = loopSnapshot
+                )
             }
             ShizukuController.setTargetTriggerConfig(
                 mode = mode,

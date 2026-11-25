@@ -867,7 +867,7 @@ class MainActivity : ComponentActivity() {
                     showMessage(scope, "已批量添加 ${created.size} 个空方案")
                 }
             },
-            onSavePresetTarget = { targetId, x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs ->
+            onSavePresetTarget = { targetId, x, y, intervalMs, pressMs, jitter, enabled, actionType, endX, endY, swipeDur, repeatCount, refPresetId, subDurationMs, triggerTargetZone ->
                 val metrics = ShizukuController.getDisplayScreenMetrics(this)
                 val settings = ClickConfigStore.loadSettings(this)
                 val current = ClickConfigStore.loadTargetsForScreen(this, metrics.widthPx, metrics.heightPx)
@@ -892,7 +892,8 @@ class MainActivity : ComponentActivity() {
                         swipeDurationMs = swipeDur,
                         repeatCount = safeRepeat,
                         refPresetId = refPresetId,
-                        subDurationMs = safeSubDur
+                        subDurationMs = safeSubDur,
+                        triggerTargetZone = triggerTargetZone
                     ).apply {
                         if (actionType != ActionType.SUB_PRESET) {
                             setStartPixel(x, y, metrics.widthPx, metrics.heightPx)
@@ -912,7 +913,8 @@ class MainActivity : ComponentActivity() {
                             swipeDurationMs = swipeDur,
                             repeatCount = safeRepeat,
                             refPresetId = refPresetId,
-                            subDurationMs = safeSubDur
+                            subDurationMs = safeSubDur,
+                            triggerTargetZone = triggerTargetZone
                         ).apply {
                             if (actionType != ActionType.SUB_PRESET) {
                                 setStartPixel(x, y, metrics.widthPx, metrics.heightPx)

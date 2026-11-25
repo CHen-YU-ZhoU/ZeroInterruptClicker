@@ -1435,7 +1435,8 @@ fun TargetEditDialog(
         swipeDurationMs: Long,
         repeatCount: Int,
         refPresetId: String,
-        subDurationMs: Long
+        subDurationMs: Long,
+        triggerTargetZone: Boolean
     ) -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
@@ -1491,6 +1492,7 @@ fun TargetEditDialog(
     }
     var jitter by remember { mutableStateOf(initial?.microJitter ?: defaultJitter) }
     var enabled by remember { mutableStateOf(initial?.enabled ?: true) }
+    var triggerTargetZone by remember { mutableStateOf(initial?.triggerTargetZone ?: true) }
 
     val canSave = actionType != ActionType.SUB_PRESET || refPresetId.isNotBlank()
 
@@ -1860,6 +1862,16 @@ fun TargetEditDialog(
                     Text("启用该步骤", style = MaterialTheme.typography.bodyMedium)
                     CheckSwitch(checked = enabled, onCheckedChange = { enabled = it })
                 }
+                if (actionType == ActionType.TAP || actionType == ActionType.HOLD) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("设为触发目标区域", style = MaterialTheme.typography.bodyMedium)
+                        CheckSwitch(checked = triggerTargetZone, onCheckedChange = { triggerTargetZone = it })
+                    }
+                }
             }
         },
         confirmButton = {
@@ -1901,7 +1913,8 @@ fun TargetEditDialog(
                         x, y, interval, press, jitter, enabled, actionType,
                         ex, ey, swipeDur, repeatCount,
                         if (actionType == ActionType.SUB_PRESET) refPresetId else "",
-                        subDur
+                        subDur,
+                        triggerTargetZone
                     )
                 }
             ) { Text("保存") }
