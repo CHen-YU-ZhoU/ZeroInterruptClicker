@@ -137,5 +137,6 @@ data class MainScreenCallbacks(
     val onPreferredBackendChange: (Int) -> Unit,
     val onRpcBridgeEnabledChange: (Boolean) -> Unit,
     val onResetRpcToken: () -> Unit,
-    val onCopyText: (label: String, text: String) -> Unit
+    val onCopyText: (label: String, text: String) -> Unit,
+    val onCheckUpdate: () -> Unit = {}
 )

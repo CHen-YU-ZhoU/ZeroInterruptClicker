@@ -23,7 +23,23 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -31,6 +47,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.zerointerrupt.clicker.BuildConfig
 import com.zerointerrupt.clicker.QuickTileService
@@ -47,6 +66,8 @@ import com.zerointerrupt.clicker.overlay.OverlayStateHub
 import com.zerointerrupt.clicker.shizuku.ShizukuConnectionState
 import com.zerointerrupt.clicker.shizuku.ShizukuController
 import com.zerointerrupt.clicker.ui.theme.ZeroInterruptTheme
+import com.zerointerrupt.clicker.update.GitHubReleaseInfo
+import com.zerointerrupt.clicker.update.GitHubUpdateChecker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -58,6 +79,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var snackbarHostState: SnackbarHostState
     private var currentActiveTab by mutableStateOf(MainTab.HOME)
     private var requestedTab by mutableStateOf<MainTab?>(null)
+    private var pendingUpdateRelease by mutableStateOf<GitHubReleaseInfo?>(null)
+    private var isCheckingUpdate: Boolean = false
 
     private var uiModel by mutableStateOf(
         MainUiState(
@@ -198,6 +221,15 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
+            // Silent auto-check on launch
+            LaunchedEffect(Unit) {
+                val result = GitHubUpdateChecker.checkLatestRelease(BuildConfig.VERSION_NAME)
+                val release = result.getOrNull()
+                if (release != null && release.tagName != GitHubUpdateChecker.getIgnoredTag(this@MainActivity)) {
+                    pendingUpdateRelease = release
+                }
+            }
+
             ZeroInterruptTheme(
                 darkTheme = darkTheme,
                 dynamicColor = mergedState.dynamicColor
@@ -210,6 +242,87 @@ class MainActivity : ComponentActivity() {
                     onConsumeRequestedTab = { requestedTab = null },
                     onCurrentTabChanged = { currentActiveTab = it }
                 )
+
+                pendingUpdateRelease?.let { release ->
+                    val cs = MaterialTheme.colorScheme
+                    AlertDialog(
+                        onDismissRequest = { pendingUpdateRelease = null },
+                        shape = RoundedCornerShape(24.dp),
+                        title = {
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(
+                                    text = "发现新版本 ${release.tagName}",
+                                    style = MaterialTheme.typography.titleLarge,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Surface(
+                                    shape = CircleShape,
+                                    color = cs.secondaryContainer
+                                ) {
+                                    Text(
+                                        text = "v${BuildConfig.VERSION_NAME} → ${release.tagName}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = cs.onSecondaryContainer,
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp)
+                                    )
+                                }
+                            }
+                        },
+                        text = {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 260.dp)
+                                    .verticalScroll(rememberScrollState()),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                if (release.releaseName.isNotBlank() && release.releaseName != release.tagName) {
+                                    Text(
+                                        text = release.releaseName,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                                Text(
+                                    text = release.body.ifBlank { "包含最新功能优化与问题修复，点击下方按钮即可下载安装。" },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = cs.onSurfaceVariant
+                                )
+                            }
+                        },
+                        confirmButton = {
+                            Button(
+                                onClick = {
+                                    val targetUrl = release.apkDownloadUrl ?: release.htmlUrl
+                                    pendingUpdateRelease = null
+                                    openExternalUrl(scope, targetUrl)
+                                },
+                                shape = CircleShape
+                            ) {
+                                Text(
+                                    text = if (release.apkDownloadUrl != null) "下载 APK" else "前往下载",
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        },
+                        dismissButton = {
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                TextButton(
+                                    onClick = {
+                                        GitHubUpdateChecker.setIgnoredTag(this@MainActivity, release.tagName)
+                                        pendingUpdateRelease = null
+                                    }
+                                ) {
+                                    Text("忽略此版")
+                                }
+                                TextButton(onClick = { pendingUpdateRelease = null }) {
+                                    Text("稍后")
+                                }
+                            }
+                        }
+                    )
+                }
             }
         }
     }
@@ -916,6 +1029,31 @@ class MainActivity : ComponentActivity() {
             },
             onCopyText = { label, text ->
                 copyToClipboard(scope, label, text)
+            },
+            onCheckUpdate = {
+                if (!isCheckingUpdate) {
+                    isCheckingUpdate = true
+                    showMessage(scope, "正在检查 GitHub 最新版本…")
+                    scope.launch {
+                        try {
+                            val result = GitHubUpdateChecker.checkLatestRelease(BuildConfig.VERSION_NAME)
+                            result.onSuccess { release ->
+                                if (release != null) {
+                                    if (::snackbarHostState.isInitialized) {
+                                        snackbarHostState.currentSnackbarData?.dismiss()
+                                    }
+                                    pendingUpdateRelease = release
+                                } else {
+                                    showMessage(scope, "当前已是最新版本 (v${BuildConfig.VERSION_NAME})")
+                                }
+                            }.onFailure { err ->
+                                showMessage(scope, "检查更新失败：${err.message ?: "网络异常"}")
+                            }
+                        } finally {
+                            isCheckingUpdate = false
+                        }
+                    }
+                }
             }
         )
     }
@@ -1002,6 +1140,14 @@ class MainActivity : ComponentActivity() {
             showMessage(scope, "桌面图标已设为「$modeLabel」，返回桌面后生效")
         } catch (t: Throwable) {
             showMessage(scope, "切换图标失败: ${t.message ?: "未知错误"}")
+        }
+    }
+
+    private fun openExternalUrl(scope: kotlinx.coroutines.CoroutineScope, url: String) {
+        runCatching {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        }.onFailure {
+            showMessage(scope, "无法打开下载链接")
         }
     }
 
