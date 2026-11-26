@@ -1,8 +1,11 @@
 package com.zerointerrupt.clicker.ui.components
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
@@ -12,6 +15,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -24,6 +29,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -36,6 +43,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledTonalButton
@@ -56,9 +64,11 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -71,6 +81,7 @@ import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -80,6 +91,8 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
 import com.zerointerrupt.clicker.R
 import com.zerointerrupt.clicker.model.ActionType
 import com.zerointerrupt.clicker.model.ClickConfigStore
@@ -475,14 +488,33 @@ private fun SlotLegendDot(label: String, color: Color) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SetupWizardBottomSheet(
     state: MainUiState,
     callbacks: MainScreenCallbacks,
     onDismiss: () -> Unit
 ) {
+    val cs = MaterialTheme.colorScheme
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val pagerScope = rememberCoroutineScope()
+    val initialPage = remember {
+        if (state.authMode == ClickGlobalSettings.AUTH_MODE_ROOT) 1 else 0
+    }
+    val pagerState = rememberPagerState(initialPage = initialPage, pageCount = { 2 })
+
+    val isShizukuActive = state.authMode == ClickGlobalSettings.AUTH_MODE_SHIZUKU
+    val isRootActive = state.authMode == ClickGlobalSettings.AUTH_MODE_ROOT
+    val shizukuConnected = isShizukuActive && state.connectionState == ShizukuConnectionState.CONNECTED
+    val rootConnected = isRootActive && state.connectionState == ShizukuConnectionState.CONNECTED
+
+    val modeTabs = remember {
+        listOf(
+            ExpressiveOption(0, "Shizuku 模式", R.drawable.ic_terminal),
+            ExpressiveOption(1, "Root 极速模式", R.drawable.ic_shield_check)
+        )
+    }
+
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
@@ -496,179 +528,628 @@ fun SetupWizardBottomSheet(
                 .padding(bottom = 28.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
-                text = "初始化向导",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold
-            )
-
-            var stepNum = 1
-            WizardStepCard(
-                step = (stepNum++).toString(),
-                title = "悬浮窗权限",
-                subtitle = if (state.overlayPermGranted) "已授权" else "未授权",
-                done = state.overlayPermGranted,
-                actionLabel = if (state.overlayPermGranted) "已完成" else "去开启",
-                onAction = callbacks.onGrantOverlay
-            )
-
-            if (state.showNotifRow) {
-                WizardStepCard(
-                    step = (stepNum++).toString(),
-                    title = "通知权限（建议）",
-                    subtitle = if (state.notifPermGranted) "已授权" else "用于前台保活显示",
-                    done = state.notifPermGranted,
-                    actionLabel = if (state.notifPermGranted) "已完成" else "授予",
-                    onAction = callbacks.onGrantNotif
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "初始化向导",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
                 )
+                val readyLabel = when {
+                    !state.needsSetupWizard && isRootActive -> "已就绪 · Root"
+                    !state.needsSetupWizard -> "已就绪 · Shizuku"
+                    else -> "任选一页完成"
+                }
+                val badgeBg = if (!state.needsSetupWizard) cs.primaryContainer else cs.secondaryContainer
+                val badgeFg = if (!state.needsSetupWizard) cs.onPrimaryContainer else cs.onSecondaryContainer
+                Surface(
+                    shape = CircleShape,
+                    color = badgeBg
+                ) {
+                    Text(
+                        text = readyLabel,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = badgeFg,
+                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 4.dp)
+                    )
+                }
             }
 
-            WizardStepCard(
-                step = (stepNum++).toString(),
-                title = "省电策略（建议）",
-                subtitle = if (state.batteryOptIgnored) "已忽略电池优化" else "建议设为无限制，防止后台断连",
-                done = state.batteryOptIgnored,
-                actionLabel = if (state.batteryOptIgnored) "已完成" else "去设置",
-                onAction = callbacks.onGrantBatteryOpt
+            val calibrating = state.selfCheckRemainingMs > 0L
+            ExpressiveConnectedGroup(
+                options = modeTabs,
+                selectedValue = pagerState.currentPage,
+                onSelect = { page ->
+                    if (!calibrating) {
+                        pagerScope.launch {
+                            pagerState.animateScrollToPage(page)
+                        }
+                    }
+                },
+                height = 44.dp
             )
 
-            val shizukuConnected = state.connectionState == ShizukuConnectionState.CONNECTED
-            val shizukuBtn = when (state.connectionState) {
+            Text(
+                text = if (pagerState.currentPage == 0) {
+                    "免 Root 通用方案 · 依次授予系统权限并连接 Shizuku 后校准"
+                } else {
+                    "已 Root 设备推荐 · 1 次授权自动配齐全部权限，仅需 2 步完成"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = cs.onSurfaceVariant
+            )
+
+            HorizontalPager(
+                state = pagerState,
+                userScrollEnabled = !calibrating,
+                pageSpacing = 14.dp,
+                verticalAlignment = Alignment.Top,
+                beyondViewportPageCount = 1,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .animateContentSize(
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        )
+                    )
+            ) { page ->
+                if (page == 0) {
+                    ShizukuWizardPage(
+                        state = state,
+                        callbacks = callbacks,
+                        shizukuConnected = shizukuConnected,
+                        rootCurrentlyActive = rootConnected,
+                        onDismiss = onDismiss
+                    )
+                } else {
+                    RootWizardPage(
+                        state = state,
+                        callbacks = callbacks,
+                        rootConnected = rootConnected,
+                        shizukuCurrentlyActive = shizukuConnected,
+                        onDismiss = onDismiss
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShizukuWizardPage(
+    state: MainUiState,
+    callbacks: MainScreenCallbacks,
+    shizukuConnected: Boolean,
+    rootCurrentlyActive: Boolean,
+    onDismiss: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        if (rootCurrentlyActive) {
+            WizardModeSwitchHint(
+                text = "当前已通过 Root 通道运行；如需改用 Shizuku，点击下方「授权连接」即可切换"
+            )
+        }
+
+        var stepNum = 1
+        WizardStepCard(
+            step = (stepNum++).toString(),
+            title = "悬浮窗权限",
+            subtitle = if (state.overlayPermGranted) "已授权" else "未授权",
+            done = state.overlayPermGranted,
+            actionLabel = if (state.overlayPermGranted) "已完成" else "去开启",
+            onAction = callbacks.onGrantOverlay
+        )
+
+        if (state.showNotifRow) {
+            WizardStepCard(
+                step = (stepNum++).toString(),
+                title = "通知权限（建议）",
+                subtitle = if (state.notifPermGranted) "已授权" else "用于前台保活显示",
+                done = state.notifPermGranted,
+                actionLabel = if (state.notifPermGranted) "已完成" else "授予",
+                onAction = callbacks.onGrantNotif
+            )
+        }
+
+        WizardStepCard(
+            step = (stepNum++).toString(),
+            title = "省电策略（建议）",
+            subtitle = if (state.batteryOptIgnored) "已忽略电池优化" else "建议设为无限制，防止后台断连",
+            done = state.batteryOptIgnored,
+            actionLabel = if (state.batteryOptIgnored) "已完成" else "去设置",
+            onAction = callbacks.onGrantBatteryOpt
+        )
+
+        val shizukuBtn = if (state.authMode != ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+            "切换并连接"
+        } else {
+            when (state.connectionState) {
                 ShizukuConnectionState.SHIZUKU_NOT_RUNNING -> "打开 Shizuku"
                 ShizukuConnectionState.NO_PERMISSION -> "授权连接"
                 ShizukuConnectionState.BINDING -> "连接中..."
                 ShizukuConnectionState.CONNECTED -> "已连接"
                 ShizukuConnectionState.ERROR -> "重试"
             }
-            WizardStepCard(
-                step = (stepNum++).toString(),
-                title = "Shizuku 通道",
-                subtitle = if (shizukuConnected) "已连接" else "未连接",
-                done = shizukuConnected,
-                actionLabel = shizukuBtn,
-                onAction = callbacks.onGrantShizuku
-            )
+        }
+        WizardStepCard(
+            step = (stepNum++).toString(),
+            title = "Shizuku 通道",
+            subtitle = when {
+                shizukuConnected -> "已连接 (UID ${state.engineSnapshot.uid.takeIf { it >= 0 } ?: 2000})"
+                state.authMode == ClickGlobalSettings.AUTH_MODE_SHIZUKU &&
+                    state.connectionState == ShizukuConnectionState.BINDING -> "正在绑定底层服务…"
+                else -> "未连接"
+            },
+            done = shizukuConnected,
+            actionLabel = shizukuBtn,
+            onAction = callbacks.onGrantShizuku
+        )
 
-            // Last step: 5-second touch calibration (when hardware touch node readable)
-            val touchReadable = state.engineSnapshot.touchDeviceReadable &&
-                state.preferredBackend != ClickGlobalSettings.BACKEND_FALLBACK
-            if (shizukuConnected && touchReadable) {
-                val calStepNum = stepNum.toString()
-                val testing = state.selfCheckRemainingMs > 0L
+        val touchReadable = state.engineSnapshot.touchDeviceReadable &&
+            state.preferredBackend != ClickGlobalSettings.BACKEND_FALLBACK
+        TouchCalibrationStepCard(
+            stepNumber = stepNum.toString(),
+            channelConnected = shizukuConnected,
+            touchReadable = touchReadable,
+            lockedHint = "连接 Shizuku 通道后解锁触控校准",
+            state = state,
+            callbacks = callbacks,
+            onDismiss = onDismiss
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun RootWizardPage(
+    state: MainUiState,
+    callbacks: MainScreenCallbacks,
+    rootConnected: Boolean,
+    shizukuCurrentlyActive: Boolean,
+    onDismiss: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    val allRootPermsReady = rootConnected &&
+        state.overlayPermGranted &&
+        (!state.showNotifRow || state.notifPermGranted) &&
+        state.batteryOptIgnored
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        if (shizukuCurrentlyActive) {
+            WizardModeSwitchHint(
+                text = "当前已通过 Shizuku 通道运行；授权 Root 后将自动切换至 UID 0 直连模式"
+            )
+        }
+
+        // Compact M3 Tonal highlight banner explaining the 2-step Root fast path
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = cs.primaryContainer.copy(alpha = 0.45f),
+            border = BorderStroke(1.dp, cs.primary.copy(alpha = 0.18f))
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = MaterialTheme.colorScheme.surfaceContainerHigh
+                    shape = CircleShape,
+                    color = cs.primary.copy(alpha = 0.14f),
+                    modifier = Modifier.size(36.dp)
                 ) {
-                    Column(
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_bolt),
+                            contentDescription = null,
+                            tint = cs.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(
+                        text = "一次 Root 授权，全自动托管配置",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = cs.onPrimaryContainer
+                    )
+                    Text(
+                        text = "免跳转自动授予悬浮窗、通知与省电白名单，并直连 UID 0 引擎",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = cs.onPrimaryContainer.copy(alpha = 0.82f)
+                    )
+                }
+            }
+        }
+
+        // Step 1: One-click Root superuser authorization + auto permissions
+        val step1Done = rootConnected && state.overlayPermGranted
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = cs.surfaceContainerHigh
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(28.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (step1Done) cs.primary else cs.secondaryContainer
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = if (step1Done) "✓" else "1",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = if (step1Done) cs.onPrimary else cs.onSecondaryContainer
+                        )
+                    }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Root 超级用户授权",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = when {
+                                state.rootConnecting -> "正在请求 Root 权限并自动配置全部系统项…"
+                                allRootPermsReady -> "UID 0 引擎与系统权限已全部自动就绪"
+                                rootConnected -> "Root 引擎已连接，可点击下方未就绪标签快速补授"
+                                !state.rootErrorMessage.isNullOrBlank() -> state.rootErrorMessage
+                                else -> "授予一次 Root，自动代替所有手工授权步骤"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (!state.rootErrorMessage.isNullOrBlank() && !rootConnected && !state.rootConnecting) {
+                                cs.error
+                            } else {
+                                cs.onSurfaceVariant
+                            }
+                        )
+                    }
+                    if (rootConnected) {
+                        Surface(
+                            shape = CircleShape,
+                            color = cs.primaryContainer
+                        ) {
+                            Text(
+                                text = "UID 0",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = cs.onPrimaryContainer,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Live auto-granted checklist pills (tap any ungranted pill as ROM fallback)
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    RootAutoPermChip(
+                        label = "Root 引擎",
+                        granted = rootConnected,
+                        onClick = if (!rootConnected && !state.rootConnecting) callbacks.onGrantRoot else null
+                    )
+                    RootAutoPermChip(
+                        label = "悬浮窗",
+                        granted = state.overlayPermGranted,
+                        onClick = if (!state.overlayPermGranted) callbacks.onGrantOverlay else null
+                    )
+                    if (state.showNotifRow) {
+                        RootAutoPermChip(
+                            label = "通知",
+                            granted = state.notifPermGranted,
+                            onClick = if (!state.notifPermGranted) callbacks.onGrantNotif else null
+                        )
+                    }
+                    RootAutoPermChip(
+                        label = "省电白名单",
+                        granted = state.batteryOptIgnored,
+                        onClick = if (!state.batteryOptIgnored) callbacks.onGrantBatteryOpt else null
+                    )
+                }
+
+                if (allRootPermsReady) {
+                    FilledTonalButton(
+                        onClick = callbacks.onGrantRoot,
+                        enabled = !state.rootConnecting,
+                        shape = CircleShape,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                            .height(42.dp),
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = cs.secondaryContainer.copy(alpha = 0.65f)
+                        )
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(28.dp)
-                                    .clip(CircleShape)
-                                    .background(
-                                        if (state.selfCheckPassed) MaterialTheme.colorScheme.primary
-                                        else MaterialTheme.colorScheme.secondaryContainer
-                                    ),
-                                contentAlignment = Alignment.Center
+                        Text("Root 已就绪 · 重新检测", fontWeight = FontWeight.SemiBold)
+                    }
+                } else {
+                    Button(
+                        onClick = callbacks.onGrantRoot,
+                        enabled = !state.rootConnecting,
+                        shape = CircleShape,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(44.dp)
+                    ) {
+                        if (state.rootConnecting) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = cs.onPrimary
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text("正在授权并自动配置…", fontWeight = FontWeight.SemiBold)
+                        } else {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_shield_check),
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = if (rootConnected) "重新自动配置权限" else "一键授权 Root 并自动配置",
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 2: 5-second touch calibration (always visible so the 2-step flow is crystal clear)
+        val touchReadable = state.engineSnapshot.touchDeviceReadable &&
+            state.preferredBackend != ClickGlobalSettings.BACKEND_FALLBACK
+        TouchCalibrationStepCard(
+            stepNumber = "2",
+            channelConnected = rootConnected,
+            touchReadable = touchReadable,
+            lockedHint = "完成步骤 1 Root 授权后解锁校准",
+            state = state,
+            callbacks = callbacks,
+            onDismiss = onDismiss
+        )
+    }
+}
+
+@Composable
+private fun WizardModeSwitchHint(text: String) {
+    val cs = MaterialTheme.colorScheme
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = cs.tertiaryContainer.copy(alpha = 0.5f)
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodySmall,
+            color = cs.onTertiaryContainer,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 9.dp)
+        )
+    }
+}
+
+@Composable
+private fun RootAutoPermChip(
+    label: String,
+    granted: Boolean,
+    onClick: (() -> Unit)?
+) {
+    val cs = MaterialTheme.colorScheme
+    val bg by animateColorAsState(
+        targetValue = if (granted) cs.primaryContainer else cs.surfaceContainerHighest,
+        animationSpec = tween(200),
+        label = "rootPermBg_$label"
+    )
+    val fg by animateColorAsState(
+        targetValue = if (granted) cs.onPrimaryContainer else cs.onSurfaceVariant,
+        animationSpec = tween(200),
+        label = "rootPermFg_$label"
+    )
+    Surface(
+        shape = CircleShape,
+        color = bg,
+        border = if (!granted) BorderStroke(1.dp, cs.outlineVariant.copy(alpha = 0.45f)) else null,
+        modifier = if (onClick != null) {
+            Modifier
+                .clip(CircleShape)
+                .clickable(onClick = onClick)
+        } else {
+            Modifier
+        }
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text(
+                text = if (granted) "✓" else "○",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (granted) cs.primary else cs.onSurfaceVariant
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = if (granted) FontWeight.SemiBold else FontWeight.Medium,
+                color = fg
+            )
+        }
+    }
+}
+
+@Composable
+private fun TouchCalibrationStepCard(
+    stepNumber: String,
+    channelConnected: Boolean,
+    touchReadable: Boolean,
+    lockedHint: String,
+    state: MainUiState,
+    callbacks: MainScreenCallbacks,
+    onDismiss: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    val testing = state.selfCheckRemainingMs > 0L
+    val calibrationNeeded = !channelConnected || touchReadable
+    val stepDone = channelConnected && (!touchReadable || state.selfCheckPassed)
+    val cardAlpha = if (channelConnected) 1f else 0.62f
+
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = cs.surfaceContainerHigh,
+        modifier = Modifier.alpha(cardAlpha)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (stepDone) cs.primary else cs.secondaryContainer
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = if (stepDone) "✓" else stepNumber,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = if (stepDone) cs.onPrimary else cs.onSecondaryContainer
+                    )
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "5 秒触控校准",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = when {
+                            !channelConnected -> lockedHint
+                            !calibrationNeeded -> "当前后端无需硬件独占校准，可直接开启"
+                            testing -> "请滑动屏幕测试触控，正常后点击确认"
+                            state.selfCheckPassed -> "已通过，零断触引擎就绪"
+                            else -> "验证物理触控合流并开启安全回滚保护"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = cs.onSurfaceVariant
+                    )
+                }
+            }
+
+            if (testing && channelConnected) {
+                val sec = (state.selfCheckRemainingMs + 999L) / 1000L
+                val smoothProgress = remember { Animatable(1f) }
+                LaunchedEffect(testing) {
+                    smoothProgress.snapTo(1f)
+                    smoothProgress.animateTo(
+                        targetValue = 0f,
+                        animationSpec = tween(
+                            durationMillis = state.selfCheckTimeoutMs.coerceAtLeast(1000L).toInt(),
+                            easing = LinearEasing
+                        )
+                    )
+                }
+                M3WavyLinearProgressIndicator(
+                    progress = { smoothProgress.value },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = callbacks.onRollbackSelfCheck,
+                        shape = CircleShape,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("立即回滚")
+                    }
+                    Button(
+                        onClick = callbacks.onConfirmSelfCheck,
+                        shape = CircleShape,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("触控正常 (${sec}s)")
+                    }
+                }
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    if (stepDone) {
+                        if (touchReadable) {
+                            OutlinedButton(
+                                onClick = callbacks.onStartSelfCheck,
+                                shape = CircleShape,
+                                modifier = Modifier.weight(1f)
                             ) {
-                                Text(
-                                    text = if (state.selfCheckPassed) "✓" else calStepNum,
-                                    style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = if (state.selfCheckPassed) MaterialTheme.colorScheme.onPrimary
-                                    else MaterialTheme.colorScheme.onSecondaryContainer
-                                )
-                            }
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "5 秒触控校准",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                                Text(
-                                    text = when {
-                                        testing -> "滑动屏幕测试并点击确认"
-                                        state.selfCheckPassed -> "已通过"
-                                        else -> "待校准"
-                                    },
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                                Text("重新校准")
                             }
                         }
-
-                        if (testing) {
-                            val sec = (state.selfCheckRemainingMs + 999L) / 1000L
-                            val smoothProgress = remember { Animatable(1f) }
-                            LaunchedEffect(testing) {
-                                smoothProgress.snapTo(1f)
-                                smoothProgress.animateTo(
-                                    targetValue = 0f,
-                                    animationSpec = tween(
-                                        durationMillis = state.selfCheckTimeoutMs.coerceAtLeast(1000L).toInt(),
-                                        easing = LinearEasing
-                                    )
-                                )
-                            }
-                            M3WavyLinearProgressIndicator(
-                                progress = { smoothProgress.value },
-                                modifier = Modifier.fillMaxWidth()
+                        Button(
+                            onClick = {
+                                onDismiss()
+                                callbacks.onToggleOverlay()
+                            },
+                            enabled = state.overlayPermGranted,
+                            shape = CircleShape,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(if (state.overlayVisible) "关闭悬浮窗" else "立即开启悬浮窗")
+                        }
+                    } else {
+                        Button(
+                            onClick = callbacks.onStartSelfCheck,
+                            enabled = channelConnected,
+                            shape = CircleShape,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = if (channelConnected) "开始 5 秒触控校准" else "等待通道连接",
+                                fontWeight = FontWeight.SemiBold
                             )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
-                            ) {
-                                OutlinedButton(
-                                    onClick = callbacks.onRollbackSelfCheck,
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Text("立即回滚")
-                                }
-                                Button(
-                                    onClick = callbacks.onConfirmSelfCheck,
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Text("触控正常 (${sec}s)")
-                                }
-                            }
-                        } else {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
-                            ) {
-                                if (state.selfCheckPassed) {
-                                    OutlinedButton(
-                                        onClick = callbacks.onStartSelfCheck,
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Text("重新校准")
-                                    }
-                                    Button(
-                                        onClick = {
-                                            onDismiss()
-                                            callbacks.onToggleOverlay()
-                                        },
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Text(if (state.overlayVisible) "关闭悬浮窗" else "立即开启悬浮窗")
-                                    }
-                                } else {
-                                    Button(
-                                        onClick = callbacks.onStartSelfCheck,
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) {
-                                        Text("开始 5 秒触控校准")
-                                    }
-                                }
-                            }
                         }
                     }
                 }

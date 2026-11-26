@@ -5,8 +5,10 @@ import android.content.Context
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
+import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.provider.Settings
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Display
@@ -21,6 +23,7 @@ import com.zerointerrupt.clicker.model.ClickPreset
 import com.zerointerrupt.clicker.model.ClickTarget
 import com.zerointerrupt.clicker.model.ExecutionMode
 import com.zerointerrupt.clicker.model.RawMacroCodec
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -31,8 +34,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import rikka.shizuku.Shizuku
+import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class ShizukuConnectionState {
     SHIZUKU_NOT_RUNNING,
@@ -66,20 +73,44 @@ data class DisplayScreenMetrics(
     val rotation: Int
 )
 
+data class RootConnectResult(
+    val success: Boolean,
+    val message: String
+)
+
 /**
- * Process-wide Shizuku UserService connection, permission, auto-rebind, and IPC controller.
+ * Process-wide privileged TouchMux service controller supporting both
+ * Shizuku UserService (UID 2000/0) and direct Root `app_process` daemon (UID 0).
  */
 object ShizukuController {
     private const val TAG = "ShizukuController"
     const val REQUEST_CODE_SHIZUKU = 10042
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val secureRandom = SecureRandom()
 
     private var appContext: Context? = null
     private var listenersRegistered = false
     private var boundArgs: Shizuku.UserServiceArgs? = null
     @Volatile
     private var service: ITouchMuxService? = null
+    @Volatile
+    private var serviceSourceMode: Int = -1
+
+    private val rootClientDeathSentinel = Binder()
+    private val rootHandshakeLock = Any()
+    private var pendingRootToken: String? = null
+    private var pendingRootDeferred: CompletableDeferred<IBinder>? = null
+    private val rootConnectInFlight = AtomicBoolean(false)
+
+    private val _activeAuthMode = MutableStateFlow(ClickGlobalSettings.AUTH_MODE_SHIZUKU)
+    val activeAuthMode: StateFlow<Int> = _activeAuthMode.asStateFlow()
+
+    private val _rootConnecting = MutableStateFlow(false)
+    val rootConnecting: StateFlow<Boolean> = _rootConnecting.asStateFlow()
+
+    private val _rootErrorMessage = MutableStateFlow<String?>(null)
+    val rootErrorMessage: StateFlow<String?> = _rootErrorMessage.asStateFlow()
 
     private val _connectionState = MutableStateFlow(ShizukuConnectionState.SHIZUKU_NOT_RUNNING)
     val connectionState: StateFlow<ShizukuConnectionState> = _connectionState.asStateFlow()
@@ -131,12 +162,18 @@ object ShizukuController {
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
         Log.i(TAG, "Shizuku binder received.")
-        evaluateShizukuState()
+        if (_activeAuthMode.value == ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+            evaluateShizukuState()
+        }
     }
 
     private val binderDeadListener = Shizuku.OnBinderDeadListener {
         Log.w(TAG, "Shizuku binder died; resetting service reference.")
-        service = null
+        if (_activeAuthMode.value != ClickGlobalSettings.AUTH_MODE_SHIZUKU) return@OnBinderDeadListener
+        if (serviceSourceMode == ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+            service = null
+            serviceSourceMode = -1
+        }
         _slotStates.value = List(16) { 0 }
         _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
         _engineSnapshot.value = _engineSnapshot.value.copy(
@@ -146,7 +183,9 @@ object ShizukuController {
     }
 
     private val permissionResultListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
-        if (requestCode == REQUEST_CODE_SHIZUKU) {
+        if (requestCode == REQUEST_CODE_SHIZUKU &&
+            _activeAuthMode.value == ClickGlobalSettings.AUTH_MODE_SHIZUKU
+        ) {
             if (grantResult == PackageManager.PERMISSION_GRANTED) {
                 bindUserService()
             } else {
@@ -160,6 +199,13 @@ object ShizukuController {
 
     private val userServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            if (_activeAuthMode.value != ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+                try {
+                    boundArgs?.let { Shizuku.unbindUserService(it, this, true) }
+                } catch (_: Throwable) {
+                }
+                return
+            }
             if (binder == null || !binder.pingBinder()) {
                 _connectionState.value = ShizukuConnectionState.ERROR
                 _engineSnapshot.value = _engineSnapshot.value.copy(
@@ -169,6 +215,7 @@ object ShizukuController {
             }
             val svc = ITouchMuxService.Stub.asInterface(binder)
             service = svc
+            serviceSourceMode = ClickGlobalSettings.AUTH_MODE_SHIZUKU
             _connectionState.value = ShizukuConnectionState.CONNECTED
             try {
                 svc.registerCallback(serviceCallback)
@@ -182,13 +229,17 @@ object ShizukuController {
             try {
                 binder.linkToDeath({
                     Log.w(TAG, "TouchMuxUserService remote process died.")
+                    if (service?.asBinder() !== binder) return@linkToDeath
                     service = null
+                    serviceSourceMode = -1
                     _slotStates.value = List(16) { 0 }
-                    if (Shizuku.pingBinder() && hasPermission()) {
-                        _connectionState.value = ShizukuConnectionState.BINDING
-                        bindUserService()
-                    } else {
-                        _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
+                    if (_activeAuthMode.value == ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+                        if (Shizuku.pingBinder() && hasPermission()) {
+                            _connectionState.value = ShizukuConnectionState.BINDING
+                            bindUserService()
+                        } else {
+                            _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
+                        }
                     }
                 }, 0)
             } catch (_: Throwable) {
@@ -197,12 +248,17 @@ object ShizukuController {
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
-            service = null
-            _slotStates.value = List(16) { 0 }
-            if (Shizuku.pingBinder() && hasPermission()) {
-                _connectionState.value = ShizukuConnectionState.BINDING
-            } else {
-                _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
+            if (serviceSourceMode == ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+                service = null
+                serviceSourceMode = -1
+                _slotStates.value = List(16) { 0 }
+            }
+            if (_activeAuthMode.value == ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+                if (Shizuku.pingBinder() && hasPermission()) {
+                    _connectionState.value = ShizukuConnectionState.BINDING
+                } else {
+                    _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
+                }
             }
         }
     }
@@ -211,6 +267,9 @@ object ShizukuController {
         if (appContext == null) {
             appContext = context.applicationContext
         }
+        val ctx = appContext ?: return
+        val savedMode = ClickConfigStore.loadSettings(ctx).authMode
+        _activeAuthMode.value = savedMode
         if (!listenersRegistered) {
             Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
             Shizuku.addBinderDeadListener(binderDeadListener)
@@ -221,13 +280,28 @@ object ShizukuController {
     }
 
     fun evaluateShizukuState() {
+        val ctx = appContext
+        val mode = if (ctx != null) {
+            ClickConfigStore.loadSettings(ctx).authMode.also { _activeAuthMode.value = it }
+        } else {
+            _activeAuthMode.value
+        }
+
+        if (mode == ClickGlobalSettings.AUTH_MODE_ROOT) {
+            evaluateRootStateInternal()
+            return
+        }
+
         val binderAlive = try {
             Shizuku.pingBinder()
         } catch (_: Throwable) {
             false
         }
         if (!binderAlive) {
-            service = null
+            if (serviceSourceMode == ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+                service = null
+                serviceSourceMode = -1
+            }
             _slotStates.value = List(16) { 0 }
             _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
             _engineSnapshot.value = EngineSnapshot(statusDetail = "请先启动 Shizuku 服务")
@@ -238,12 +312,285 @@ object ShizukuController {
             _engineSnapshot.value = EngineSnapshot(statusDetail = "Shizuku 已运行，等待授权")
             return
         }
-        if (service?.asBinder()?.pingBinder() == true) {
+        if (service?.asBinder()?.pingBinder() == true &&
+            serviceSourceMode == ClickGlobalSettings.AUTH_MODE_SHIZUKU
+        ) {
             _connectionState.value = ShizukuConnectionState.CONNECTED
             refreshCapabilitiesAsync()
         } else {
             bindUserService()
         }
+    }
+
+    private fun evaluateRootStateInternal() {
+        val ctx = appContext ?: return
+        if (service?.asBinder()?.pingBinder() == true &&
+            serviceSourceMode == ClickGlobalSettings.AUTH_MODE_ROOT
+        ) {
+            _connectionState.value = ShizukuConnectionState.CONNECTED
+            refreshCapabilitiesAsync()
+            return
+        }
+        if (rootConnectInFlight.get()) {
+            _connectionState.value = ShizukuConnectionState.BINDING
+            return
+        }
+        val settings = ClickConfigStore.loadSettings(ctx)
+        if (settings.rootAuthorizedEver) {
+            _connectionState.value = ShizukuConnectionState.BINDING
+            scope.launch {
+                val needOverlayGrant = !Settings.canDrawOverlays(ctx)
+                requestRootAuthorizationAndConnect(grantPermissions = needOverlayGrant)
+            }
+        } else {
+            _connectionState.value = ShizukuConnectionState.NO_PERMISSION
+            _engineSnapshot.value = EngineSnapshot(statusDetail = "Root 模式待授权")
+        }
+    }
+
+    /**
+     * Called by [RootBinderProvider.call] from UID 0 [RootMuxServerMain] during handshake.
+     * Returns the client death-sentinel Binder on valid token match, or null to reject.
+     */
+    internal fun onRootServiceBinderReceived(token: String, binder: IBinder?): IBinder? {
+        if (binder == null || !binder.pingBinder()) return null
+        val targetDeferred: CompletableDeferred<IBinder>? = synchronized(rootHandshakeLock) {
+            val expected = pendingRootToken
+            val def = pendingRootDeferred
+            if (expected != null && def != null && token == expected) {
+                pendingRootToken = null
+                pendingRootDeferred = null
+                def
+            } else {
+                null
+            }
+        }
+        if (targetDeferred == null) {
+            Log.w(TAG, "Ignored unexpected Root handshake token")
+            return null
+        }
+        targetDeferred.complete(binder)
+        return rootClientDeathSentinel
+    }
+
+    /**
+     * Requests Root superuser permission once, optionally grants all required Android app
+     * permissions in the same `su` session, launches the UID 0 TouchMux daemon, and binds it.
+     *
+     * If Root authorization fails while Shizuku is already connected, the existing Shizuku
+     * connection is preserved intact.
+     */
+    suspend fun requestRootAuthorizationAndConnect(
+        grantPermissions: Boolean = true
+    ): RootConnectResult = withContext(Dispatchers.IO) {
+        val ctx = appContext ?: return@withContext RootConnectResult(
+            success = false,
+            message = "应用上下文尚未初始化"
+        )
+        if (!rootConnectInFlight.compareAndSet(false, true)) {
+            return@withContext RootConnectResult(
+                success = false,
+                message = "正在连接 Root 通道，请稍候…"
+            )
+        }
+        _rootConnecting.value = true
+        _rootErrorMessage.value = null
+        val wasAlreadyRootMode = _activeAuthMode.value == ClickGlobalSettings.AUTH_MODE_ROOT
+        if (wasAlreadyRootMode) {
+            _connectionState.value = ShizukuConnectionState.BINDING
+        }
+
+        val sessionToken = generateRootSessionToken()
+        val deferred = CompletableDeferred<IBinder>()
+        synchronized(rootHandshakeLock) {
+            pendingRootToken = sessionToken
+            pendingRootDeferred = deferred
+        }
+
+        try {
+            val authority = RootBinderProvider.authorityFor(ctx.packageName)
+            val launchRes = RootHelper.requestRootGrantAndLaunchDaemon(
+                context = ctx,
+                authority = authority,
+                sessionToken = sessionToken,
+                grantAllPermissions = grantPermissions
+            )
+            if (!launchRes.rootGranted || !launchRes.daemonLaunched) {
+                clearPendingRootHandshake(sessionToken)
+                _rootErrorMessage.value = launchRes.message
+                if (wasAlreadyRootMode && service?.asBinder()?.pingBinder() != true) {
+                    _connectionState.value = ShizukuConnectionState.NO_PERMISSION
+                    _engineSnapshot.value = EngineSnapshot(statusDetail = launchRes.message)
+                }
+                return@withContext RootConnectResult(success = false, message = launchRes.message)
+            }
+
+            val binder = withTimeoutOrNull(8_500L) {
+                deferred.await()
+            }
+            if (binder == null || !binder.pingBinder()) {
+                clearPendingRootHandshake(sessionToken)
+                val msg = "Root 已授权，但底层通道握手超时，请重试"
+                _rootErrorMessage.value = msg
+                if (wasAlreadyRootMode && service?.asBinder()?.pingBinder() != true) {
+                    _connectionState.value = ShizukuConnectionState.ERROR
+                    _engineSnapshot.value = EngineSnapshot(statusDetail = msg)
+                }
+                return@withContext RootConnectResult(success = false, message = msg)
+            }
+
+            // Release any previously active service from the other channel or old Root daemon
+            val previousService = service
+            val previousMode = serviceSourceMode
+            if (previousMode == ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+                unbindShizukuSilently()
+            } else if (previousService != null && previousService.asBinder() !== binder) {
+                try {
+                    previousService.destroy()
+                } catch (_: Throwable) {
+                }
+            }
+
+            ClickConfigStore.saveAuthMode(
+                context = ctx,
+                mode = ClickGlobalSettings.AUTH_MODE_ROOT,
+                markRootAuthorized = true
+            )
+            _activeAuthMode.value = ClickGlobalSettings.AUTH_MODE_ROOT
+
+            val svc = ITouchMuxService.Stub.asInterface(binder)
+            service = svc
+            serviceSourceMode = ClickGlobalSettings.AUTH_MODE_ROOT
+            _connectionState.value = ShizukuConnectionState.CONNECTED
+            _rootErrorMessage.value = null
+
+            try {
+                svc.registerCallback(serviceCallback)
+                val settings = ClickConfigStore.loadSettings(ctx)
+                svc.setVolumeKeyControlEnabled(settings.volumeKeyToggleEnabled)
+                svc.setPreferredBackend(settings.preferredBackend)
+            } catch (_: Throwable) {
+            }
+
+            try {
+                binder.linkToDeath({
+                    Log.w(TAG, "Root TouchMux daemon process died.")
+                    if (service?.asBinder() !== binder) return@linkToDeath
+                    service = null
+                    serviceSourceMode = -1
+                    _slotStates.value = List(16) { 0 }
+                    if (_activeAuthMode.value == ClickGlobalSettings.AUTH_MODE_ROOT) {
+                        _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
+                        _engineSnapshot.value = _engineSnapshot.value.copy(
+                            engineMode = TouchMuxUserService.MODE_IDLE,
+                            statusDetail = "Root 底层守护进程已断开，点击重连"
+                        )
+                    }
+                }, 0)
+            } catch (_: Throwable) {
+            }
+
+            // Synchronously probe hardware capabilities once so wizard immediately unlocks 5s calibration
+            probeCapabilitiesSyncInternal(ctx, svc)
+
+            RootConnectResult(
+                success = true,
+                message = "Root 授权成功，权限与 UID 0 原生引擎已就绪"
+            )
+        } catch (t: Throwable) {
+            clearPendingRootHandshake(sessionToken)
+            val msg = "Root 通道启动失败: ${t.message ?: "未知错误"}"
+            Log.e(TAG, msg, t)
+            _rootErrorMessage.value = msg
+            if (wasAlreadyRootMode && service?.asBinder()?.pingBinder() != true) {
+                _connectionState.value = ShizukuConnectionState.ERROR
+                _engineSnapshot.value = EngineSnapshot(statusDetail = msg)
+            }
+            RootConnectResult(success = false, message = msg)
+        } finally {
+            _rootConnecting.value = false
+            rootConnectInFlight.set(false)
+        }
+    }
+
+    /**
+     * Activates Shizuku mode (disconnecting Root daemon if active) and requests Shizuku permission/binding.
+     * Returns false if Shizuku daemon is not running at all.
+     */
+    fun activateShizukuModeAndRequestPermission(): Boolean {
+        val ctx = appContext ?: return false
+        val binderAlive = try {
+            Shizuku.pingBinder()
+        } catch (_: Throwable) {
+            false
+        }
+        if (!binderAlive) {
+            if (_activeAuthMode.value == ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+                _connectionState.value = ShizukuConnectionState.SHIZUKU_NOT_RUNNING
+                _engineSnapshot.value = EngineSnapshot(statusDetail = "请先启动 Shizuku 服务")
+            }
+            return false
+        }
+
+        if (_activeAuthMode.value != ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+            disconnectRootServiceSilently()
+            ClickConfigStore.saveAuthMode(ctx, ClickGlobalSettings.AUTH_MODE_SHIZUKU)
+            _activeAuthMode.value = ClickGlobalSettings.AUTH_MODE_SHIZUKU
+            _rootErrorMessage.value = null
+        }
+
+        requestPermission()
+        return true
+    }
+
+    private fun disconnectRootServiceSilently() {
+        val oldSvc = service
+        if (serviceSourceMode == ClickGlobalSettings.AUTH_MODE_ROOT && oldSvc != null) {
+            service = null
+            serviceSourceMode = -1
+            _slotStates.value = List(16) { 0 }
+            scope.launch {
+                try {
+                    oldSvc.destroy()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    private fun unbindShizukuSilently() {
+        val args = boundArgs
+        if (serviceSourceMode == ClickGlobalSettings.AUTH_MODE_SHIZUKU) {
+            try {
+                service?.shutdownEngine()
+            } catch (_: Throwable) {
+            }
+            if (args != null) {
+                try {
+                    Shizuku.unbindUserService(args, userServiceConnection, true)
+                } catch (_: Throwable) {
+                }
+            }
+            service = null
+            serviceSourceMode = -1
+            _slotStates.value = List(16) { 0 }
+        }
+    }
+
+    private fun clearPendingRootHandshake(token: String) {
+        synchronized(rootHandshakeLock) {
+            if (pendingRootToken == token) {
+                pendingRootToken = null
+                pendingRootDeferred?.cancel()
+                pendingRootDeferred = null
+            }
+        }
+    }
+
+    private fun generateRootSessionToken(): String {
+        val bytes = ByteArray(24)
+        secureRandom.nextBytes(bytes)
+        return bytes.joinToString("") { "%02x".format(it) }
     }
 
     fun hasPermission(): Boolean {
@@ -310,62 +657,66 @@ object ShizukuController {
         val ctx = appContext ?: return
         val svc = service ?: return
         scope.launch {
-            try {
-                val jsonStr = svc.probeCapabilities(ctx.applicationInfo.nativeLibraryDir)
-                val obj = JSONObject(jsonStr)
-                val touchPath = obj.optString("touchDevicePath", "")
-                val touchName = obj.optString("touchDeviceName", "")
-                val touchInfo = if (touchPath.isNotEmpty()) "$touchPath ($touchName)" else "未检测到可读触控节点"
-                val detail = obj.optString("statusDetail", "Ready")
-                val uinputOk = obj.optBoolean("uinputWritable", false)
-                val uinputErr = obj.optInt("uinputErrno", -1)
-                val uhidOk = obj.optBoolean("uhidWritable", false)
-                val uhidErr = obj.optInt("uhidErrno", -1)
-                val touchOk = obj.optBoolean("touchDeviceReadable", false)
-                val touchErr = obj.optInt("touchDeviceErrno", -1)
-                val minX = obj.optInt("absMinX", 0)
-                val maxX = obj.optInt("absMaxX", 0)
-                val minY = obj.optInt("absMinY", 0)
-                val maxY = obj.optInt("absMaxY", 0)
-                val absText = if (touchOk) "X[$minX..$maxX] Y[$minY..$maxY]" else "-"
+            probeCapabilitiesSyncInternal(ctx, svc)
+        }
+    }
 
-                val probeErr = buildString {
-                    val loadErr = obj.optString("nativeLoadError", "")
-                    if (loadErr.isNotEmpty()) append(loadErr)
-                    if (!uinputOk) {
-                        if (isNotEmpty()) append("; ")
-                        append("/dev/uinput errno=$uinputErr")
-                    }
-                    if (!uhidOk) {
-                        if (isNotEmpty()) append("; ")
-                        append("/dev/uhid errno=$uhidErr")
-                    }
-                    if (!touchOk) {
-                        if (isNotEmpty()) append("; ")
-                        append("/dev/input errno=$touchErr")
-                    }
+    private fun probeCapabilitiesSyncInternal(ctx: Context, svc: ITouchMuxService) {
+        try {
+            val jsonStr = svc.probeCapabilities(ctx.applicationInfo.nativeLibraryDir)
+            val obj = JSONObject(jsonStr)
+            val touchPath = obj.optString("touchDevicePath", "")
+            val touchName = obj.optString("touchDeviceName", "")
+            val touchInfo = if (touchPath.isNotEmpty()) "$touchPath ($touchName)" else "未检测到可读触控节点"
+            val detail = obj.optString("statusDetail", "Ready")
+            val uinputOk = obj.optBoolean("uinputWritable", false)
+            val uinputErr = obj.optInt("uinputErrno", -1)
+            val uhidOk = obj.optBoolean("uhidWritable", false)
+            val uhidErr = obj.optInt("uhidErrno", -1)
+            val touchOk = obj.optBoolean("touchDeviceReadable", false)
+            val touchErr = obj.optInt("touchDeviceErrno", -1)
+            val minX = obj.optInt("absMinX", 0)
+            val maxX = obj.optInt("absMaxX", 0)
+            val minY = obj.optInt("absMinY", 0)
+            val maxY = obj.optInt("absMaxY", 0)
+            val absText = if (touchOk) "X[$minX..$maxX] Y[$minY..$maxY]" else "-"
+
+            val probeErr = buildString {
+                val loadErr = obj.optString("nativeLoadError", "")
+                if (loadErr.isNotEmpty()) append(loadErr)
+                if (!uinputOk) {
+                    if (isNotEmpty()) append("; ")
+                    append("/dev/uinput errno=$uinputErr")
                 }
-
-                _engineSnapshot.value = EngineSnapshot(
-                    engineMode = obj.optInt("currentMode", TouchMuxUserService.MODE_IDLE),
-                    preferredBackend = obj.optInt("preferredBackend", ClickGlobalSettings.BACKEND_AUTO),
-                    uinputWritable = uinputOk,
-                    uinputErrno = uinputErr,
-                    uhidWritable = uhidOk,
-                    uhidErrno = uhidErr,
-                    touchDeviceReadable = touchOk,
-                    touchErrno = touchErr,
-                    fallbackReady = obj.optBoolean("fallbackInjectorReady", false),
-                    touchDeviceInfo = touchInfo,
-                    absRangeText = absText,
-                    statusDetail = detail,
-                    uid = obj.optInt("uid", -1),
-                    pid = obj.optInt("pid", -1),
-                    nativeProbeError = probeErr
-                )
-            } catch (t: Throwable) {
-                Log.w(TAG, "probeCapabilities failed", t)
+                if (!uhidOk) {
+                    if (isNotEmpty()) append("; ")
+                    append("/dev/uhid errno=$uhidErr")
+                }
+                if (!touchOk) {
+                    if (isNotEmpty()) append("; ")
+                    append("/dev/input errno=$touchErr")
+                }
             }
+
+            _engineSnapshot.value = EngineSnapshot(
+                engineMode = obj.optInt("currentMode", TouchMuxUserService.MODE_IDLE),
+                preferredBackend = obj.optInt("preferredBackend", ClickGlobalSettings.BACKEND_AUTO),
+                uinputWritable = uinputOk,
+                uinputErrno = uinputErr,
+                uhidWritable = uhidOk,
+                uhidErrno = uhidErr,
+                touchDeviceReadable = touchOk,
+                touchErrno = touchErr,
+                fallbackReady = obj.optBoolean("fallbackInjectorReady", false),
+                touchDeviceInfo = touchInfo,
+                absRangeText = absText,
+                statusDetail = detail,
+                uid = obj.optInt("uid", -1),
+                pid = obj.optInt("pid", -1),
+                nativeProbeError = probeErr
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "probeCapabilities failed", t)
         }
     }
 
@@ -483,25 +834,41 @@ object ShizukuController {
         }
     }
 
-    fun clearTargetTriggerConfigAsync() {
+    private fun clearTargetTriggerConfigInternal() {
         val svc = service ?: return
+        try {
+            svc.setTargetTriggerConfig(
+                ClickGlobalSettings.TARGET_TRIGGER_OFF,
+                FloatArray(0),
+                FloatArray(0),
+                FloatArray(0),
+                1080,
+                2400,
+                0,
+                0,
+                0,
+                0,
+                0,
+                48f
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun clearTargetTriggerConfigAsync() {
+        if (service == null) return
         scope.launch {
-            try {
-                svc.setTargetTriggerConfig(
-                    ClickGlobalSettings.TARGET_TRIGGER_OFF,
-                    FloatArray(0),
-                    FloatArray(0),
-                    FloatArray(0),
-                    1080,
-                    2400,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    48f
-                )
-            } catch (_: Throwable) {
+            clearTargetTriggerConfigInternal()
+        }
+    }
+
+    fun releaseOverlayEngineAsync(shouldReleaseHardware: () -> Boolean) {
+        if (service == null) return
+        scope.launch {
+            clearTargetTriggerConfigInternal()
+            stopClicking()
+            if (shouldReleaseHardware()) {
+                shutdownEngine()
             }
         }
     }
@@ -834,6 +1201,10 @@ object ShizukuController {
     }
 
     fun unbindUserService() {
+        if (serviceSourceMode == ClickGlobalSettings.AUTH_MODE_ROOT) {
+            disconnectRootServiceSilently()
+            return
+        }
         val args = boundArgs ?: return
         try {
             service?.shutdownEngine()
@@ -844,6 +1215,7 @@ object ShizukuController {
         } catch (_: Throwable) {
         }
         service = null
+        serviceSourceMode = -1
         _slotStates.value = List(16) { 0 }
     }
 

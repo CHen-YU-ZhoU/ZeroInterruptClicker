@@ -153,6 +153,9 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val connectionState by ShizukuController.connectionState.collectAsState()
+            val activeAuthMode by ShizukuController.activeAuthMode.collectAsState()
+            val rootConnecting by ShizukuController.rootConnecting.collectAsState()
+            val rootErrorMessage by ShizukuController.rootErrorMessage.collectAsState()
             val engineSnapshot by ShizukuController.engineSnapshot.collectAsState()
             val slotStates by ShizukuController.slotStates.collectAsState()
             val overlayVisible by OverlayStateHub.overlayVisible.collectAsState()
@@ -191,6 +194,9 @@ class MainActivity : ComponentActivity() {
 
             val mergedState = uiModel.copy(
                 connectionState = connectionState,
+                authMode = activeAuthMode,
+                rootConnecting = rootConnecting,
+                rootErrorMessage = rootErrorMessage,
                 engineSnapshot = engineSnapshot,
                 slotStates = slotStates,
                 overlayVisible = overlayVisible,
@@ -260,7 +266,11 @@ class MainActivity : ComponentActivity() {
                                     color = cs.secondaryContainer
                                 ) {
                                     Text(
-                                        text = "v${BuildConfig.VERSION_NAME} → ${release.tagName}",
+                                        text = if (release.viaMirror) {
+                                            "v${BuildConfig.VERSION_NAME} → ${release.tagName} · 镜像加速"
+                                        } else {
+                                            "v${BuildConfig.VERSION_NAME} → ${release.tagName}"
+                                        },
                                         style = MaterialTheme.typography.labelSmall,
                                         fontWeight = FontWeight.SemiBold,
                                         color = cs.onSecondaryContainer,
@@ -485,9 +495,28 @@ class MainActivity : ComponentActivity() {
             },
             onGrantOverlay = { openOverlayPermissionSettings() },
             onGrantShizuku = {
-                ShizukuController.requestPermission()
-                if (ShizukuController.connectionState.value == ShizukuConnectionState.SHIZUKU_NOT_RUNNING) {
+                val ok = ShizukuController.activateShizukuModeAndRequestPermission()
+                syncFromStorageAndSystem()
+                if (!ok) {
                     showMessage(scope, "未检测到 Shizuku 后台服务，请先打开 Shizuku 并启动")
+                }
+            },
+            onGrantRoot = {
+                scope.launch {
+                    val res = ShizukuController.requestRootAuthorizationAndConnect(grantPermissions = true)
+                    syncFromStorageAndSystem()
+                    if (res.success) {
+                        val settings = ClickConfigStore.loadSettings(this@MainActivity)
+                        val overlayOk = Settings.canDrawOverlays(this@MainActivity)
+                        val msg = when {
+                            !overlayOk -> "Root 通道已连接，请点「悬浮窗」标签补授系统权限"
+                            !settings.selfCheckPassed -> "Root 授权成功，请继续完成 5 秒触控校准"
+                            else -> "Root 通道 (UID 0) 已就绪"
+                        }
+                        showMessage(scope, msg)
+                    } else {
+                        showMessage(scope, res.message)
+                    }
                 }
             },
             onGrantNotif = {
@@ -504,7 +533,7 @@ class MainActivity : ComponentActivity() {
                     }
                     if (rc < 0) {
                         uiModel = uiModel.copy(selfCheckRemainingMs = 0L)
-                        showMessage(scope, "启动 5 秒校准失败（code=$rc），请检查 Shizuku 与设备节点")
+                        showMessage(scope, "启动 5 秒校准失败（code=$rc），请检查底层通道与设备节点")
                     } else {
                         uiModel = uiModel.copy(selfCheckRemainingMs = SELF_CHECK_TIMEOUT_MS)
                         selfCheckTimer = object : CountDownTimer(SELF_CHECK_TIMEOUT_MS, 500L) {
@@ -734,7 +763,7 @@ class MainActivity : ComponentActivity() {
                     showMessage(scope, "请先授予悬浮窗权限以启用录制控件")
                 } else if (!ShizukuController.isServiceConnected()) {
                     ShizukuController.evaluateShizukuState()
-                    showMessage(scope, "请先在主页或设置向导中授权并连接 Shizuku")
+                    showMessage(scope, "请先在主页初始化向导中完成 Root 或 Shizuku 授权")
                 } else {
                     ContextCompat.startForegroundService(
                         this,
@@ -751,7 +780,7 @@ class MainActivity : ComponentActivity() {
                     showMessage(scope, "请先授予悬浮窗权限以启用录宏控件")
                 } else if (!ShizukuController.isServiceConnected()) {
                     ShizukuController.evaluateShizukuState()
-                    showMessage(scope, "请先在主页或设置向导中授权并连接 Shizuku")
+                    showMessage(scope, "请先在主页初始化向导中完成 Root 或 Shizuku 授权")
                 } else {
                     ContextCompat.startForegroundService(
                         this,
@@ -1035,7 +1064,7 @@ class MainActivity : ComponentActivity() {
             onCheckUpdate = {
                 if (!isCheckingUpdate) {
                     isCheckingUpdate = true
-                    showMessage(scope, "正在检查 GitHub 最新版本…")
+                    showMessage(scope, "正在检查最新版本…")
                     scope.launch {
                         try {
                             val result = GitHubUpdateChecker.checkLatestRelease(BuildConfig.VERSION_NAME)

@@ -388,7 +388,8 @@ class OverlayService : Service(), ControlBarView.Listener {
         targetTriggerJob?.cancel()
         emergencyUngrabJob?.cancel()
         clickingCompletedJob?.cancel()
-        ShizukuController.clearTargetTriggerConfigAsync()
+        val settings = ClickConfigStore.loadSettings(this)
+        val keepEngineAliveForRpc = settings.proModeEnabled && settings.rpcBridgeEnabled
         stopClickingInternal()
         dismissTunePanel()
         removeAllAnchorWindows()
@@ -397,6 +398,11 @@ class OverlayService : Service(), ControlBarView.Listener {
         normalOverlayAttached = false
         OverlayStateHub.setClickingRunning(this, false)
         OverlayStateHub.setOverlayVisible(this, false)
+        ShizukuController.releaseOverlayEngineAsync(
+            shouldReleaseHardware = {
+                !keepEngineAliveForRpc && !OverlayStateHub.overlayVisible.value
+            }
+        )
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -1525,7 +1531,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         }
         if (!ShizukuController.isServiceConnected()) {
             stopClickingInternal()
-            Toast.makeText(this, "Shizuku 触控服务尚未连接，已停止运行", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "底层触控服务尚未连接，已停止运行", Toast.LENGTH_SHORT).show()
             return
         }
         if (showToast) {
@@ -1631,7 +1637,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         }
         if (!ShizukuController.isServiceConnected()) {
             ShizukuController.evaluateShizukuState()
-            Toast.makeText(this, "Shizuku 触控服务尚未连接，请在主界面授权并连接", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "底层触控服务尚未连接，请在初始化向导中授权并连接", Toast.LENGTH_SHORT).show()
             scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
             return
         }
@@ -1693,7 +1699,7 @@ class OverlayService : Service(), ControlBarView.Listener {
                     refreshControlBarState()
                     Toast.makeText(
                         this@OverlayService,
-                        if (mode == -4) "当前方案没有可执行的手势节点" else "启动连点失败 (code=$mode)，请检查 Shizuku 状态",
+                        if (mode == -4) "当前方案没有可执行的手势节点" else "启动连点失败 (code=$mode)，请检查底层授权状态",
                         Toast.LENGTH_SHORT
                     ).show()
                     scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
@@ -1804,7 +1810,7 @@ class OverlayService : Service(), ControlBarView.Listener {
                 }
                 if (!ShizukuController.isServiceConnected()) {
                     ShizukuController.evaluateShizukuState()
-                    Toast.makeText(this, "Shizuku 触控服务尚未连接，请在主界面授权并连接", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "底层触控服务尚未连接，请在初始化向导中授权并连接", Toast.LENGTH_SHORT).show()
                     return
                 }
                 clickingStartedByTargetHold = true
@@ -2030,7 +2036,7 @@ class OverlayService : Service(), ControlBarView.Listener {
         if (macroRecordOverlay?.isActive() == true) return
         if (!ShizukuController.isServiceConnected()) {
             ShizukuController.evaluateShizukuState()
-            Toast.makeText(this, "请先确保 Shizuku 服务已连接", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "请先在初始化向导中连接 Root 或 Shizuku 服务", Toast.LENGTH_SHORT).show()
             if (!normalOverlayAttached) {
                 stopSelf()
             }

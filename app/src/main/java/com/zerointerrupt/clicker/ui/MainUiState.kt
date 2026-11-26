@@ -18,6 +18,9 @@ enum class MainTab(val title: String) {
 
 data class MainUiState(
     val connectionState: ShizukuConnectionState,
+    val authMode: Int = ClickGlobalSettings.AUTH_MODE_SHIZUKU,
+    val rootConnecting: Boolean = false,
+    val rootErrorMessage: String? = null,
     val engineSnapshot: EngineSnapshot,
     val slotStates: List<Int> = List(16) { 0 },
     val overlayVisible: Boolean,
@@ -72,6 +75,7 @@ data class MainScreenCallbacks(
     val onToggleOverlay: () -> Unit,
     val onGrantOverlay: () -> Unit,
     val onGrantShizuku: () -> Unit,
+    val onGrantRoot: () -> Unit,
     val onGrantNotif: () -> Unit,
     val onGrantBatteryOpt: () -> Unit,
     val onStartSelfCheck: () -> Unit,

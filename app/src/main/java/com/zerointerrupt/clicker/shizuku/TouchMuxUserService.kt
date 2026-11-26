@@ -794,7 +794,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         clickingActive.set(true)
         currentMode.set(MODE_SHIZUKU_FALLBACK)
         startOrWakeFallbackThread()
-        statusDetail = "Running (Shizuku UID ${android.os.Process.myUid()} Fallback)"
+        statusDetail = "Running (UID ${android.os.Process.myUid()} Fallback)"
         return MODE_SHIZUKU_FALLBACK
     }
 
@@ -1957,7 +1957,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             }
             if (completedNaturally && clickingActive.compareAndSet(true, false)) {
                 if (currentMode.get() == MODE_SHIZUKU_FALLBACK) {
-                    statusDetail = "Ready (Shizuku Fallback)"
+                    statusDetail = "Ready (UID ${android.os.Process.myUid()} Fallback)"
                 }
                 notifyRemoteCallbacks { it.onClickingCompleted() }
             }
@@ -2162,7 +2162,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             }
             if (completedNaturally && clickingActive.compareAndSet(true, false)) {
                 if (currentMode.get() == MODE_SHIZUKU_FALLBACK) {
-                    statusDetail = "Ready (Shizuku Fallback)"
+                    statusDetail = "Ready (UID ${android.os.Process.myUid()} Fallback)"
                 }
                 notifyRemoteCallbacks { it.onClickingCompleted() }
             }
@@ -2258,7 +2258,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             MODE_NATIVE_UINPUT -> "Tier 1 UInput 合流"
             MODE_NATIVE_UHID -> "Tier 2 UHID Digitizer"
             MODE_HYBRID_EVDEV_INJECT -> "Tier 3 Hybrid 零GC合流"
-            MODE_SHIZUKU_FALLBACK -> "Tier 4 Shizuku 降级注入"
+            MODE_SHIZUKU_FALLBACK -> "Tier 4 降级注入"
             else -> "空闲未激活"
         }
     }

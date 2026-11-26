@@ -493,7 +493,9 @@ data class ClickGlobalSettings(
     val proModeEnabled: Boolean = false,
     val preferredBackend: Int = BACKEND_AUTO,
     val rpcBridgeEnabled: Boolean = false,
-    val rpcToken: String = ""
+    val rpcToken: String = "",
+    val authMode: Int = AUTH_MODE_SHIZUKU,
+    val rootAuthorizedEver: Boolean = false
 ) {
     val targetTriggerMode: Int
         get() = when {
@@ -536,6 +538,9 @@ data class ClickGlobalSettings(
         const val BACKEND_UHID = 2
         const val BACKEND_HYBRID = 3
         const val BACKEND_FALLBACK = 4
+
+        const val AUTH_MODE_SHIZUKU = 0
+        const val AUTH_MODE_ROOT = 1
     }
 }
 
@@ -568,6 +573,8 @@ object ClickConfigStore {
     private const val KEY_PREFERRED_BACKEND = "preferred_backend"
     private const val KEY_RPC_BRIDGE_ENABLED = "rpc_bridge_enabled"
     private const val KEY_RPC_TOKEN = "rpc_token"
+    private const val KEY_AUTH_MODE = "auth_mode"
+    private const val KEY_ROOT_AUTHORIZED_EVER = "root_authorized_ever"
     private const val KEY_MIGRATED_CONCURRENT_ZERO = "migrated_concurrent_zero_v3"
 
     private const val KEY_CONTROL_BAR_X = "control_bar_x"
@@ -646,7 +653,10 @@ object ClickConfigStore {
             preferredBackend = prefs.getInt(KEY_PREFERRED_BACKEND, ClickGlobalSettings.BACKEND_AUTO)
                 .coerceIn(ClickGlobalSettings.BACKEND_AUTO, ClickGlobalSettings.BACKEND_FALLBACK),
             rpcBridgeEnabled = prefs.getBoolean(KEY_RPC_BRIDGE_ENABLED, false),
-            rpcToken = token
+            rpcToken = token,
+            authMode = prefs.getInt(KEY_AUTH_MODE, ClickGlobalSettings.AUTH_MODE_SHIZUKU)
+                .coerceIn(ClickGlobalSettings.AUTH_MODE_SHIZUKU, ClickGlobalSettings.AUTH_MODE_ROOT),
+            rootAuthorizedEver = prefs.getBoolean(KEY_ROOT_AUTHORIZED_EVER, false)
         )
     }
 
@@ -689,11 +699,32 @@ object ClickConfigStore {
             .putInt(KEY_PREFERRED_BACKEND, settings.preferredBackend)
             .putBoolean(KEY_RPC_BRIDGE_ENABLED, settings.rpcBridgeEnabled)
             .putString(KEY_RPC_TOKEN, safeToken)
+            .putInt(
+                KEY_AUTH_MODE,
+                settings.authMode.coerceIn(
+                    ClickGlobalSettings.AUTH_MODE_SHIZUKU,
+                    ClickGlobalSettings.AUTH_MODE_ROOT
+                )
+            )
+            .putBoolean(KEY_ROOT_AUTHORIZED_EVER, settings.rootAuthorizedEver)
             .apply()
     }
 
     fun hasLauncherIconModePref(context: Context): Boolean =
         context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).contains(KEY_LAUNCHER_ICON_MODE)
+
+    fun saveAuthMode(context: Context, mode: Int, markRootAuthorized: Boolean? = null) {
+        val safeMode = mode.coerceIn(
+            ClickGlobalSettings.AUTH_MODE_SHIZUKU,
+            ClickGlobalSettings.AUTH_MODE_ROOT
+        )
+        val editor = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_AUTH_MODE, safeMode)
+        if (markRootAuthorized != null) {
+            editor.putBoolean(KEY_ROOT_AUTHORIZED_EVER, markRootAuthorized)
+        }
+        editor.apply()
+    }
 
     fun markSelfCheckPassed(context: Context, passed: Boolean) {
         context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit()

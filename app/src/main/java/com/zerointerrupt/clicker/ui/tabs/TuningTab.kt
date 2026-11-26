@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -293,6 +294,40 @@ private fun InteractionTuningCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = cs.onSurfaceVariant
             )
+
+            HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
+
+            Text(
+                text = "触发方式",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = cs.primary
+            )
+
+            SettingSwitchRow(
+                title = "悬浮窗",
+                checked = true,
+                enabled = false,
+                onCheckedChange = {}
+            )
+
+            SettingSwitchRow(
+                title = "长按目标区域",
+                checked = state.targetLongPressTriggerEnabled,
+                onCheckedChange = callbacks.onTargetLongPressTriggerChange
+            )
+
+            SettingSwitchRow(
+                title = "点击目标区域",
+                checked = state.targetTapTriggerEnabled,
+                onCheckedChange = callbacks.onTargetTapTriggerChange
+            )
+
+            SettingSwitchRow(
+                title = "双敲音量减键",
+                checked = state.volumeKeyToggleEnabled,
+                onCheckedChange = callbacks.onVolumeKeyToggleChange
+            )
         }
     }
 }
@@ -348,7 +383,8 @@ private fun SliderBlock(
 private fun SettingSwitchRow(
     title: String,
     checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -365,7 +401,8 @@ private fun SettingSwitchRow(
         )
         CheckSwitch(
             checked = checked,
-            onCheckedChange = onCheckedChange
+            onCheckedChange = onCheckedChange,
+            enabled = enabled
         )
     }
 }

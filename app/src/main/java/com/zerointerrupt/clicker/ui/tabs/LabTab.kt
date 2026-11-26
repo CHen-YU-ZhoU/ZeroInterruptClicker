@@ -209,50 +209,6 @@ fun LabTab(
             }
         }
 
-        ExpressiveCard {
-            Column(
-                modifier = Modifier.padding(18.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                Text(
-                    text = "触发方式",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-
-                LabSwitchRow(
-                    title = "悬浮窗",
-                    checked = true,
-                    enabled = false,
-                    onCheckedChange = {}
-                )
-
-                HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
-
-                LabSwitchRow(
-                    title = "长按目标区域",
-                    checked = state.targetLongPressTriggerEnabled,
-                    onCheckedChange = callbacks.onTargetLongPressTriggerChange
-                )
-
-                HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
-
-                LabSwitchRow(
-                    title = "点击目标区域",
-                    checked = state.targetTapTriggerEnabled,
-                    onCheckedChange = callbacks.onTargetTapTriggerChange
-                )
-
-                HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
-
-                LabSwitchRow(
-                    title = "双敲音量减键",
-                    checked = state.volumeKeyToggleEnabled,
-                    onCheckedChange = callbacks.onVolumeKeyToggleChange
-                )
-            }
-        }
-
         ExpressiveCard(
             modifier = Modifier
                 .clip(RoundedCornerShape(24.dp))
@@ -392,7 +348,12 @@ private fun ProHardwareConsoleCard(
                     modifier = Modifier.padding(12.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    DiagLine("Shizuku 状态", "${state.connectionState} · ${modeName(snap.engineMode)}")
+                    val channelLabel = if (state.authMode == ClickGlobalSettings.AUTH_MODE_ROOT) {
+                        "Root"
+                    } else {
+                        "Shizuku"
+                    }
+                    DiagLine("授权通道", "$channelLabel · ${state.connectionState} · ${modeName(snap.engineMode)}")
                     DiagLine("UID / PID", "${snap.uid} / ${snap.pid}")
                     DiagLine("物理触控节点", snap.touchDeviceInfo.ifBlank { "未发现可读节点" })
                     DiagLine("Abs 量程", snap.absRangeText.ifBlank { "未初始化" })

@@ -1572,10 +1572,13 @@ bool TouchMuxEngine::setupUinputDevice(const DeviceDesc& desc, int& outErrno) {
         if (absOk) {
             struct uinput_setup devSetup {};
             std::snprintf(devSetup.name, UINPUT_MAX_NAME_SIZE, "ZeroInterrupt_TouchMux");
+            // Never clone physical vendor/product/version: OEM THP daemons (e.g. Xiaomi Goodix
+            // touchfeature-service matching 0xbeef:0xdead:0x28bb) scan /dev/input/event* by ID
+            // on restart and will mis-bind to this uinput node if it spoofs the physical panel.
             devSetup.id.bustype = BUS_VIRTUAL;
-            devSetup.id.vendor = desc.vendor != 0 ? desc.vendor : 0x18D1;
-            devSetup.id.product = desc.product != 0 ? desc.product : 0x4E11;
-            devSetup.id.version = desc.version != 0 ? desc.version : 1;
+            devSetup.id.vendor = 0x18D1;
+            devSetup.id.product = 0x4E11;
+            devSetup.id.version = 1;
             if (ioctl(uinputFd_, UI_DEV_SETUP, &devSetup) == 0) {
                 configuredModern = true;
             }
@@ -1587,9 +1590,9 @@ bool TouchMuxEngine::setupUinputDevice(const DeviceDesc& desc, int& outErrno) {
         struct uinput_user_dev uidev {};
         std::snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "ZeroInterrupt_TouchMux");
         uidev.id.bustype = BUS_VIRTUAL;
-        uidev.id.vendor = desc.vendor != 0 ? desc.vendor : 0x18D1;
-        uidev.id.product = desc.product != 0 ? desc.product : 0x4E11;
-        uidev.id.version = desc.version != 0 ? desc.version : 1;
+        uidev.id.vendor = 0x18D1;
+        uidev.id.product = 0x4E11;
+        uidev.id.version = 1;
 
         uidev.absmin[ABS_MT_SLOT] = 0;
         uidev.absmax[ABS_MT_SLOT] = kMaxUinputSlots - 1;
@@ -1681,8 +1684,10 @@ bool TouchMuxEngine::setupUhidDevice(const DeviceDesc& desc, int& outErrno) {
                   "zi-mt-01");
     ev.u.create2.rd_size = static_cast<uint16_t>(rd.size());
     ev.u.create2.bus = BUS_VIRTUAL;
-    ev.u.create2.vendor = desc.vendor != 0 ? desc.vendor : 0x18D1;
-    ev.u.create2.product = desc.product != 0 ? desc.product : 0x4E12;
+    // Use dedicated virtual IDs so OEM touch/THP services never mis-identify this HID device
+    // as the physical touchscreen panel.
+    ev.u.create2.vendor = 0x18D1;
+    ev.u.create2.product = 0x4E12;
     ev.u.create2.version = 1;
     ev.u.create2.country = 0;
     std::memcpy(ev.u.create2.rd_data, rd.data(), rd.size());
