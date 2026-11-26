@@ -88,8 +88,42 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
     private val rpcFbPs = FloatArray(MAX_SLOTS) { 0.16f }
     private val rpcFbSs = FloatArray(MAX_SLOTS) { 0.16f }
 
-    private val remoteCallbacks = RemoteCallbackList<ITouchMuxCallback>()
+    private val shuttingDown = AtomicBoolean(false)
     private val callbackBroadcastLock = Any()
+    private val remoteCallbacks = object : RemoteCallbackList<ITouchMuxCallback>() {
+        override fun onCallbackDied(callback: ITouchMuxCallback?, cookie: Any?) {
+            super.onCallbackDied(callback, cookie)
+            if (shuttingDown.get()) return
+            val remaining = try {
+                registeredCallbackCount
+            } catch (_: Throwable) {
+                0
+            }
+            if (remaining <= 0) {
+                Log.w(
+                    TAG,
+                    "All client callbacks died (app force-stopped or crashed); releasing hardware grab and exiting."
+                )
+                Thread({
+                    try {
+                        // Brief re-check in case a client re-registered during death dispatch
+                        val stillEmpty = try {
+                            registeredCallbackCount <= 0
+                        } catch (_: Throwable) {
+                            true
+                        }
+                        if (stillEmpty && !shuttingDown.get()) {
+                            destroy()
+                        }
+                    } catch (_: Throwable) {
+                    }
+                }, "TouchMuxClientDeathCleanup").apply {
+                    isDaemon = true
+                    start()
+                }
+            }
+        }
+    }
 
     // Zero-GC pre-allocated arrays shared by Tier 3 Hybrid & Tier 4 Fallback
     private val injectFrameLock = Any()
@@ -558,6 +592,49 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         }
     }
 
+    private fun getSystemProperty(key: String): String {
+        return try {
+            val cls = Class.forName("android.os.SystemProperties")
+            val get = cls.getMethod("get", String::class.java, String::class.java)
+            (get.invoke(null, key, "") as? String).orEmpty().trim()
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    private fun isXiaomiThpTouchSystem(): Boolean {
+        val hasXiaomiTouchNode = File("/dev/xiaomi-touch").exists() || File("/dev/xiaomi-thp").exists()
+        if (!hasXiaomiTouchNode) return false
+        if (getSystemProperty("init.svc.touchfeature-service") == "running") return true
+        return getSystemProperty("ro.vendor.touchfeature.type").isNotEmpty()
+    }
+
+    /**
+     * Resolves the effective native backend passed to TouchMuxEngine::initAndGrab.
+     * On Xiaomi THP devices (vendor.xiaomi.hw.touchfeature-service / libtouchreport_hal),
+     * the THP daemon scans /dev/input/event* by multi-touch capabilities on restart and can
+     * mis-bind to any uinput/uhid virtual touchscreen node, permanently breaking physical touch
+     * once that virtual node is later destroyed. Preferring Tier 3 Hybrid (EVIOCGRAB + zero-GC
+     * IInputManager.injectInputEvent) creates zero /dev/input/event* nodes and eliminates this
+     * conflict completely.
+     */
+    private fun resolveEffectiveNativeBackend(prefBackend: Int): Int {
+        if (prefBackend == BACKEND_HYBRID) {
+            return if (ensureFallbackInjectorReady()) BACKEND_HYBRID else -1003
+        }
+        if (prefBackend == BACKEND_AUTO) {
+            val hybridReady = ensureFallbackInjectorReady()
+            if (hybridReady && isXiaomiThpTouchSystem()) {
+                Log.i(
+                    TAG,
+                    "Detected Xiaomi THP touch subsystem; selecting Tier 3 Hybrid backend in AUTO mode to avoid /dev/input THP mis-binding."
+                )
+                return BACKEND_HYBRID
+            }
+        }
+        return prefBackend
+    }
+
     override fun initNativeEngine(
         nativeLibDir: String?,
         displayWidth: Int,
@@ -578,7 +655,12 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             statusDetail = nativeLoadError ?: "Native load failed"
             return@synchronized -1001
         }
-        val rc = nativeInitAndGrab(displayWidth, displayHeight, rotation, 0, prefBackend)
+        val effectivePref = resolveEffectiveNativeBackend(prefBackend)
+        if (effectivePref < 0) {
+            statusDetail = "Tier 3 Hybrid InputManager unavailable"
+            return@synchronized effectivePref
+        }
+        val rc = nativeInitAndGrab(displayWidth, displayHeight, rotation, 0, effectivePref)
         if (rc == 0) {
             selfCheckConfirmed.set(true)
             val mode = resolveNativeMode()
@@ -611,12 +693,17 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             statusDetail = nativeLoadError ?: "Native load failed"
             return@synchronized -1001
         }
+        val effectivePref = resolveEffectiveNativeBackend(prefBackend)
+        if (effectivePref < 0) {
+            statusDetail = "Tier 3 Hybrid InputManager unavailable"
+            return@synchronized effectivePref
+        }
         stopFallbackThread()
         selfCheckConfirmed.set(false)
         cancelWatchdogTask()
 
         val safeTimeout = timeoutMs.coerceIn(2000, 15000)
-        val rc = nativeInitAndGrab(displayWidth, displayHeight, rotation, safeTimeout, prefBackend)
+        val rc = nativeInitAndGrab(displayWidth, displayHeight, rotation, safeTimeout, effectivePref)
         if (rc != 0) {
             currentMode.set(MODE_IDLE)
             statusDetail = nativeGetLastError().ifBlank { "Native grab failed ($rc)" }
@@ -1249,6 +1336,9 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
     }
 
     override fun destroy() {
+        if (!shuttingDown.compareAndSet(false, true)) {
+            return
+        }
         if (nativeLoaded.get()) {
             try {
                 nativeCancelRecording()
