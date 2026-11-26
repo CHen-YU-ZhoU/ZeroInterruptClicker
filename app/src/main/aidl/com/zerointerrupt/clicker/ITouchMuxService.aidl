@@ -38,6 +38,7 @@ interface ITouchMuxService {
     int[] getSlotStates();
     void setPreferredBackend(int preferredBackend);
     void setVolumeKeyControlEnabled(boolean enabled);
+    void setHybridTouchFeedbackEnabled(boolean enabled);
     void setTargetTriggerConfig(
         int mode,
         in float[] zoneXs,

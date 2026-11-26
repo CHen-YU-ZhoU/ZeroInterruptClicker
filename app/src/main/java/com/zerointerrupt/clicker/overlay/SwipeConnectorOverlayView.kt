@@ -7,6 +7,7 @@ import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Typeface
+import android.os.SystemClock
 import android.view.View
 import com.zerointerrupt.clicker.model.ActionType
 import com.zerointerrupt.clicker.model.ClickConfigStore
@@ -39,11 +40,39 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
         val isExpandedChild: Boolean
     )
 
+    private data class ActiveSpot(
+        var x: Float,
+        var y: Float
+    )
+
+    private data class FadingSpot(
+        val x: Float,
+        val y: Float,
+        val liftTimeMs: Long
+    )
+
     private var nodes: List<DrawNode> = emptyList()
     private var running: Boolean = false
     private var locked: Boolean = false
+    private var drawMacros: Boolean = true
+    private var macroAlphaScale: Float = 1f
+
+    // Silent system-synced show_touches dots for Tier 3 Hybrid mode
+    private val activeSpots = LinkedHashMap<Int, ActiveSpot>()
+    private val fadingSpots = ArrayList<FadingSpot>(16)
+    private var lastTouchIdsSeen = HashSet<Int>(16)
 
     private val d = resources.displayMetrics.density
+    private val touchSpotRadiusPx = 11.5f * d
+    private val touchSpotFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.WHITE
+    }
+    private val touchSpotHaloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.6f * d
+        color = Color.BLACK
+    }
     private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 2.4f * d
@@ -110,38 +139,130 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
     fun updateExpandedSwipes(
         entries: List<ClickConfigStore.DisplayTargetEntry>,
         isRunning: Boolean,
-        isLocked: Boolean
+        isLocked: Boolean,
+        showMacros: Boolean = true,
+        macroAlphaScale: Float = 1f
     ) {
         running = isRunning
         locked = isLocked
+        drawMacros = showMacros
+        this.macroAlphaScale = macroAlphaScale.coerceIn(0f, 1f)
         var seq = 1
-        nodes = entries
-            .filter { it.target.actionType != ActionType.SUB_PRESET }
-            .map { entry ->
-                val t = entry.target
-                val displayNum = if (entry.isExpandedChild) seq++ else {
-                    seq = maxOf(seq, t.index + 1)
-                    t.index
+        nodes = if (!showMacros) {
+            emptyList()
+        } else {
+            entries
+                .filter { it.target.actionType != ActionType.SUB_PRESET }
+                .map { entry ->
+                    val t = entry.target
+                    val displayNum = if (entry.isExpandedChild) seq++ else {
+                        seq = maxOf(seq, t.index + 1)
+                        t.index
+                    }
+                    DrawNode(
+                        indexNumber = displayNum,
+                        actionType = t.actionType,
+                        x = t.x,
+                        y = t.y,
+                        endX = t.endX,
+                        endY = t.endY,
+                        intervalMs = t.intervalMs,
+                        enabled = t.enabled,
+                        isExpandedChild = entry.isExpandedChild
+                    )
                 }
-                DrawNode(
-                    indexNumber = displayNum,
-                    actionType = t.actionType,
-                    x = t.x,
-                    y = t.y,
-                    endX = t.endX,
-                    endY = t.endY,
-                    intervalMs = t.intervalMs,
-                    enabled = t.enabled,
-                    isExpandedChild = entry.isExpandedChild
-                )
-            }
+        }
         invalidate()
+    }
+
+    fun updateHybridTouchPoints(pointerIds: IntArray, xs: FloatArray, ys: FloatArray) {
+        val nowMs = SystemClock.uptimeMillis()
+        val count = minOf(pointerIds.size, xs.size, ys.size)
+        lastTouchIdsSeen.clear()
+        for (i in 0 until count) {
+            val pid = pointerIds[i]
+            val x = xs[i]
+            val y = ys[i]
+            lastTouchIdsSeen.add(pid)
+            val existing = activeSpots[pid]
+            if (existing != null) {
+                existing.x = x
+                existing.y = y
+            } else {
+                activeSpots[pid] = ActiveSpot(x, y)
+            }
+        }
+
+        val iter = activeSpots.entries.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            if (!lastTouchIdsSeen.contains(entry.key)) {
+                if (fadingSpots.size >= MAX_FADING_SPOTS) {
+                    fadingSpots.removeAt(0)
+                }
+                fadingSpots.add(FadingSpot(entry.value.x, entry.value.y, nowMs))
+                iter.remove()
+            }
+        }
+        invalidate()
+    }
+
+    fun clearHybridTouchSpots() {
+        if (activeSpots.isEmpty() && fadingSpots.isEmpty()) return
+        activeSpots.clear()
+        fadingSpots.clear()
+        invalidate()
+    }
+
+    private fun drawTouchSpots(canvas: Canvas) {
+        if (activeSpots.isEmpty() && fadingSpots.isEmpty()) return
+
+        val nowMs = SystemClock.uptimeMillis()
+        var needsNextFrame = false
+
+        var i = 0
+        while (i < fadingSpots.size) {
+            val spot = fadingSpots[i]
+            val elapsed = nowMs - spot.liftTimeMs
+            if (elapsed >= SPOT_FADE_DURATION_MS) {
+                fadingSpots.removeAt(i)
+                continue
+            }
+            val progress = (elapsed.toFloat() / SPOT_FADE_DURATION_MS).coerceIn(0f, 1f)
+            val fadeAlpha = (1f - progress) * (1f - progress)
+            val radius = touchSpotRadiusPx * (1f - 0.16f * progress)
+            touchSpotHaloPaint.alpha = (88f * fadeAlpha).roundToInt().coerceIn(0, 255)
+            touchSpotFillPaint.alpha = (232f * fadeAlpha).roundToInt().coerceIn(0, 255)
+            canvas.drawCircle(spot.x, spot.y, radius, touchSpotFillPaint)
+            canvas.drawCircle(spot.x, spot.y, radius, touchSpotHaloPaint)
+            needsNextFrame = true
+            i++
+        }
+
+        if (activeSpots.isNotEmpty()) {
+            touchSpotHaloPaint.alpha = 96
+            touchSpotFillPaint.alpha = 240
+            for (spot in activeSpots.values) {
+                canvas.drawCircle(spot.x, spot.y, touchSpotRadiusPx, touchSpotFillPaint)
+                canvas.drawCircle(spot.x, spot.y, touchSpotRadiusPx, touchSpotHaloPaint)
+            }
+        }
+
+        if (needsNextFrame) {
+            postInvalidateOnAnimation()
+        }
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (nodes.isEmpty()) return
+        if (drawMacros && nodes.isNotEmpty()) {
+            drawMacroLayer(canvas)
+        }
+        drawTouchSpots(canvas)
+    }
 
+    private fun drawMacroLayer(canvas: Canvas) {
+        val mScale = macroAlphaScale
         val denseMode = nodes.size > 12
 
         // Layer 1: Draw SWIPE vector lines / arrows
@@ -156,7 +277,7 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
                 running -> Color.parseColor("#00E676")
                 else -> Color.parseColor("#7C4DFF")
             }
-            val vecAlpha = if (locked) 210 else 220
+            val vecAlpha = ((if (locked) 210 else 220) * mScale).roundToInt().coerceIn(0, 255)
 
             if (denseMode) {
                 solidCurvePaint.color = baseColor
@@ -199,7 +320,7 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
         if (!locked && !hasExpandedChildren) return
 
         // Layer 2: Unified anchor rendering (single WindowManager window = zero alpha stacking)
-        val ringAlphaScale = if (running) 0.78f else 0.94f
+        val ringAlphaScale = (if (running) 0.78f else 0.94f) * mScale
         val radius = 19f * d
         val endRadius = 13.5f * d
         val innerTick = radius + 1.5f * d
@@ -236,22 +357,22 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
 
             if (isContinuousMidKnot) {
                 centerDotPaint.color = accentColor
-                centerDotPaint.alpha = (210 * ringAlphaScale).roundToInt()
+                centerDotPaint.alpha = (210 * ringAlphaScale).roundToInt().coerceIn(0, 255)
                 canvas.drawCircle(node.x, node.y, 3.2f * d, centerDotPaint)
             } else {
                 fillPaint.color = accentColor
-                fillPaint.alpha = 42
+                fillPaint.alpha = (42 * mScale).roundToInt().coerceIn(0, 255)
                 outerRingPaint.color = accentColor
-                outerRingPaint.alpha = (255 * ringAlphaScale).roundToInt()
+                outerRingPaint.alpha = (255 * ringAlphaScale).roundToInt().coerceIn(0, 255)
                 crosshairPaint.color = accentColor
-                crosshairPaint.alpha = (210 * ringAlphaScale).roundToInt()
+                crosshairPaint.alpha = (210 * ringAlphaScale).roundToInt().coerceIn(0, 255)
 
                 canvas.drawCircle(node.x, node.y, radius, fillPaint)
                 canvas.drawCircle(node.x, node.y, radius, outerRingPaint)
 
                 if (node.actionType == ActionType.HOLD && node.enabled) {
                     secondaryRingPaint.color = accentColor
-                    secondaryRingPaint.alpha = (180 * ringAlphaScale).roundToInt()
+                    secondaryRingPaint.alpha = (180 * ringAlphaScale).roundToInt().coerceIn(0, 255)
                     canvas.drawCircle(node.x, node.y, radius - 4.2f * d, secondaryRingPaint)
                 }
 
@@ -261,10 +382,10 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
                 canvas.drawLine(node.x + innerTick, node.y, node.x + outerTick, node.y, crosshairPaint)
 
                 centerDotPaint.color = accentColor
-                centerDotPaint.alpha = 210
+                centerDotPaint.alpha = (210 * mScale).roundToInt().coerceIn(0, 255)
                 canvas.drawCircle(node.x, node.y, 2.2f * d, centerDotPaint)
 
-                textPaint.alpha = (255 * ringAlphaScale).roundToInt()
+                textPaint.alpha = (255 * ringAlphaScale).roundToInt().coerceIn(0, 255)
                 val textY = node.y - (fontMetrics.ascent + fontMetrics.descent) * 0.5f
                 canvas.drawText(node.indexNumber.toString(), node.x, textY, textPaint)
             }
@@ -285,18 +406,23 @@ class SwipeConnectorOverlayView(context: Context) : View(context) {
                 }
                 if (!seamlesslyContinues) {
                     fillPaint.color = accentColor
-                    fillPaint.alpha = 36
+                    fillPaint.alpha = (36 * mScale).roundToInt().coerceIn(0, 255)
                     endRingPaint.color = accentColor
-                    endRingPaint.alpha = (255 * ringAlphaScale).roundToInt()
+                    endRingPaint.alpha = (255 * ringAlphaScale).roundToInt().coerceIn(0, 255)
 
                     canvas.drawCircle(node.endX, node.endY, endRadius, fillPaint)
                     canvas.drawCircle(node.endX, node.endY, endRadius, endRingPaint)
 
-                    endTextPaint.alpha = (255 * ringAlphaScale).roundToInt()
+                    endTextPaint.alpha = (255 * ringAlphaScale).roundToInt().coerceIn(0, 255)
                     val ty = node.endY - (endFontMetrics.ascent + endFontMetrics.descent) * 0.5f
                     canvas.drawText("终", node.endX, ty, endTextPaint)
                 }
             }
         }
+    }
+
+    companion object {
+        private const val SPOT_FADE_DURATION_MS = 135L
+        private const val MAX_FADING_SPOTS = 32
     }
 }

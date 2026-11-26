@@ -27,6 +27,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -76,6 +77,12 @@ data class DisplayScreenMetrics(
 data class RootConnectResult(
     val success: Boolean,
     val message: String
+)
+
+class HybridTouchFrame(
+    val pointerIds: IntArray,
+    val xs: FloatArray,
+    val ys: FloatArray
 )
 
 /**
@@ -133,6 +140,15 @@ object ShizukuController {
     private val _targetTriggerEvents = MutableSharedFlow<Int>(extraBufferCapacity = 8)
     val targetTriggerEvents: SharedFlow<Int> = _targetTriggerEvents.asSharedFlow()
 
+    private val _hybridTouchPoints = MutableSharedFlow<HybridTouchFrame>(
+        extraBufferCapacity = 32,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val hybridTouchPoints: SharedFlow<HybridTouchFrame> = _hybridTouchPoints.asSharedFlow()
+
+    @Volatile
+    private var desiredHybridTouchFeedbackEnabled: Boolean = false
+
     private val serviceCallback = object : ITouchMuxCallback.Stub() {
         override fun onVolumeKeyToggleRequested() {
             _volumeKeyToggleEvents.tryEmit(Unit)
@@ -140,6 +156,7 @@ object ShizukuController {
 
         override fun onEmergencyUngrabTriggered() {
             _slotStates.value = List(16) { 0 }
+            _hybridTouchPoints.tryEmit(HybridTouchFrame(IntArray(0), FloatArray(0), FloatArray(0)))
             _emergencyUngrabEvents.tryEmit(Unit)
             refreshCapabilitiesAsync()
         }
@@ -157,6 +174,24 @@ object ShizukuController {
 
         override fun onTargetTriggerEvent(eventType: Int) {
             _targetTriggerEvents.tryEmit(eventType)
+        }
+
+        override fun onHybridTouchPoints(pointerIds: IntArray?, xs: FloatArray?, ys: FloatArray?) {
+            val ids = pointerIds ?: IntArray(0)
+            val fx = xs ?: FloatArray(0)
+            val fy = ys ?: FloatArray(0)
+            val n = minOf(ids.size, fx.size, fy.size)
+            if (n <= 0) {
+                _hybridTouchPoints.tryEmit(HybridTouchFrame(IntArray(0), FloatArray(0), FloatArray(0)))
+            } else {
+                _hybridTouchPoints.tryEmit(
+                    HybridTouchFrame(
+                        if (ids.size == n) ids else ids.copyOf(n),
+                        if (fx.size == n) fx else fx.copyOf(n),
+                        if (fy.size == n) fy else fy.copyOf(n)
+                    )
+                )
+            }
         }
     }
 
@@ -224,6 +259,7 @@ object ShizukuController {
                     svc.setVolumeKeyControlEnabled(settings.volumeKeyToggleEnabled)
                     svc.setPreferredBackend(settings.preferredBackend)
                 }
+                svc.setHybridTouchFeedbackEnabled(desiredHybridTouchFeedbackEnabled)
             } catch (_: Throwable) {
             }
             try {
@@ -469,6 +505,7 @@ object ShizukuController {
                 val settings = ClickConfigStore.loadSettings(ctx)
                 svc.setVolumeKeyControlEnabled(settings.volumeKeyToggleEnabled)
                 svc.setPreferredBackend(settings.preferredBackend)
+                svc.setHybridTouchFeedbackEnabled(desiredHybridTouchFeedbackEnabled)
             } catch (_: Throwable) {
             }
 
@@ -794,6 +831,15 @@ object ShizukuController {
         val svc = service ?: return
         try {
             svc.setVolumeKeyControlEnabled(enabled)
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun setHybridTouchFeedbackEnabled(enabled: Boolean) {
+        desiredHybridTouchFeedbackEnabled = enabled
+        val svc = service ?: return
+        try {
+            svc.setHybridTouchFeedbackEnabled(enabled)
         } catch (_: Throwable) {
         }
     }

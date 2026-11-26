@@ -6,4 +6,5 @@ interface ITouchMuxCallback {
     oneway void onSlotStatesChanged(in int[] slots);
     oneway void onClickingCompleted();
     oneway void onTargetTriggerEvent(int eventType);
+    oneway void onHybridTouchPoints(in int[] pointerIds, in float[] xs, in float[] ys);
 }

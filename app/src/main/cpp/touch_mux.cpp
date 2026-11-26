@@ -2530,7 +2530,7 @@ void TouchMuxEngine::emitHybridAction(int64_t downTimeMs, int64_t eventTimeMs, i
 
     for (int32_t i = 0; i < count; ++i) {
         const auto& p = hybridReported_[i];
-        hybridTmpIds_[i] = p.muxSlot;
+        hybridTmpIds_[i] = p.pointerId;
         hybridTmpXs_[i] = p.x;
         hybridTmpYs_[i] = p.y;
         hybridTmpPressures_[i] = p.pressure;
@@ -2621,8 +2621,26 @@ void TouchMuxEngine::flushHybridFrame() {
         if (alreadyDown) continue;
         if (hybridReported_.size() >= static_cast<size_t>(kMaxUinputSlots)) continue;
 
+        // Allocate lowest free Android pointerId (0..9 first, matching InputReader TouchInputMapper)
+        // so game engines with 10-touch caps (e.g. UE4 Touch1..Touch10) never drop high virtual muxSlots.
+        int32_t allocatedPid = 0;
+        for (int32_t candidate = 0; candidate < kMaxUinputSlots; ++candidate) {
+            bool inUse = false;
+            for (const auto& rp : hybridReported_) {
+                if (rp.pointerId == candidate) {
+                    inUse = true;
+                    break;
+                }
+            }
+            if (!inUse) {
+                allocatedPid = candidate;
+                break;
+            }
+        }
+
         HybridPointerTrack track;
         track.muxSlot = s;
+        track.pointerId = allocatedPid;
         track.trackingId = muxSlots_[s].trackingId;
         slotToCoords(s, track.x, track.y);
         track.pressure = calcNormalizedPressure(s);

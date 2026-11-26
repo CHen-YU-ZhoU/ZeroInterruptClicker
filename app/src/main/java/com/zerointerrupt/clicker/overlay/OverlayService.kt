@@ -15,6 +15,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.database.ContentObserver
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
@@ -22,6 +23,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.Settings
 import android.service.quicksettings.TileService
 import android.util.TypedValue
 import android.view.Display
@@ -182,6 +184,16 @@ class OverlayService : Service(), ControlBarView.Listener {
     private var targetTriggerJob: Job? = null
     private var emergencyUngrabJob: Job? = null
     private var clickingCompletedJob: Job? = null
+    private var hybridTouchPointsJob: Job? = null
+
+    private var systemShowTouchesEnabled: Boolean = false
+    private var hybridTouchFeedbackActive: Boolean = false
+    private val showTouchesObserver = object : ContentObserver(mainHandler) {
+        override fun onChange(selfChange: Boolean) {
+            systemShowTouchesEnabled = querySystemShowTouchesEnabled()
+            syncHybridTouchFeedbackState()
+        }
+    }
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = Unit
@@ -207,19 +219,42 @@ class OverlayService : Service(), ControlBarView.Listener {
         ShizukuController.initialize(this)
         startForegroundWithNotification()
         displayManager.registerDisplayListener(displayListener, null)
+        systemShowTouchesEnabled = querySystemShowTouchesEnabled()
+        try {
+            contentResolver.registerContentObserver(
+                Settings.System.getUriFor("show_touches"),
+                false,
+                showTouchesObserver
+            )
+        } catch (_: Throwable) {
+        }
 
         engineCollectJob = serviceScope.launch {
             ShizukuController.engineSnapshot.collect { snap ->
                 engineMode = snap.engineMode
+                syncHybridTouchFeedbackState()
                 refreshControlBarState()
             }
         }
 
         connectionCollectJob = serviceScope.launch {
             ShizukuController.connectionState.collect { state ->
-                if (state == ShizukuConnectionState.CONNECTED && normalOverlayAttached) {
-                    syncTargetTriggerConfig(preArmNative = true)
+                if (state == ShizukuConnectionState.CONNECTED) {
+                    syncHybridTouchFeedbackState(forcePush = true)
+                    if (normalOverlayAttached) {
+                        syncTargetTriggerConfig(preArmNative = true)
+                    }
                 }
+            }
+        }
+
+        hybridTouchPointsJob = serviceScope.launch {
+            ShizukuController.hybridTouchPoints.collect { frame ->
+                if (!hybridTouchFeedbackActive) return@collect
+                if (swipeConnectorView == null && normalOverlayAttached) {
+                    syncSwipeConnectorLayer()
+                }
+                swipeConnectorView?.updateHybridTouchPoints(frame.pointerIds, frame.xs, frame.ys)
             }
         }
 
@@ -382,12 +417,18 @@ class OverlayService : Service(), ControlBarView.Listener {
         macroRecordOverlay = null
         cancelBarSprings()
         displayManager.unregisterDisplayListener(displayListener)
+        try {
+            contentResolver.unregisterContentObserver(showTouchesObserver)
+        } catch (_: Throwable) {
+        }
+        ShizukuController.setHybridTouchFeedbackEnabled(false)
         engineCollectJob?.cancel()
         connectionCollectJob?.cancel()
         volumeToggleJob?.cancel()
         targetTriggerJob?.cancel()
         emergencyUngrabJob?.cancel()
         clickingCompletedJob?.cancel()
+        hybridTouchPointsJob?.cancel()
         val settings = ClickConfigStore.loadSettings(this)
         val keepEngineAliveForRpc = settings.proModeEnabled && settings.rpcBridgeEnabled
         stopClickingInternal()
@@ -1014,23 +1055,62 @@ class OverlayService : Service(), ControlBarView.Listener {
         return !showMacroTrajectoriesPref
     }
 
-    private fun syncSwipeConnectorLayer() {
-        if (shouldHideCurrentMacroOverlay()) {
-            removeSwipeConnectorLayer()
-            return
+    private fun querySystemShowTouchesEnabled(): Boolean {
+        return try {
+            Settings.System.getInt(contentResolver, "show_touches", 0) != 0
+        } catch (_: Throwable) {
+            false
         }
-        val displayEntries = buildExpandedDisplayEntries()
-        val hasSwipes = displayEntries.any { it.target.actionType == ActionType.SWIPE }
-        val hasExpandedChildren = displayEntries.any { it.isExpandedChild }
-        val hasVisibleTargets = displayEntries.isNotEmpty()
-        if (!hasSwipes && !hasExpandedChildren && !(isLocked && hasVisibleTargets)) {
-            removeSwipeConnectorLayer()
-            return
+    }
+
+    private fun syncHybridTouchFeedbackState(forcePush: Boolean = false) {
+        val nextActive = systemShowTouchesEnabled &&
+            (engineMode == TouchMuxUserService.MODE_HYBRID_EVDEV_INJECT)
+        val changed = (nextActive != hybridTouchFeedbackActive)
+        hybridTouchFeedbackActive = nextActive
+        if (changed || forcePush) {
+            ShizukuController.setHybridTouchFeedbackEnabled(nextActive)
         }
-        val safeAlpha = lockedAlpha.coerceIn(
+        if (!nextActive) {
+            swipeConnectorView?.clearHybridTouchSpots()
+        }
+        if (changed && normalOverlayAttached) {
+            syncSwipeConnectorLayer()
+        }
+    }
+
+    private fun computeSwipeLayerWindowAlpha(): Float {
+        if (hybridTouchFeedbackActive) {
+            return ClickGlobalSettings.MAX_LOCKED_ALPHA
+        }
+        return lockedAlpha.coerceIn(
             ClickGlobalSettings.MIN_LOCKED_ALPHA,
             ClickGlobalSettings.MAX_LOCKED_ALPHA
         )
+    }
+
+    private fun computeMacroAlphaScale(): Float {
+        if (!hybridTouchFeedbackActive) return 1f
+        val safeLocked = lockedAlpha.coerceIn(
+            ClickGlobalSettings.MIN_LOCKED_ALPHA,
+            ClickGlobalSettings.MAX_LOCKED_ALPHA
+        )
+        return (safeLocked / ClickGlobalSettings.MAX_LOCKED_ALPHA).coerceIn(0f, 1f)
+    }
+
+    private fun syncSwipeConnectorLayer() {
+        val hideMacros = shouldHideCurrentMacroOverlay()
+        val displayEntries = if (hideMacros) emptyList() else buildExpandedDisplayEntries()
+        val hasSwipes = displayEntries.any { it.target.actionType == ActionType.SWIPE }
+        val hasExpandedChildren = displayEntries.any { it.isExpandedChild }
+        val hasVisibleTargets = displayEntries.isNotEmpty()
+        val needMacroLayer = !hideMacros && (hasSwipes || hasExpandedChildren || (isLocked && hasVisibleTargets))
+        val needTouchDotsLayer = hybridTouchFeedbackActive
+        if (!needMacroLayer && !needTouchDotsLayer) {
+            removeSwipeConnectorLayer()
+            return
+        }
+        val windowAlpha = computeSwipeLayerWindowAlpha()
         var view = swipeConnectorView
         if (view == null) {
             view = SwipeConnectorOverlayView(this)
@@ -1039,20 +1119,26 @@ class OverlayService : Service(), ControlBarView.Listener {
                 WindowManager.LayoutParams.MATCH_PARENT,
                 touchable = false
             ).apply {
-                alpha = safeAlpha
+                alpha = windowAlpha
             }
             windowManager.addView(view, lp)
             swipeConnectorView = view
             swipeConnectorLp = lp
         } else {
             swipeConnectorLp?.let { lp ->
-                if (lp.alpha != safeAlpha) {
-                    lp.alpha = safeAlpha
+                if (lp.alpha != windowAlpha) {
+                    lp.alpha = windowAlpha
                     windowManager.updateViewLayout(view, lp)
                 }
             }
         }
-        view.updateExpandedSwipes(displayEntries, isClicking, isLocked)
+        view.updateExpandedSwipes(
+            entries = displayEntries,
+            isRunning = isClicking,
+            isLocked = isLocked,
+            showMacros = needMacroLayer,
+            macroAlphaScale = computeMacroAlphaScale()
+        )
     }
 
     private fun removeSwipeConnectorLayer() {
@@ -1196,7 +1282,13 @@ class OverlayService : Service(), ControlBarView.Listener {
                 t.setStartPixel(cx, cy, metrics.widthPx, metrics.heightPx)
             }
         }
-        swipeConnectorView?.updateExpandedSwipes(buildExpandedDisplayEntries(), isClicking, isLocked)
+        swipeConnectorView?.updateExpandedSwipes(
+            entries = buildExpandedDisplayEntries(),
+            isRunning = isClicking,
+            isLocked = isLocked,
+            showMacros = !shouldHideCurrentMacroOverlay(),
+            macroAlphaScale = computeMacroAlphaScale()
+        )
     }
 
     private fun handleAnchorDragFinish(targetId: Int) {
@@ -1267,16 +1359,16 @@ class OverlayService : Service(), ControlBarView.Listener {
                 windowManager.updateViewLayout(view, lp)
             }
         }
-        val safeCanvasAlpha = lockedAlpha.coerceIn(
-            ClickGlobalSettings.MIN_LOCKED_ALPHA,
-            ClickGlobalSettings.MAX_LOCKED_ALPHA
-        )
+        val windowAlpha = computeSwipeLayerWindowAlpha()
         swipeConnectorView?.let { v ->
             swipeConnectorLp?.let { lp ->
-                if (lp.alpha != safeCanvasAlpha) {
-                    lp.alpha = safeCanvasAlpha
+                if (lp.alpha != windowAlpha) {
+                    lp.alpha = windowAlpha
                     windowManager.updateViewLayout(v, lp)
                 }
+            }
+            if (hybridTouchFeedbackActive) {
+                syncSwipeConnectorLayer()
             }
         }
     }
@@ -1705,6 +1797,7 @@ class OverlayService : Service(), ControlBarView.Listener {
                     scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
                 } else {
                     engineMode = mode
+                    syncHybridTouchFeedbackState()
                     refreshControlBarState()
                     scheduleAutoCollapse(START_COLLAPSE_DELAY_MS)
                 }
@@ -2241,7 +2334,13 @@ class OverlayService : Service(), ControlBarView.Listener {
                 windowManager.updateViewLayout(endView, endLp)
             }
         }
-        swipeConnectorView?.updateExpandedSwipes(buildExpandedDisplayEntries(), isClicking, isLocked)
+        swipeConnectorView?.updateExpandedSwipes(
+            entries = buildExpandedDisplayEntries(),
+            isRunning = isClicking,
+            isLocked = isLocked,
+            showMacros = !shouldHideCurrentMacroOverlay(),
+            macroAlphaScale = computeMacroAlphaScale()
+        )
         syncTargetTriggerConfig()
 
         serviceScope.launch(Dispatchers.IO) {

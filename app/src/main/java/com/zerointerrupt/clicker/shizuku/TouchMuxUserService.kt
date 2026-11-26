@@ -18,12 +18,14 @@ import org.json.JSONObject
 import java.io.File
 import java.lang.reflect.Method
 import java.util.Random as JavaRandom
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.roundToLong
 
@@ -51,6 +53,9 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
     private val clickingActive = AtomicBoolean(false)
     private val selfCheckConfirmed = AtomicBoolean(false)
     private val volumeKeyEnabled = AtomicBoolean(true)
+    private val hybridTouchFeedbackEnabled = AtomicBoolean(false)
+    private val lastHybridMoveFeedbackNs = AtomicLong(0L)
+    private val lastInjectFailureLogNs = AtomicLong(0L)
     private var statusDetail: String = "Idle"
 
     private val targetTriggerCfgLock = Any()
@@ -69,6 +74,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
 
     private val watchdogExecutor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val rpcFallbackExecutor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    private val touchFeedbackExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var selfCheckWatchdogTask: ScheduledFuture<*>? = null
     private val nativeLifecycleLock = Any()
 
@@ -403,6 +409,79 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
             pressures = hybridPressuresBuf,
             sizes = hybridSizesBuf
         )
+        if (hybridTouchFeedbackEnabled.get()) {
+            dispatchHybridTouchFeedbackAsync(action, pointerCount)
+        }
+    }
+
+    private fun dispatchHybridTouchFeedbackAsync(action: Int, pointerCount: Int) {
+        val masked = action and MotionEvent.ACTION_MASK
+        if (masked == MotionEvent.ACTION_MOVE) {
+            val nowNs = System.nanoTime()
+            val prevNs = lastHybridMoveFeedbackNs.get()
+            if (nowNs - prevNs < HYBRID_MOVE_FEEDBACK_MIN_INTERVAL_NS) return
+            lastHybridMoveFeedbackNs.set(nowNs)
+        }
+
+        val outIds: IntArray
+        val outXs: FloatArray
+        val outYs: FloatArray
+        when (masked) {
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                outIds = EMPTY_INT_ARRAY
+                outXs = EMPTY_FLOAT_ARRAY
+                outYs = EMPTY_FLOAT_ARRAY
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                val upIdx = (action and MotionEvent.ACTION_POINTER_INDEX_MASK) shr MotionEvent.ACTION_POINTER_INDEX_SHIFT
+                val remain = (pointerCount - 1).coerceAtLeast(0)
+                if (remain == 0) {
+                    outIds = EMPTY_INT_ARRAY
+                    outXs = EMPTY_FLOAT_ARRAY
+                    outYs = EMPTY_FLOAT_ARRAY
+                } else {
+                    outIds = IntArray(remain)
+                    outXs = FloatArray(remain)
+                    outYs = FloatArray(remain)
+                    var dst = 0
+                    for (i in 0 until pointerCount) {
+                        if (i == upIdx || dst >= remain) continue
+                        outIds[dst] = hybridIdsBuf[i]
+                        outXs[dst] = hybridXsBuf[i]
+                        outYs[dst] = hybridYsBuf[i]
+                        dst++
+                    }
+                }
+            }
+            else -> {
+                outIds = IntArray(pointerCount)
+                outXs = FloatArray(pointerCount)
+                outYs = FloatArray(pointerCount)
+                for (i in 0 until pointerCount) {
+                    outIds[i] = hybridIdsBuf[i]
+                    outXs[i] = hybridXsBuf[i]
+                    outYs[i] = hybridYsBuf[i]
+                }
+            }
+        }
+
+        try {
+            touchFeedbackExecutor.execute {
+                notifyRemoteCallbacks { it.onHybridTouchPoints(outIds, outXs, outYs) }
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun clearHybridTouchFeedbackAsync() {
+        try {
+            touchFeedbackExecutor.execute {
+                notifyRemoteCallbacks {
+                    it.onHybridTouchPoints(EMPTY_INT_ARRAY, EMPTY_FLOAT_ARRAY, EMPTY_FLOAT_ARRAY)
+                }
+            }
+        } catch (_: Throwable) {
+        }
     }
 
     @Keep
@@ -537,6 +616,13 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         }
     }
 
+    override fun setHybridTouchFeedbackEnabled(enabled: Boolean) {
+        val prev = hybridTouchFeedbackEnabled.getAndSet(enabled)
+        if (prev && !enabled) {
+            clearHybridTouchFeedbackAsync()
+        }
+    }
+
     override fun setTargetTriggerConfig(
         mode: Int,
         zoneXs: FloatArray?,
@@ -609,6 +695,11 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         return getSystemProperty("ro.vendor.touchfeature.type").isNotEmpty()
     }
 
+    private fun isHybridInjectPermittedOnXiaomi(): Boolean {
+        if (android.os.Process.myUid() == 0) return true
+        return getSystemProperty("persist.security.adbinput") == "1"
+    }
+
     /**
      * Resolves the effective native backend passed to TouchMuxEngine::initAndGrab.
      * On Xiaomi THP devices (vendor.xiaomi.hw.touchfeature-service / libtouchreport_hal),
@@ -616,7 +707,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
      * mis-bind to any uinput/uhid virtual touchscreen node, permanently breaking physical touch
      * once that virtual node is later destroyed. Preferring Tier 3 Hybrid (EVIOCGRAB + zero-GC
      * IInputManager.injectInputEvent) creates zero /dev/input/event* nodes and eliminates this
-     * conflict completely.
+     * conflict completely, provided MIUI ADB input injection is permitted (or running as UID 0).
      */
     private fun resolveEffectiveNativeBackend(prefBackend: Int): Int {
         if (prefBackend == BACKEND_HYBRID) {
@@ -624,7 +715,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         }
         if (prefBackend == BACKEND_AUTO) {
             val hybridReady = ensureFallbackInjectorReady()
-            if (hybridReady && isXiaomiThpTouchSystem()) {
+            if (hybridReady && isXiaomiThpTouchSystem() && isHybridInjectPermittedOnXiaomi()) {
                 Log.i(
                     TAG,
                     "Detected Xiaomi THP touch subsystem; selecting Tier 3 Hybrid backend in AUTO mode to avoid /dev/input THP mis-binding."
@@ -954,6 +1045,9 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         stopNativeSilently()
         currentMode.set(MODE_IDLE)
         statusDetail = "Engine stopped."
+        if (hybridTouchFeedbackEnabled.get()) {
+            clearHybridTouchFeedbackAsync()
+        }
     }
 
     override fun getEngineMode(): Int = currentMode.get()
@@ -1355,6 +1449,7 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         remoteCallbacks.kill()
         watchdogExecutor.shutdownNow()
         rpcFallbackExecutor.shutdownNow()
+        touchFeedbackExecutor.shutdownNow()
         System.exit(0)
     }
 
@@ -2301,7 +2396,14 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 0
             )
             try {
-                method.invoke(im, event, INJECT_INPUT_EVENT_MODE_ASYNC)
+                val ok = method.invoke(im, event, INJECT_INPUT_EVENT_MODE_ASYNC)
+                if (ok == false) {
+                    val nowNs = System.nanoTime()
+                    val prevNs = lastInjectFailureLogNs.get()
+                    if (nowNs - prevNs > 2_000_000_000L && lastInjectFailureLogNs.compareAndSet(prevNs, nowNs)) {
+                        Log.w(TAG, "injectInputEvent returned false (action=$action, count=$count)")
+                    }
+                }
             } catch (t: Throwable) {
                 Log.w(TAG, "injectInputEvent failed: ${t.message}")
             } finally {
@@ -2316,6 +2418,9 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
         private const val INJECT_INPUT_EVENT_MODE_ASYNC = 0
         private const val VIRTUAL_INJECT_DEVICE_ID = -1
         private const val NATIVE_STATE_RUNNING_GRABBED = 2
+        private const val HYBRID_MOVE_FEEDBACK_MIN_INTERVAL_NS = 8_000_000L
+        private val EMPTY_INT_ARRAY = IntArray(0)
+        private val EMPTY_FLOAT_ARRAY = FloatArray(0)
 
         private const val ACTION_TAP = 0
         private const val ACTION_SWIPE = 1

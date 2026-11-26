@@ -499,6 +499,7 @@ private:
     // Tier 3 Hybrid state machine (tracks what Android currently sees DOWN)
     struct HybridPointerTrack {
         int muxSlot = -1;
+        int32_t pointerId = 0;
         int32_t trackingId = -1;
         float x = 0.0f;
         float y = 0.0f;
