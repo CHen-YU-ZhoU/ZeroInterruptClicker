@@ -3,6 +3,7 @@ package com.zerointerrupt.clicker.ui.theme
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.Typography
@@ -11,10 +12,15 @@ import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
+import androidx.core.graphics.ColorUtils
+import com.zerointerrupt.clicker.model.ClickGlobalSettings
+import kotlin.math.abs
 
 private val FallbackLightColorScheme = lightColorScheme(
     primary = Color(0xFF006494),
@@ -106,19 +112,99 @@ private val ExpressiveTypography = Typography().run {
 
 fun TextStyle.withTabular(): TextStyle = copy(fontFeatureSettings = "tnum")
 
+fun tuneArgbColor(
+    argb: Int,
+    satBoost: Float,
+    lightBoost: Float,
+    isSurface: Boolean = false,
+    isContent: Boolean = false
+): Int {
+    if (abs(satBoost) < 0.001f && abs(lightBoost) < 0.001f) return argb
+    val alpha = android.graphics.Color.alpha(argb)
+    val hsl = FloatArray(3)
+    ColorUtils.colorToHSL(argb, hsl)
+    var s = hsl[1]
+    var l = hsl[2]
+    if (s > 0.008f) {
+        val sScale = when {
+            isContent -> 0.35f
+            isSurface -> 0.72f
+            else -> 1.0f
+        }
+        val effSat = satBoost * sScale
+        s = (s * (1f + effSat * 1.15f) + effSat * 0.22f)
+            .coerceIn(0f, if (isSurface) 0.55f else 0.92f)
+    }
+    if (!isContent) {
+        val lScale = if (isSurface) 0.50f else 1.0f
+        l = (l + lightBoost * lScale).coerceIn(0.04f, 0.99f)
+    }
+    hsl[1] = s
+    hsl[2] = l
+    return ColorUtils.setAlphaComponent(ColorUtils.HSLToColor(hsl), alpha)
+}
+
+private fun Color.tuned(
+    satBoost: Float,
+    lightBoost: Float,
+    isSurface: Boolean = false,
+    isContent: Boolean = false
+): Color = Color(tuneArgbColor(this.toArgb(), satBoost, lightBoost, isSurface, isContent))
+
+private fun ColorScheme.withVibrancyTuning(
+    satBoost: Float,
+    lightBoost: Float
+): ColorScheme {
+    if (abs(satBoost) < 0.001f && abs(lightBoost) < 0.001f) return this
+    return copy(
+        primary = primary.tuned(satBoost, lightBoost),
+        onPrimary = onPrimary.tuned(satBoost, lightBoost, isContent = true),
+        primaryContainer = primaryContainer.tuned(satBoost, lightBoost),
+        onPrimaryContainer = onPrimaryContainer.tuned(satBoost, lightBoost, isContent = true),
+        inversePrimary = inversePrimary.tuned(satBoost, lightBoost),
+        secondary = secondary.tuned(satBoost, lightBoost),
+        onSecondary = onSecondary.tuned(satBoost, lightBoost, isContent = true),
+        secondaryContainer = secondaryContainer.tuned(satBoost, lightBoost),
+        onSecondaryContainer = onSecondaryContainer.tuned(satBoost, lightBoost, isContent = true),
+        tertiary = tertiary.tuned(satBoost, lightBoost),
+        onTertiary = onTertiary.tuned(satBoost, lightBoost, isContent = true),
+        tertiaryContainer = tertiaryContainer.tuned(satBoost, lightBoost),
+        onTertiaryContainer = onTertiaryContainer.tuned(satBoost, lightBoost, isContent = true),
+        background = background.tuned(satBoost, lightBoost, isSurface = true),
+        surface = surface.tuned(satBoost, lightBoost, isSurface = true),
+        surfaceVariant = surfaceVariant.tuned(satBoost, lightBoost, isSurface = true),
+        surfaceTint = surfaceTint.tuned(satBoost, lightBoost),
+        surfaceBright = surfaceBright.tuned(satBoost, lightBoost, isSurface = true),
+        surfaceDim = surfaceDim.tuned(satBoost, lightBoost, isSurface = true),
+        surfaceContainerLowest = surfaceContainerLowest.tuned(satBoost, lightBoost, isSurface = true),
+        surfaceContainerLow = surfaceContainerLow.tuned(satBoost, lightBoost, isSurface = true),
+        surfaceContainer = surfaceContainer.tuned(satBoost, lightBoost, isSurface = true),
+        surfaceContainerHigh = surfaceContainerHigh.tuned(satBoost, lightBoost, isSurface = true),
+        surfaceContainerHighest = surfaceContainerHighest.tuned(satBoost, lightBoost, isSurface = true),
+        outlineVariant = outlineVariant.tuned(satBoost, lightBoost, isSurface = true)
+    )
+}
+
 @Composable
 fun ZeroInterruptTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     dynamicColor: Boolean = true,
+    colorSaturationBoost: Float = ClickGlobalSettings.DEFAULT_COLOR_SATURATION_BOOST,
+    colorLightnessBoost: Float = ClickGlobalSettings.DEFAULT_COLOR_LIGHTNESS_BOOST,
     content: @Composable () -> Unit
 ) {
     val context = LocalContext.current
-    val colorScheme = when {
+    val baseScheme = when {
         dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
             if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
         }
         darkTheme -> FallbackDarkColorScheme
         else -> FallbackLightColorScheme
+    }
+    val effectiveSat = ClickGlobalSettings.BASE_COLOR_SATURATION_OFFSET + colorSaturationBoost
+    val effectiveLit = ClickGlobalSettings.BASE_COLOR_LIGHTNESS_OFFSET + colorLightnessBoost
+    val colorScheme = remember(baseScheme, effectiveSat, effectiveLit) {
+        baseScheme.withVibrancyTuning(effectiveSat, effectiveLit)
     }
 
     MaterialTheme(

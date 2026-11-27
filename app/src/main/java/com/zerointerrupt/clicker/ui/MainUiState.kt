@@ -6,6 +6,7 @@ import com.zerointerrupt.clicker.model.ClickGlobalSettings
 import com.zerointerrupt.clicker.model.ClickPreset
 import com.zerointerrupt.clicker.model.ClickTarget
 import com.zerointerrupt.clicker.model.ExecutionMode
+import com.zerointerrupt.clicker.model.PresetQuickTriggerConfig
 import com.zerointerrupt.clicker.shizuku.EngineSnapshot
 import com.zerointerrupt.clicker.shizuku.ShizukuConnectionState
 
@@ -47,6 +48,9 @@ data class MainUiState(
     val screenHeightPx: Int,
     val themeMode: Int = ClickGlobalSettings.THEME_SYSTEM,
     val dynamicColor: Boolean = true,
+    val colorSaturationBoost: Float = ClickGlobalSettings.DEFAULT_COLOR_SATURATION_BOOST,
+    val colorLightnessBoost: Float = ClickGlobalSettings.DEFAULT_COLOR_LIGHTNESS_BOOST,
+    val activeQuickTriggerPresetIds: Set<String> = emptySet(),
     val launcherIconMode: Int = ClickGlobalSettings.LAUNCHER_SYSTEM,
     val volumeKeyToggleEnabled: Boolean = true,
     val targetLongPressTriggerEnabled: Boolean = false,
@@ -94,7 +98,6 @@ data class MainScreenCallbacks(
     val onAutoLockChange: (Boolean) -> Unit,
     val onAutoCollapseChange: (Boolean) -> Unit,
     val onShowMacroTrajectoriesChange: (Boolean) -> Unit,
-    val onApplyDefaultsToGlobal: () -> Unit,
     val onSelectPreset: (String) -> Unit,
     val onCyclePreset: (Int) -> Unit,
     val onCreatePreset: (String, Boolean) -> Unit,
@@ -133,6 +136,11 @@ data class MainScreenCallbacks(
     val onDeletePresetTarget: (Int) -> Unit,
     val onThemeModeChange: (Int) -> Unit,
     val onDynamicColorChange: (Boolean) -> Unit,
+    val onColorSaturationBoostChange: (Float, Boolean) -> Unit,
+    val onColorLightnessBoostChange: (Float, Boolean) -> Unit,
+    val onResetColorTuning: () -> Unit,
+    val onShowPresetQuickTrigger: (PresetQuickTriggerConfig) -> Unit,
+    val onHidePresetQuickTrigger: (String) -> Unit,
     val onLauncherIconModeChange: (Int) -> Unit,
     val onVolumeKeyToggleChange: (Boolean) -> Unit,
     val onTargetLongPressTriggerChange: (Boolean) -> Unit,

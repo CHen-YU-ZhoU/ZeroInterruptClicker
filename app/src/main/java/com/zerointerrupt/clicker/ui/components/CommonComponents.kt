@@ -257,20 +257,6 @@ fun PresetMiniCanvas(
         val maxDispW = (screenWidthPx - 1).coerceAtLeast(1).toFloat()
         val maxDispH = (screenHeightPx - 1).coerceAtLeast(1).toFloat()
 
-        // Subtle grid guidelines
-        drawLine(
-            color = outlineColor.copy(alpha = 0.22f),
-            start = Offset(w * 0.5f, 0f),
-            end = Offset(w * 0.5f, h),
-            strokeWidth = 1f
-        )
-        drawLine(
-            color = outlineColor.copy(alpha = 0.22f),
-            start = Offset(0f, h * 0.5f),
-            end = Offset(w, h * 0.5f),
-            strokeWidth = 1f
-        )
-
         if (drawOuterFrame) {
             drawRoundRect(
                 color = outlineColor.copy(alpha = 0.35f),
@@ -380,7 +366,7 @@ fun PresetMiniCanvas(
                 (maxOf(0, idx - 8) until idx).any { k ->
                     val prev = previewTargets[k]
                     prev.actionType == ActionType.SWIPE &&
-                        prev.intervalMs <= 80L &&
+                        prev.intervalMs <= ClickTarget.SEAMLESS_HOLD_GAP_MS &&
                         kotlin.math.hypot((t.x - prev.endX).toDouble(), (t.y - prev.endY).toDouble()) <= 24.0
                 }
             if (!isDenseMidKnot) {
@@ -511,7 +497,7 @@ fun SetupWizardBottomSheet(
     val modeTabs = remember {
         listOf(
             ExpressiveOption(0, "Shizuku 模式", R.drawable.ic_terminal),
-            ExpressiveOption(1, "Root 极速模式", R.drawable.ic_shield_check)
+            ExpressiveOption(1, "Root 模式", R.drawable.ic_shield_check)
         )
     }
 
@@ -571,16 +557,6 @@ fun SetupWizardBottomSheet(
                     }
                 },
                 height = 44.dp
-            )
-
-            Text(
-                text = if (pagerState.currentPage == 0) {
-                    "免 Root 通用方案 · 依次授予系统权限并连接 Shizuku 后校准"
-                } else {
-                    "已 Root 设备推荐 · 1 次授权自动配齐全部权限，仅需 2 步完成"
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = cs.onSurfaceVariant
             )
 
             HorizontalPager(
@@ -708,7 +684,6 @@ private fun ShizukuWizardPage(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun RootWizardPage(
     state: MainUiState,
@@ -717,224 +692,50 @@ private fun RootWizardPage(
     shizukuCurrentlyActive: Boolean,
     onDismiss: () -> Unit
 ) {
-    val cs = MaterialTheme.colorScheme
-    val allRootPermsReady = rootConnected &&
-        state.overlayPermGranted &&
-        (!state.showNotifRow || state.notifPermGranted) &&
-        state.batteryOptIgnored
+    val step1Done = rootConnected && state.overlayPermGranted
+    val rootSubtitle = when {
+        state.rootConnecting -> "正在授权并连接…"
+        rootConnected && state.overlayPermGranted -> "已连接 (UID 0)"
+        rootConnected -> "已连接，待开启悬浮窗权限"
+        !state.rootErrorMessage.isNullOrBlank() -> state.rootErrorMessage
+        else -> "未连接"
+    }
+    val rootBtnLabel = when {
+        state.rootConnecting -> "连接中..."
+        rootConnected && state.overlayPermGranted -> "已连接"
+        rootConnected -> "去开启"
+        shizukuCurrentlyActive -> "切换并连接"
+        else -> "授权连接"
+    }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        if (shizukuCurrentlyActive) {
-            WizardModeSwitchHint(
-                text = "当前已通过 Shizuku 通道运行；授权 Root 后将自动切换至 UID 0 直连模式"
-            )
-        }
-
-        // Compact M3 Tonal highlight banner explaining the 2-step Root fast path
-        Surface(
-            shape = RoundedCornerShape(20.dp),
-            color = cs.primaryContainer.copy(alpha = 0.45f),
-            border = BorderStroke(1.dp, cs.primary.copy(alpha = 0.18f))
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Surface(
-                    shape = CircleShape,
-                    color = cs.primary.copy(alpha = 0.14f),
-                    modifier = Modifier.size(36.dp)
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_bolt),
-                            contentDescription = null,
-                            tint = cs.primary,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                }
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(2.dp)
-                ) {
-                    Text(
-                        text = "一次 Root 授权，全自动托管配置",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = cs.onPrimaryContainer
-                    )
-                    Text(
-                        text = "免跳转自动授予悬浮窗、通知与省电白名单，并直连 UID 0 引擎",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = cs.onPrimaryContainer.copy(alpha = 0.82f)
-                    )
-                }
-            }
-        }
-
-        // Step 1: One-click Root superuser authorization + auto permissions
-        val step1Done = rootConnected && state.overlayPermGranted
-        Surface(
-            shape = RoundedCornerShape(20.dp),
-            color = cs.surfaceContainerHigh
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(28.dp)
-                            .clip(CircleShape)
-                            .background(
-                                if (step1Done) cs.primary else cs.secondaryContainer
-                            ),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = if (step1Done) "✓" else "1",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = if (step1Done) cs.onPrimary else cs.onSecondaryContainer
-                        )
-                    }
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Root 超级用户授权",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Text(
-                            text = when {
-                                state.rootConnecting -> "正在请求 Root 权限并自动配置全部系统项…"
-                                allRootPermsReady -> "UID 0 引擎与系统权限已全部自动就绪"
-                                rootConnected -> "Root 引擎已连接，可点击下方未就绪标签快速补授"
-                                !state.rootErrorMessage.isNullOrBlank() -> state.rootErrorMessage
-                                else -> "授予一次 Root，自动代替所有手工授权步骤"
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (!state.rootErrorMessage.isNullOrBlank() && !rootConnected && !state.rootConnecting) {
-                                cs.error
-                            } else {
-                                cs.onSurfaceVariant
-                            }
-                        )
-                    }
-                    if (rootConnected) {
-                        Surface(
-                            shape = CircleShape,
-                            color = cs.primaryContainer
-                        ) {
-                            Text(
-                                text = "UID 0",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = cs.onPrimaryContainer,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                            )
-                        }
-                    }
-                }
-
-                // Live auto-granted checklist pills (tap any ungranted pill as ROM fallback)
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    RootAutoPermChip(
-                        label = "Root 引擎",
-                        granted = rootConnected,
-                        onClick = if (!rootConnected && !state.rootConnecting) callbacks.onGrantRoot else null
-                    )
-                    RootAutoPermChip(
-                        label = "悬浮窗",
-                        granted = state.overlayPermGranted,
-                        onClick = if (!state.overlayPermGranted) callbacks.onGrantOverlay else null
-                    )
-                    if (state.showNotifRow) {
-                        RootAutoPermChip(
-                            label = "通知",
-                            granted = state.notifPermGranted,
-                            onClick = if (!state.notifPermGranted) callbacks.onGrantNotif else null
-                        )
-                    }
-                    RootAutoPermChip(
-                        label = "省电白名单",
-                        granted = state.batteryOptIgnored,
-                        onClick = if (!state.batteryOptIgnored) callbacks.onGrantBatteryOpt else null
-                    )
-                }
-
-                if (allRootPermsReady) {
-                    FilledTonalButton(
-                        onClick = callbacks.onGrantRoot,
-                        enabled = !state.rootConnecting,
-                        shape = CircleShape,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(42.dp),
-                        colors = ButtonDefaults.filledTonalButtonColors(
-                            containerColor = cs.secondaryContainer.copy(alpha = 0.65f)
-                        )
-                    ) {
-                        Text("Root 已就绪 · 重新检测", fontWeight = FontWeight.SemiBold)
-                    }
-                } else {
-                    Button(
-                        onClick = callbacks.onGrantRoot,
-                        enabled = !state.rootConnecting,
-                        shape = CircleShape,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(44.dp)
-                    ) {
-                        if (state.rootConnecting) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp),
-                                strokeWidth = 2.dp,
-                                color = cs.onPrimary
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text("正在授权并自动配置…", fontWeight = FontWeight.SemiBold)
-                        } else {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_shield_check),
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(Modifier.width(6.dp))
-                            Text(
-                                text = if (rootConnected) "重新自动配置权限" else "一键授权 Root 并自动配置",
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
+        WizardStepCard(
+            step = "1",
+            title = "Root 通道",
+            subtitle = rootSubtitle,
+            done = step1Done,
+            actionLabel = rootBtnLabel,
+            onAction = {
+                if (!state.rootConnecting) {
+                    if (rootConnected && !state.overlayPermGranted) {
+                        callbacks.onGrantOverlay()
+                    } else {
+                        callbacks.onGrantRoot()
                     }
                 }
             }
-        }
+        )
 
-        // Step 2: 5-second touch calibration (always visible so the 2-step flow is crystal clear)
         val touchReadable = state.engineSnapshot.touchDeviceReadable &&
             state.preferredBackend != ClickGlobalSettings.BACKEND_FALLBACK
         TouchCalibrationStepCard(
             stepNumber = "2",
             channelConnected = rootConnected,
             touchReadable = touchReadable,
-            lockedHint = "完成步骤 1 Root 授权后解锁校准",
+            lockedHint = "连接 Root 通道后解锁触控校准",
             state = state,
             callbacks = callbacks,
             onDismiss = onDismiss
@@ -957,56 +758,6 @@ private fun WizardModeSwitchHint(text: String) {
                 .fillMaxWidth()
                 .padding(horizontal = 12.dp, vertical = 9.dp)
         )
-    }
-}
-
-@Composable
-private fun RootAutoPermChip(
-    label: String,
-    granted: Boolean,
-    onClick: (() -> Unit)?
-) {
-    val cs = MaterialTheme.colorScheme
-    val bg by animateColorAsState(
-        targetValue = if (granted) cs.primaryContainer else cs.surfaceContainerHighest,
-        animationSpec = tween(200),
-        label = "rootPermBg_$label"
-    )
-    val fg by animateColorAsState(
-        targetValue = if (granted) cs.onPrimaryContainer else cs.onSurfaceVariant,
-        animationSpec = tween(200),
-        label = "rootPermFg_$label"
-    )
-    Surface(
-        shape = CircleShape,
-        color = bg,
-        border = if (!granted) BorderStroke(1.dp, cs.outlineVariant.copy(alpha = 0.45f)) else null,
-        modifier = if (onClick != null) {
-            Modifier
-                .clip(CircleShape)
-                .clickable(onClick = onClick)
-        } else {
-            Modifier
-        }
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Text(
-                text = if (granted) "✓" else "○",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = if (granted) cs.primary else cs.onSurfaceVariant
-            )
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = if (granted) FontWeight.SemiBold else FontWeight.Medium,
-                color = fg
-            )
-        }
     }
 }
 
@@ -2196,7 +1947,7 @@ fun TargetEditDialog(
                                 }
                             }
                             Text(
-                                text = "设 0ms（≤80ms）时，相邻同坐标持续长按将自动合并保持按住不松手",
+                                text = "步后停顿为 0ms 时，相邻同坐标按住/滑动自动不断触衔接",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = cs.onSurfaceVariant
                             )
@@ -2233,7 +1984,7 @@ fun TargetEditDialog(
                             OutlinedTextField(
                                 value = intervalText,
                                 onValueChange = { intervalText = it.filter(Char::isDigit).take(5) },
-                                label = { Text("间隔/步停顿(ms)") },
+                                label = { Text("步后停顿(ms)") },
                                 singleLine = true,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                 modifier = Modifier.weight(1f)
@@ -2253,17 +2004,10 @@ fun TargetEditDialog(
                             OutlinedTextField(
                                 value = intervalText,
                                 onValueChange = { intervalText = it.filter(Char::isDigit).take(5) },
-                                label = { Text(if (isSequential) "停顿/无缝(ms)" else "循环间隔(ms)") },
+                                label = { Text("步后停顿(ms)") },
                                 singleLine = true,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                 modifier = Modifier.weight(1f)
-                            )
-                        }
-                        if (isSequential) {
-                            Text(
-                                text = "停顿设 0ms（≤80ms）时，可与前后步同点长按自动衔接不断触",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = cs.onSurfaceVariant
                             )
                         }
                     }
@@ -2283,42 +2027,10 @@ fun TargetEditDialog(
                     }
                 }
 
-                val repeatVal = repeatText.toIntOrNull() ?: ClickTarget.defaultRepeatFor(executionMode)
-                Text(
-                    text = "循环次数 (0=无限)",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = cs.onSurfaceVariant
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    listOf(0 to "无限", 1 to "1次", 3 to "3次", 5 to "5次", 10 to "10次").forEach { (v, tag) ->
-                        val selected = repeatVal == v
-                        Surface(
-                            shape = CircleShape,
-                            color = if (selected) cs.primary else cs.surfaceContainerHigh,
-                            contentColor = if (selected) cs.onPrimary else cs.onSurfaceVariant,
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(CircleShape)
-                                .clickable { repeatText = v.toString() }
-                        ) {
-                            Text(
-                                text = tag,
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                textAlign = TextAlign.Center,
-                                maxLines = 1,
-                                modifier = Modifier.padding(vertical = 7.dp)
-                            )
-                        }
-                    }
-                }
                 OutlinedTextField(
                     value = repeatText,
                     onValueChange = { repeatText = it.filter(Char::isDigit).take(4) },
-                    label = { Text("自定义循环次数 (0=无限, 1~9999)") },
+                    label = { Text("循环次数 (0=无限, 1~9999)") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.fillMaxWidth()

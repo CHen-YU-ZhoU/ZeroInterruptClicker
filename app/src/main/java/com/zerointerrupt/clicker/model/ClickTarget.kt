@@ -214,7 +214,7 @@ data class ClickTarget(
         const val MAX_SUB_DURATION_MS = 600_000L
         const val DEFAULT_SUB_DURATION_MS = 3_000L
 
-        const val SEAMLESS_HOLD_GAP_MS = 80L
+        const val SEAMLESS_HOLD_GAP_MS = 0L
         const val SEAMLESS_HOLD_DIST_PX = 20f
 
         fun defaultRepeatFor(executionMode: ExecutionMode): Int =
@@ -486,6 +486,8 @@ data class ClickGlobalSettings(
     val lockedAnchorAlpha: Float = DEFAULT_LOCKED_ALPHA,
     val themeMode: Int = THEME_SYSTEM,
     val dynamicColor: Boolean = true,
+    val colorSaturationBoost: Float = DEFAULT_COLOR_SATURATION_BOOST,
+    val colorLightnessBoost: Float = DEFAULT_COLOR_LIGHTNESS_BOOST,
     val launcherIconMode: Int = LAUNCHER_SYSTEM,
     val volumeKeyToggleEnabled: Boolean = true,
     val targetLongPressTriggerEnabled: Boolean = false,
@@ -529,6 +531,17 @@ data class ClickGlobalSettings(
         const val THEME_LIGHT = 1
         const val THEME_DARK = 2
 
+        const val BASE_COLOR_SATURATION_OFFSET = 0.03f
+        const val BASE_COLOR_LIGHTNESS_OFFSET = -0.01f
+
+        const val DEFAULT_COLOR_SATURATION_BOOST = 0.0f
+        const val MIN_COLOR_SATURATION_BOOST = -0.25f
+        const val MAX_COLOR_SATURATION_BOOST = 0.45f
+
+        const val DEFAULT_COLOR_LIGHTNESS_BOOST = 0.0f
+        const val MIN_COLOR_LIGHTNESS_BOOST = -0.10f
+        const val MAX_COLOR_LIGHTNESS_BOOST = 0.15f
+
         const val LAUNCHER_SYSTEM = 0
         const val LAUNCHER_DARK = 1
         const val LAUNCHER_LIGHT = 2
@@ -565,6 +578,8 @@ object ClickConfigStore {
     private const val KEY_LOCKED_ANCHOR_ALPHA = "locked_anchor_alpha"
     private const val KEY_THEME_MODE = "theme_mode"
     private const val KEY_DYNAMIC_COLOR = "dynamic_color"
+    private const val KEY_COLOR_SAT_BOOST = "color_sat_boost_v2"
+    private const val KEY_COLOR_LIGHT_BOOST = "color_light_boost_v2"
     private const val KEY_LAUNCHER_ICON_MODE = "launcher_icon_mode"
     private const val KEY_VOL_KEY_TOGGLE = "volume_key_toggle_enabled"
     private const val KEY_TARGET_LONG_PRESS_TRIGGER = "target_long_press_trigger_enabled"
@@ -644,6 +659,20 @@ object ClickConfigStore {
             themeMode = prefs.getInt(KEY_THEME_MODE, ClickGlobalSettings.THEME_SYSTEM)
                 .coerceIn(ClickGlobalSettings.THEME_SYSTEM, ClickGlobalSettings.THEME_DARK),
             dynamicColor = prefs.getBoolean(KEY_DYNAMIC_COLOR, true),
+            colorSaturationBoost = prefs.getFloat(
+                KEY_COLOR_SAT_BOOST,
+                ClickGlobalSettings.DEFAULT_COLOR_SATURATION_BOOST
+            ).coerceIn(
+                ClickGlobalSettings.MIN_COLOR_SATURATION_BOOST,
+                ClickGlobalSettings.MAX_COLOR_SATURATION_BOOST
+            ),
+            colorLightnessBoost = prefs.getFloat(
+                KEY_COLOR_LIGHT_BOOST,
+                ClickGlobalSettings.DEFAULT_COLOR_LIGHTNESS_BOOST
+            ).coerceIn(
+                ClickGlobalSettings.MIN_COLOR_LIGHTNESS_BOOST,
+                ClickGlobalSettings.MAX_COLOR_LIGHTNESS_BOOST
+            ),
             launcherIconMode = prefs.getInt(KEY_LAUNCHER_ICON_MODE, ClickGlobalSettings.LAUNCHER_SYSTEM)
                 .coerceIn(ClickGlobalSettings.LAUNCHER_SYSTEM, ClickGlobalSettings.LAUNCHER_LIGHT),
             volumeKeyToggleEnabled = prefs.getBoolean(KEY_VOL_KEY_TOGGLE, true),
@@ -685,6 +714,20 @@ object ClickConfigStore {
             )
             .putInt(KEY_THEME_MODE, settings.themeMode)
             .putBoolean(KEY_DYNAMIC_COLOR, settings.dynamicColor)
+            .putFloat(
+                KEY_COLOR_SAT_BOOST,
+                settings.colorSaturationBoost.coerceIn(
+                    ClickGlobalSettings.MIN_COLOR_SATURATION_BOOST,
+                    ClickGlobalSettings.MAX_COLOR_SATURATION_BOOST
+                )
+            )
+            .putFloat(
+                KEY_COLOR_LIGHT_BOOST,
+                settings.colorLightnessBoost.coerceIn(
+                    ClickGlobalSettings.MIN_COLOR_LIGHTNESS_BOOST,
+                    ClickGlobalSettings.MAX_COLOR_LIGHTNESS_BOOST
+                )
+            )
             .putInt(
                 KEY_LAUNCHER_ICON_MODE,
                 settings.launcherIconMode.coerceIn(
@@ -2059,6 +2102,21 @@ swipe 300 1600 800 1600 280 120 1"""
         persistPresetsInternal(context, presets, active.id)
     }
 
+    fun restoreTargetAt(
+        context: Context,
+        presetId: String,
+        target: ClickTarget,
+        index: Int
+    ): Boolean {
+        val presets = loadPresets(context)
+        val preset = presets.firstOrNull { it.id == presetId } ?: return false
+        val insertAt = index.coerceIn(0, preset.targets.size)
+        preset.targets.add(insertAt, target.copy())
+        preset.targets.forEachIndexed { idx, t -> t.index = idx + 1 }
+        persistPresetsInternal(context, presets, getActivePresetId(context))
+        return true
+    }
+
     fun saveControlBarPosition(context: Context, x: Int, y: Int) {
         context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit()
             .putInt(KEY_CONTROL_BAR_X, x)
@@ -2088,4 +2146,56 @@ swipe 300 1600 800 1600 280 120 1"""
     fun loadControlBarCollapsed(context: Context): Boolean =
         context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             .getBoolean(KEY_CONTROL_BAR_COLLAPSED, false)
+
+    private const val KEY_QUICK_TRIGGER_PREFIX = "quick_trigger_cfg_"
+
+    fun loadQuickTriggerConfig(context: Context, presetId: String): PresetQuickTriggerConfig {
+        val raw = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            .getString(KEY_QUICK_TRIGGER_PREFIX + presetId, null)
+            ?: return PresetQuickTriggerConfig(presetId = presetId)
+        return try {
+            val obj = JSONObject(raw)
+            PresetQuickTriggerConfig(
+                presetId = presetId,
+                sizeDp = obj.optInt("sizeDp", PresetQuickTriggerConfig.DEFAULT_SIZE_DP)
+                    .coerceIn(PresetQuickTriggerConfig.MIN_SIZE_DP, PresetQuickTriggerConfig.MAX_SIZE_DP),
+                shapeMode = obj.optInt("shapeMode", PresetQuickTriggerConfig.SHAPE_PILL)
+                    .coerceIn(PresetQuickTriggerConfig.SHAPE_PILL, PresetQuickTriggerConfig.SHAPE_CIRCLE),
+                normX = obj.optDouble("normX", 0.82).toFloat().coerceIn(0.04f, 0.96f),
+                normY = obj.optDouble("normY", 0.42).toFloat().coerceIn(0.06f, 0.94f)
+            )
+        } catch (_: Throwable) {
+            PresetQuickTriggerConfig(presetId = presetId)
+        }
+    }
+
+    fun saveQuickTriggerConfig(context: Context, config: PresetQuickTriggerConfig) {
+        val obj = JSONObject().apply {
+            put("sizeDp", config.sizeDp.coerceIn(PresetQuickTriggerConfig.MIN_SIZE_DP, PresetQuickTriggerConfig.MAX_SIZE_DP))
+            put("shapeMode", config.shapeMode.coerceIn(PresetQuickTriggerConfig.SHAPE_PILL, PresetQuickTriggerConfig.SHAPE_CIRCLE))
+            put("normX", config.normX.coerceIn(0.04f, 0.96f).toDouble())
+            put("normY", config.normY.coerceIn(0.06f, 0.94f).toDouble())
+        }
+        context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit()
+            .putString(KEY_QUICK_TRIGGER_PREFIX + config.presetId, obj.toString())
+            .apply()
+    }
+}
+
+data class PresetQuickTriggerConfig(
+    val presetId: String,
+    val sizeDp: Int = DEFAULT_SIZE_DP,
+    val shapeMode: Int = SHAPE_PILL,
+    val normX: Float = 0.82f,
+    val normY: Float = 0.42f
+) {
+    companion object {
+        const val MIN_SIZE_DP = 28
+        const val MAX_SIZE_DP = 64
+        const val DEFAULT_SIZE_DP = 38
+
+        const val SHAPE_PILL = 0
+        const val SHAPE_SQUIRCLE = 1
+        const val SHAPE_CIRCLE = 2
+    }
 }

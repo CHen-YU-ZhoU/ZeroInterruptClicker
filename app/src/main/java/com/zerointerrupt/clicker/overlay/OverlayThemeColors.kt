@@ -15,6 +15,7 @@ import com.google.android.material.color.MaterialColors
 import com.zerointerrupt.clicker.R
 import com.zerointerrupt.clicker.model.ClickConfigStore
 import com.zerointerrupt.clicker.model.ClickGlobalSettings
+import com.zerointerrupt.clicker.ui.theme.tuneArgbColor
 
 /**
  * Resolves Material You (Dynamic Color on Android 12+) / MD3 DayNight color tokens
@@ -91,34 +92,40 @@ data class OverlayThemeColors(
                 return MaterialColors.getColor(dynamic, attrId, fb)
             }
 
-            val surfaceHigh = attr(MaterialR.attr.colorSurfaceContainerHigh, 0xFF21262E.toInt(), 0xFFECEEF4.toInt())
-            val primary = attr(androidx.appcompat.R.attr.colorPrimary, 0xFF8CD3FF.toInt(), 0xFF006494.toInt())
+            val sat = ClickGlobalSettings.BASE_COLOR_SATURATION_OFFSET + settings.colorSaturationBoost
+            val lit = ClickGlobalSettings.BASE_COLOR_LIGHTNESS_OFFSET + settings.colorLightnessBoost
+            fun tuneAccent(c: Int): Int = tuneArgbColor(c, sat, lit, isSurface = false, isContent = false)
+            fun tuneSurf(c: Int): Int = tuneArgbColor(c, sat, lit, isSurface = true, isContent = false)
+            fun tuneContent(c: Int): Int = tuneArgbColor(c, sat, lit, isSurface = false, isContent = true)
+
+            val surfaceHigh = tuneSurf(attr(MaterialR.attr.colorSurfaceContainerHigh, 0xFF21262E.toInt(), 0xFFECEEF4.toInt()))
+            val primary = tuneAccent(attr(androidx.appcompat.R.attr.colorPrimary, 0xFF8CD3FF.toInt(), 0xFF006494.toInt()))
             val activeGreen = if (isDark) 0xFF4ADE80.toInt() else 0xFF15803D.toInt()
 
             return OverlayThemeColors(
                 themedContext = dynamic,
                 isDark = isDark,
                 surfaceContainer = ColorUtils.setAlphaComponent(
-                    attr(MaterialR.attr.colorSurfaceContainer, 0xFF1A1F26.toInt(), 0xFFF2F4FA.toInt()),
+                    tuneSurf(attr(MaterialR.attr.colorSurfaceContainer, 0xFF1A1F26.toInt(), 0xFFF2F4FA.toInt())),
                     236
                 ),
                 surfaceContainerHigh = ColorUtils.setAlphaComponent(surfaceHigh, 238),
-                surfaceContainerHighest = attr(MaterialR.attr.colorSurfaceContainerHighest, 0xFF2C323B.toInt(), 0xFFE2E5EC.toInt()),
+                surfaceContainerHighest = tuneSurf(attr(MaterialR.attr.colorSurfaceContainerHighest, 0xFF2C323B.toInt(), 0xFFE2E5EC.toInt())),
                 onSurface = attr(MaterialR.attr.colorOnSurface, 0xFFE3E7EE.toInt(), 0xFF191C20.toInt()),
                 onSurfaceVariant = attr(MaterialR.attr.colorOnSurfaceVariant, 0xFFC2C7D0.toInt(), 0xFF44474E.toInt()),
                 outlineVariant = ColorUtils.setAlphaComponent(
-                    attr(MaterialR.attr.colorOutlineVariant, 0xFF434850.toInt(), 0xFFC4C6D0.toInt()),
+                    tuneSurf(attr(MaterialR.attr.colorOutlineVariant, 0xFF434850.toInt(), 0xFFC4C6D0.toInt())),
                     160
                 ),
                 primary = primary,
-                onPrimary = attr(MaterialR.attr.colorOnPrimary, 0xFF00344F.toInt(), Color.WHITE),
-                primaryContainer = attr(MaterialR.attr.colorPrimaryContainer, 0xFF004B70.toInt(), 0xFFCBE6FF.toInt()),
-                onPrimaryContainer = attr(MaterialR.attr.colorOnPrimaryContainer, 0xFFCBE6FF.toInt(), 0xFF001E30.toInt()),
-                secondaryContainer = attr(MaterialR.attr.colorSecondaryContainer, 0xFF364958.toInt(), 0xFFD6E4F3.toInt()),
-                onSecondaryContainer = attr(MaterialR.attr.colorOnSecondaryContainer, 0xFFD6E4F3.toInt(), 0xFF0F1D2A.toInt()),
-                tertiary = attr(MaterialR.attr.colorTertiary, 0xFFFBC02D.toInt(), 0xFF8C5000.toInt()),
-                tertiaryContainer = attr(MaterialR.attr.colorTertiaryContainer, 0xFF6B3E00.toInt(), 0xFFFFDDB7.toInt()),
-                onTertiaryContainer = attr(MaterialR.attr.colorOnTertiaryContainer, 0xFFFFDDB7.toInt(), 0xFF2C1600.toInt()),
+                onPrimary = tuneContent(attr(MaterialR.attr.colorOnPrimary, 0xFF00344F.toInt(), Color.WHITE)),
+                primaryContainer = tuneAccent(attr(MaterialR.attr.colorPrimaryContainer, 0xFF004B70.toInt(), 0xFFCBE6FF.toInt())),
+                onPrimaryContainer = tuneContent(attr(MaterialR.attr.colorOnPrimaryContainer, 0xFFCBE6FF.toInt(), 0xFF001E30.toInt())),
+                secondaryContainer = tuneAccent(attr(MaterialR.attr.colorSecondaryContainer, 0xFF364958.toInt(), 0xFFD6E4F3.toInt())),
+                onSecondaryContainer = tuneContent(attr(MaterialR.attr.colorOnSecondaryContainer, 0xFFD6E4F3.toInt(), 0xFF0F1D2A.toInt())),
+                tertiary = tuneAccent(attr(MaterialR.attr.colorTertiary, 0xFFFBC02D.toInt(), 0xFF8C5000.toInt())),
+                tertiaryContainer = tuneAccent(attr(MaterialR.attr.colorTertiaryContainer, 0xFF6B3E00.toInt(), 0xFFFFDDB7.toInt())),
+                onTertiaryContainer = tuneContent(attr(MaterialR.attr.colorOnTertiaryContainer, 0xFFFFDDB7.toInt(), 0xFF2C1600.toInt())),
                 error = attr(androidx.appcompat.R.attr.colorError, 0xFFFFB4AB.toInt(), 0xFFBA1A1A.toInt()),
                 errorContainer = attr(MaterialR.attr.colorErrorContainer, 0xFF93000A.toInt(), 0xFFFFDAD6.toInt()),
                 onErrorContainer = attr(MaterialR.attr.colorOnErrorContainer, 0xFFFFDAD6.toInt(), 0xFF410002.toInt()),

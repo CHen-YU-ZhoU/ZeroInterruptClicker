@@ -60,8 +60,10 @@ import com.zerointerrupt.clicker.ui.components.CheckSwitch
 import com.zerointerrupt.clicker.ui.components.ExpressiveCard
 import com.zerointerrupt.clicker.ui.components.ExpressiveConnectedGroup
 import com.zerointerrupt.clicker.ui.components.ExpressiveOption
-import com.zerointerrupt.clicker.ui.components.PageTopHeader
+import com.zerointerrupt.clicker.ui.components.ExpressiveSlider
 import com.zerointerrupt.clicker.ui.components.SlotMatrixStrip
+import com.zerointerrupt.clicker.ui.components.StickyBlurredPageHeader
+import kotlin.math.roundToInt
 
 @Composable
 fun LabTab(
@@ -73,49 +75,186 @@ fun LabTab(
     val haptic = LocalHapticFeedback.current
     var versionTapCount by remember { mutableIntStateOf(0) }
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 20.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        PageTopHeader(title = "实验室")
+    Box(modifier = modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Spacer(Modifier.height(74.dp))
 
-        ExpressiveCard {
-            Column(
-                modifier = Modifier.padding(18.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                Text(
-                    text = "外观与控制",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ExpressiveCard {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
                     Text(
-                        text = "应用外观",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold
+                        text = "外观与控制",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
                     )
-                    ExpressiveConnectedGroup(
-                        options = listOf(
-                            ExpressiveOption(ClickGlobalSettings.THEME_SYSTEM, "跟随系统"),
-                            ExpressiveOption(ClickGlobalSettings.THEME_DARK, "深色"),
-                            ExpressiveOption(ClickGlobalSettings.THEME_LIGHT, "浅色")
-                        ),
-                        selectedValue = state.themeMode,
-                        onSelect = callbacks.onThemeModeChange,
-                        height = 42.dp
-                    )
-                }
 
-                LabSwitchRow(
-                    title = "动态取色",
-                    checked = state.dynamicColor,
-                    onCheckedChange = callbacks.onDynamicColorChange
-                )
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            text = "应用外观",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        ExpressiveConnectedGroup(
+                            options = listOf(
+                                ExpressiveOption(ClickGlobalSettings.THEME_SYSTEM, "跟随系统"),
+                                ExpressiveOption(ClickGlobalSettings.THEME_DARK, "深色"),
+                                ExpressiveOption(ClickGlobalSettings.THEME_LIGHT, "浅色")
+                            ),
+                            selectedValue = state.themeMode,
+                            onSelect = callbacks.onThemeModeChange,
+                            height = 42.dp
+                        )
+                    }
+
+                    LabSwitchRow(
+                        title = "动态取色",
+                        checked = state.dynamicColor,
+                        onCheckedChange = callbacks.onDynamicColorChange
+                    )
+
+                    val satPct = (state.colorSaturationBoost * 100f).roundToInt()
+                    val litPct = (state.colorLightnessBoost * 100f).roundToInt()
+                    val satBadge = if (satPct > 0) "+${satPct}%" else "${satPct}%"
+                    val litBadge = if (litPct > 0) "+${litPct}%" else "${litPct}%"
+
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "色彩微调",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = cs.onSurface
+                            )
+                            Surface(
+                                shape = CircleShape,
+                                color = cs.secondaryContainer,
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .clickable {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        callbacks.onResetColorTuning()
+                                    }
+                            ) {
+                                Text(
+                                    text = "原色",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = cs.onSecondaryContainer,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+
+                        Column(
+                            modifier = Modifier.padding(start = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "饱和度",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium,
+                                    color = cs.onSurface
+                                )
+                                Surface(
+                                    shape = CircleShape,
+                                    color = cs.surfaceContainerHigh
+                                ) {
+                                    Text(
+                                        text = satBadge,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = cs.primary,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                            ExpressiveSlider(
+                                value = state.colorSaturationBoost.coerceIn(
+                                    ClickGlobalSettings.MIN_COLOR_SATURATION_BOOST,
+                                    ClickGlobalSettings.MAX_COLOR_SATURATION_BOOST
+                                ),
+                                valueRange = ClickGlobalSettings.MIN_COLOR_SATURATION_BOOST..
+                                    ClickGlobalSettings.MAX_COLOR_SATURATION_BOOST,
+                                onValueChange = { raw ->
+                                    val snappedPct = (raw * 100f).roundToInt().coerceIn(-25, 45)
+                                    if (snappedPct != satPct) {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        callbacks.onColorSaturationBoostChange(snappedPct / 100f, false)
+                                    }
+                                },
+                                onValueChangeFinished = {
+                                    callbacks.onColorSaturationBoostChange(state.colorSaturationBoost, true)
+                                },
+                                floatingLabel = satBadge
+                            )
+                        }
+
+                        Column(
+                            modifier = Modifier.padding(start = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "明度",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium,
+                                    color = cs.onSurface
+                                )
+                                Surface(
+                                    shape = CircleShape,
+                                    color = cs.surfaceContainerHigh
+                                ) {
+                                    Text(
+                                        text = litBadge,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = cs.primary,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                            ExpressiveSlider(
+                                value = state.colorLightnessBoost.coerceIn(
+                                    ClickGlobalSettings.MIN_COLOR_LIGHTNESS_BOOST,
+                                    ClickGlobalSettings.MAX_COLOR_LIGHTNESS_BOOST
+                                ),
+                                valueRange = ClickGlobalSettings.MIN_COLOR_LIGHTNESS_BOOST..
+                                    ClickGlobalSettings.MAX_COLOR_LIGHTNESS_BOOST,
+                                onValueChange = { raw ->
+                                    val snappedPct = (raw * 100f).roundToInt().coerceIn(-10, 15)
+                                    if (snappedPct != litPct) {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        callbacks.onColorLightnessBoostChange(snappedPct / 100f, false)
+                                    }
+                                },
+                                onValueChangeFinished = {
+                                    callbacks.onColorLightnessBoostChange(state.colorLightnessBoost, true)
+                                },
+                                floatingLabel = litBadge
+                            )
+                        }
+                    }
 
                 HorizontalDivider(color = cs.outlineVariant.copy(alpha = 0.35f))
 
@@ -286,7 +425,13 @@ fun LabTab(
             }
         }
 
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(18.dp))
+        }
+
+        StickyBlurredPageHeader(
+            title = "实验室",
+            modifier = Modifier.align(Alignment.TopCenter)
+        )
     }
 }
 

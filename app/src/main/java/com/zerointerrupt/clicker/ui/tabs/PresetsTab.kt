@@ -3,6 +3,12 @@ package com.zerointerrupt.clicker.ui.tabs
 import android.content.ClipboardManager
 import android.content.Context
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -10,6 +16,10 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.gestures.snapping.SnapPosition
 import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -20,19 +30,23 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -49,7 +63,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -62,35 +75,50 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.toRect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.addOutline
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.zerointerrupt.clicker.R
 import com.zerointerrupt.clicker.model.ActionType
 import com.zerointerrupt.clicker.model.ClickConfigStore
 import com.zerointerrupt.clicker.model.ClickPreset
 import com.zerointerrupt.clicker.model.ClickTarget
 import com.zerointerrupt.clicker.model.ExecutionMode
+import com.zerointerrupt.clicker.model.PresetQuickTriggerConfig
 import com.zerointerrupt.clicker.model.RawMacroCodec
 import com.zerointerrupt.clicker.ui.MainScreenCallbacks
 import com.zerointerrupt.clicker.ui.MainUiState
+import com.zerointerrupt.clicker.ui.components.AnimatedSwipeTrashIcon
 import com.zerointerrupt.clicker.ui.components.BatchCreateEmptyPresetsDialog
 import com.zerointerrupt.clicker.ui.components.BatchDeletePresetsDialog
 import com.zerointerrupt.clicker.ui.components.CheckSwitch
@@ -99,6 +127,7 @@ import com.zerointerrupt.clicker.ui.components.ExpressiveConnectedGroup
 import com.zerointerrupt.clicker.ui.components.ExpressiveFabMenuItem
 import com.zerointerrupt.clicker.ui.components.ExpressiveFloatingActionButtonMenu
 import com.zerointerrupt.clicker.ui.components.ExpressiveOption
+import com.zerointerrupt.clicker.ui.components.ExpressiveSlider
 import com.zerointerrupt.clicker.ui.components.ExpressiveToggleFab
 import com.zerointerrupt.clicker.ui.components.ImportJsonDialog
 import com.zerointerrupt.clicker.ui.components.OverflowMenuAction
@@ -108,10 +137,14 @@ import com.zerointerrupt.clicker.ui.components.PresetNameDialog
 import com.zerointerrupt.clicker.ui.components.PresetTreeFreezeDialog
 import com.zerointerrupt.clicker.ui.components.ScriptImportDialog
 import com.zerointerrupt.clicker.ui.components.SmoothRoundedCornerShape
+import com.zerointerrupt.clicker.ui.components.StickyBlurredPageHeader
 import com.zerointerrupt.clicker.ui.components.TargetEditDialog
 import androidx.compose.ui.unit.lerp as dpLerp
 import com.zerointerrupt.clicker.ui.components.buildPresetTree
+import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.sign
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -129,6 +162,7 @@ fun PresetsTab(
     var showScriptDialog by remember { mutableStateOf(false) }
     var scriptInitialText by remember { mutableStateOf("") }
     var renameTargetPreset by remember { mutableStateOf<ClickPreset?>(null) }
+    var quickTriggerConfigPreset by remember { mutableStateOf<ClickPreset?>(null) }
     var showBatchImportDialog by remember { mutableStateOf(false) }
     var batchImportInitialText by remember { mutableStateOf("") }
     var showTreeFreezeDialog by remember { mutableStateOf(false) }
@@ -210,22 +244,10 @@ fun PresetsTab(
         val isLandscapeTwoColumn = maxWidth >= 600.dp && maxWidth > maxHeight
 
         if (isLandscapeTwoColumn) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(top = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                PageTopHeader(
-                    title = "方案",
-                    menuActions = menuActions,
-                    modifier = Modifier.padding(horizontal = 20.dp)
-                )
-
+            Box(modifier = Modifier.fillMaxSize()) {
                 Row(
                     modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
+                        .fillMaxSize()
                         .padding(horizontal = 20.dp),
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
@@ -253,7 +275,7 @@ fun PresetsTab(
                                     state = listState,
                                     flingBehavior = snapFling,
                                     modifier = Modifier.fillMaxSize(),
-                                    contentPadding = PaddingValues(top = 2.dp, bottom = 78.dp),
+                                    contentPadding = PaddingValues(top = 74.dp, bottom = 78.dp),
                                     verticalArrangement = Arrangement.spacedBy(itemGap)
                                 ) {
                                     itemsIndexed(
@@ -267,10 +289,18 @@ fun PresetsTab(
                                             preset = preset,
                                             allPresets = state.presets,
                                             isSelected = preset.id == displayedPreset?.id,
+                                            hasQuickTrigger = preset.id in state.activeQuickTriggerPresetIds,
                                             canDelete = treeNodes.size > 1,
                                             screenWidthPx = state.screenWidthPx,
                                             screenHeightPx = state.screenHeightPx,
                                             onSelect = { callbacks.onSelectPreset(preset.id) },
+                                            onToggleQuickTrigger = {
+                                                if (preset.id in state.activeQuickTriggerPresetIds) {
+                                                    callbacks.onHidePresetQuickTrigger(preset.id)
+                                                } else {
+                                                    quickTriggerConfigPreset = preset
+                                                }
+                                            },
                                             onRename = { renameTargetPreset = preset },
                                             onExportJson = { callbacks.onExportPresetJson(preset) },
                                             onDelete = { callbacks.onDeletePreset(preset.id) }
@@ -279,7 +309,7 @@ fun PresetsTab(
                                 }
                             }
                         } else if (state.presets.isNotEmpty()) {
-                            AllFrozenPresetsCard(modifier = Modifier.padding(top = 2.dp))
+                            AllFrozenPresetsCard(modifier = Modifier.padding(top = 74.dp))
                         }
                     }
 
@@ -288,7 +318,7 @@ fun PresetsTab(
                         modifier = Modifier
                             .weight(0.64f)
                             .fillMaxHeight(),
-                        contentPadding = PaddingValues(top = 2.dp, bottom = 84.dp),
+                        contentPadding = PaddingValues(top = 74.dp, bottom = 84.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
                         val activePreset = displayedPreset
@@ -307,116 +337,138 @@ fun PresetsTab(
                         }
                     }
                 }
+
+                StickyBlurredPageHeader(
+                    title = "方案",
+                    menuActions = menuActions,
+                    modifier = Modifier.align(Alignment.TopCenter)
+                )
             }
         } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                item {
-                    PageTopHeader(
-                        title = "方案",
-                        menuActions = menuActions,
-                        modifier = Modifier.padding(horizontal = 20.dp)
-                    )
-                }
-
-                if (visiblePresets.isNotEmpty()) {
-                    item {
-                        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-                            val horizontalPadding = 20.dp
-                            val itemGap = 10.dp
-                            val availableWidth = (maxWidth - horizontalPadding * 2).coerceAtLeast(240.dp)
-                            if (visiblePresets.size <= 3) {
-                                val cardWidth = ((availableWidth - itemGap * 2) / 3f).coerceIn(108.dp, 156.dp)
-                                val fillThreeAcross = visiblePresets.size == 3 && maxWidth < 600.dp
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = horizontalPadding)
-                                        .height(224.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(itemGap)
-                                ) {
-                                    visiblePresets.forEach { preset ->
-                                        val cardModifier = if (fillThreeAcross) {
-                                            Modifier.weight(1f)
-                                        } else {
-                                            Modifier.width(cardWidth)
-                                        }
-                                        PresetStaticCard(
-                                            preset = preset,
-                                            allPresets = state.presets,
-                                            isSelected = preset.id == displayedPreset?.id,
-                                            canDelete = treeNodes.size > 1,
-                                            screenWidthPx = state.screenWidthPx,
-                                            screenHeightPx = state.screenHeightPx,
-                                            onSelect = { callbacks.onSelectPreset(preset.id) },
-                                            onRename = { renameTargetPreset = preset },
-                                            onExportJson = { callbacks.onExportPresetJson(preset) },
-                                            onDelete = { callbacks.onDeletePreset(preset.id) },
-                                            modifier = cardModifier
-                                        )
-                                    }
-                                }
-                            } else {
-                                // Re-key on structural preset IDs so Material3 1.3.1 PagerState refreshes immediately on add/delete/freeze/unfreeze
-                                key(presetIdsKey) {
-                                    val activeIdx = visiblePresets.indexOfFirst { it.id == displayedPreset?.id }.coerceAtLeast(0)
-                                    val carouselState = rememberCarouselState(initialItem = activeIdx) { latestPresetCount }
-                                    HorizontalMultiBrowseCarousel(
-                                        state = carouselState,
-                                        preferredItemWidth = 128.dp,
+            Box(modifier = Modifier.fillMaxSize()) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(top = 74.dp, bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    if (visiblePresets.isNotEmpty()) {
+                        item {
+                            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                                val horizontalPadding = 20.dp
+                                val itemGap = 10.dp
+                                val availableWidth = (maxWidth - horizontalPadding * 2).coerceAtLeast(240.dp)
+                                if (visiblePresets.size <= 3) {
+                                    val cardWidth = ((availableWidth - itemGap * 2) / 3f).coerceIn(108.dp, 156.dp)
+                                    val fillThreeAcross = visiblePresets.size == 3 && maxWidth < 600.dp
+                                    Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
+                                            .padding(horizontal = horizontalPadding)
                                             .height(224.dp),
-                                        itemSpacing = itemGap,
-                                        contentPadding = PaddingValues(horizontal = horizontalPadding)
-                                    ) { index ->
-                                        val preset = visiblePresets.getOrNull(index) ?: return@HorizontalMultiBrowseCarousel
-                                        PresetCarouselCard(
-                                            preset = preset,
-                                            allPresets = state.presets,
-                                            isSelected = preset.id == displayedPreset?.id,
-                                            isChildSubPreset = (subPresetParentCount[preset.id] ?: 0) > 0,
-                                            canDelete = treeNodes.size > 1,
-                                            screenWidthPx = state.screenWidthPx,
-                                            screenHeightPx = state.screenHeightPx,
-                                            onSelect = { callbacks.onSelectPreset(preset.id) },
-                                            onRename = { renameTargetPreset = preset },
-                                            onExportJson = { callbacks.onExportPresetJson(preset) },
-                                            onDelete = { callbacks.onDeletePreset(preset.id) }
-                                        )
+                                        horizontalArrangement = Arrangement.spacedBy(itemGap)
+                                    ) {
+                                        visiblePresets.forEach { preset ->
+                                            val cardModifier = if (fillThreeAcross) {
+                                                Modifier.weight(1f)
+                                            } else {
+                                                Modifier.width(cardWidth)
+                                            }
+                                            PresetStaticCard(
+                                                preset = preset,
+                                                allPresets = state.presets,
+                                                isSelected = preset.id == displayedPreset?.id,
+                                                hasQuickTrigger = preset.id in state.activeQuickTriggerPresetIds,
+                                                canDelete = treeNodes.size > 1,
+                                                screenWidthPx = state.screenWidthPx,
+                                                screenHeightPx = state.screenHeightPx,
+                                                onSelect = { callbacks.onSelectPreset(preset.id) },
+                                                onToggleQuickTrigger = {
+                                                    if (preset.id in state.activeQuickTriggerPresetIds) {
+                                                        callbacks.onHidePresetQuickTrigger(preset.id)
+                                                    } else {
+                                                        quickTriggerConfigPreset = preset
+                                                    }
+                                                },
+                                                onRename = { renameTargetPreset = preset },
+                                                onExportJson = { callbacks.onExportPresetJson(preset) },
+                                                onDelete = { callbacks.onDeletePreset(preset.id) },
+                                                modifier = cardModifier
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    // Re-key on structural preset IDs so Material3 1.3.1 PagerState refreshes immediately on add/delete/freeze/unfreeze
+                                    key(presetIdsKey) {
+                                        val activeIdx = visiblePresets.indexOfFirst { it.id == displayedPreset?.id }.coerceAtLeast(0)
+                                        val carouselState = rememberCarouselState(initialItem = activeIdx) { latestPresetCount }
+                                        HorizontalMultiBrowseCarousel(
+                                            state = carouselState,
+                                            preferredItemWidth = 128.dp,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(224.dp),
+                                            itemSpacing = itemGap,
+                                            contentPadding = PaddingValues(horizontal = horizontalPadding)
+                                        ) { index ->
+                                            val preset = visiblePresets.getOrNull(index) ?: return@HorizontalMultiBrowseCarousel
+                                            PresetCarouselCard(
+                                                preset = preset,
+                                                allPresets = state.presets,
+                                                isSelected = preset.id == displayedPreset?.id,
+                                                hasQuickTrigger = preset.id in state.activeQuickTriggerPresetIds,
+                                                isChildSubPreset = (subPresetParentCount[preset.id] ?: 0) > 0,
+                                                canDelete = treeNodes.size > 1,
+                                                screenWidthPx = state.screenWidthPx,
+                                                screenHeightPx = state.screenHeightPx,
+                                                onSelect = { callbacks.onSelectPreset(preset.id) },
+                                                onToggleQuickTrigger = {
+                                                    if (preset.id in state.activeQuickTriggerPresetIds) {
+                                                        callbacks.onHidePresetQuickTrigger(preset.id)
+                                                    } else {
+                                                        quickTriggerConfigPreset = preset
+                                                    }
+                                                },
+                                                onRename = { renameTargetPreset = preset },
+                                                onExportJson = { callbacks.onExportPresetJson(preset) },
+                                                onDelete = { callbacks.onDeletePreset(preset.id) }
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
+                    } else if (state.presets.isNotEmpty()) {
+                        item {
+                            AllFrozenPresetsCard(
+                                modifier = Modifier.padding(horizontal = 20.dp)
+                            )
+                        }
                     }
-                } else if (state.presets.isNotEmpty()) {
-                    item {
-                        AllFrozenPresetsCard(
-                            modifier = Modifier.padding(horizontal = 20.dp)
-                        )
+
+                    val activePreset = displayedPreset
+                    if (activePreset != null) {
+                        item {
+                            PresetDetailCard(
+                                activePreset = activePreset,
+                                state = state,
+                                callbacks = callbacks,
+                                seamlessOutgoingStepIds = seamlessOutgoingStepIds,
+                                onShowNewTargetDialog = { showNewTargetDialog = true },
+                                onShowLoopCountDialog = { showLoopCountDialog = true },
+                                onEditTarget = { editingTarget = it },
+                                modifier = Modifier.padding(horizontal = 20.dp)
+                            )
+                        }
                     }
+
+                    item { Spacer(Modifier.height(78.dp)) }
                 }
 
-                val activePreset = displayedPreset
-                if (activePreset != null) {
-                    item {
-                        PresetDetailCard(
-                            activePreset = activePreset,
-                            state = state,
-                            callbacks = callbacks,
-                            seamlessOutgoingStepIds = seamlessOutgoingStepIds,
-                            onShowNewTargetDialog = { showNewTargetDialog = true },
-                            onShowLoopCountDialog = { showLoopCountDialog = true },
-                            onEditTarget = { editingTarget = it },
-                            modifier = Modifier.padding(horizontal = 20.dp)
-                        )
-                    }
-                }
-
-                item { Spacer(Modifier.height(78.dp)) }
+                StickyBlurredPageHeader(
+                    title = "方案",
+                    menuActions = menuActions,
+                    modifier = Modifier.align(Alignment.TopCenter)
+                )
             }
         }
 
@@ -545,6 +597,22 @@ fun PresetsTab(
             onConfirm = { newName, _ ->
                 callbacks.onRenamePreset(preset.id, newName)
                 renameTargetPreset = null
+            }
+        )
+    }
+
+    quickTriggerConfigPreset?.let { preset ->
+        val initialCfg = remember(preset.id) {
+            ClickConfigStore.loadQuickTriggerConfig(context, preset.id)
+        }
+        QuickTriggerConfigDialog(
+            preset = preset,
+            initialConfig = initialCfg,
+            onDismiss = { quickTriggerConfigPreset = null },
+            onConfirm = { config ->
+                ClickConfigStore.saveQuickTriggerConfig(context, config)
+                callbacks.onShowPresetQuickTrigger(config)
+                quickTriggerConfigPreset = null
             }
         )
     }
@@ -693,34 +761,14 @@ private fun PresetDetailCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = activePreset.name,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    val detailSubtitle = if (activePreset.isRawMacro) {
-                        if (rawSummary != null) {
-                            "录宏 · ${rawSummary.strokeCount} 笔 · ${formatMsShort(rawSummary.totalDurationMs)}"
-                        } else {
-                            "录宏 · 原始触控回放"
-                        }
-                    } else {
-                        val detailModeLabel = if (activePreset.executionMode == ExecutionMode.SEQUENTIAL) {
-                            "顺序"
-                        } else {
-                            "并发"
-                        }
-                        "${activePreset.targets.size} 步骤 · $detailModeLabel"
-                    }
-                    Text(
-                        text = detailSubtitle,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = cs.onSurfaceVariant
-                    )
-                }
+                Text(
+                    text = activePreset.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
                 if (!activePreset.isRawMacro) {
                     FilledTonalButton(
                         onClick = onShowNewTargetDialog,
@@ -844,22 +892,25 @@ private fun PresetDetailCard(
                     )
                 }
             } else {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     val isConcurrent = activePreset.executionMode == ExecutionMode.CONCURRENT
-                    activePreset.targets.forEach { target ->
-                        TargetRowCard(
-                            target = target,
-                            allPresets = state.presets,
-                            globalIntervalMs = state.intervalMs,
-                            globalPressMs = state.pressDurationMs,
-                            isConcurrent = isConcurrent,
-                            hasSeamlessHandoff = target.id in seamlessOutgoingStepIds,
-                            onToggle = { enabled ->
-                                callbacks.onTogglePresetTargetEnabled(target.id, enabled)
-                            },
-                            onEdit = { onEditTarget(target) },
-                            onDelete = { callbacks.onDeletePresetTarget(target.id) }
-                        )
+                    val lastIdx = activePreset.targets.lastIndex
+                    activePreset.targets.forEachIndexed { idx, target ->
+                        key(target.id) {
+                            TargetRowCard(
+                                target = target,
+                                allPresets = state.presets,
+                                isConcurrent = isConcurrent,
+                                hasSeamlessHandoff = target.id in seamlessOutgoingStepIds,
+                                isFirst = idx == 0,
+                                isLast = idx == lastIdx,
+                                onToggle = { enabled ->
+                                    callbacks.onTogglePresetTargetEnabled(target.id, enabled)
+                                },
+                                onEdit = { onEditTarget(target) },
+                                onDelete = { callbacks.onDeletePresetTarget(target.id) }
+                            )
+                        }
                     }
                 }
             }
@@ -875,26 +926,28 @@ private fun PresetVerticalCarouselCard(
     preset: ClickPreset,
     allPresets: List<ClickPreset>,
     isSelected: Boolean,
+    hasQuickTrigger: Boolean,
     canDelete: Boolean,
     screenWidthPx: Int,
     screenHeightPx: Int,
     onSelect: () -> Unit,
+    onToggleQuickTrigger: () -> Unit,
     onRename: () -> Unit,
     onExportJson: () -> Unit,
     onDelete: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
-    val cardBg = if (isSelected) {
-        lerp(cs.surfaceContainerLow, cs.primaryContainer, 0.36f)
-    } else {
-        cs.surfaceContainerHigh
-    }
-    val shape = SmoothRoundedCornerShape(24.dp)
-    val borderStroke = if (isSelected) {
-        BorderStroke(1.8.dp, cs.primary)
-    } else {
-        BorderStroke(1.dp, cs.outlineVariant.copy(alpha = 0.50f))
-    }
+    val cardBg by animateColorAsState(
+        targetValue = if (isSelected) cs.secondaryContainer else cs.surfaceContainerHigh,
+        animationSpec = tween(220),
+        label = "presetVertCardBg"
+    )
+    val cornerRadius by animateDpAsState(
+        targetValue = if (isSelected) 30.dp else 18.dp,
+        animationSpec = spring(dampingRatio = 0.72f, stiffness = 420f),
+        label = "presetVertCorner"
+    )
+    val shape = SmoothRoundedCornerShape(cornerRadius)
 
     // Mirrors portrait HorizontalMultiBrowseCarousel fade curve: badges/labels fade smoothly when compressed below 80%
     val fadeModifier = Modifier.graphicsLayer {
@@ -959,7 +1012,6 @@ private fun PresetVerticalCarouselCard(
                     }
                 }
                 .clip(shape)
-                .border(borderStroke, shape)
                 .background(cardBg)
                 .clickable(onClick = onSelect)
         ) {
@@ -967,10 +1019,12 @@ private fun PresetVerticalCarouselCard(
                 preset = preset,
                 allPresets = allPresets,
                 isSelected = isSelected,
+                hasQuickTrigger = hasQuickTrigger,
                 canDelete = canDelete,
                 screenWidthPx = screenWidthPx,
                 screenHeightPx = screenHeightPx,
                 fadeModifier = fadeModifier,
+                onToggleQuickTrigger = onToggleQuickTrigger,
                 onRename = onRename,
                 onExportJson = onExportJson,
                 onDelete = onDelete
@@ -984,33 +1038,34 @@ private fun PresetStaticCard(
     preset: ClickPreset,
     allPresets: List<ClickPreset>,
     isSelected: Boolean,
+    hasQuickTrigger: Boolean,
     canDelete: Boolean,
     screenWidthPx: Int,
     screenHeightPx: Int,
     onSelect: () -> Unit,
+    onToggleQuickTrigger: () -> Unit,
     onRename: () -> Unit,
     onExportJson: () -> Unit,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val cs = MaterialTheme.colorScheme
-    val cardBg = if (isSelected) {
-        lerp(cs.surfaceContainerLow, cs.primaryContainer, 0.36f)
-    } else {
-        cs.surfaceContainerHigh
-    }
-    val shape = SmoothRoundedCornerShape(24.dp)
-    val borderStroke = if (isSelected) {
-        BorderStroke(1.8.dp, cs.primary)
-    } else {
-        BorderStroke(1.dp, cs.outlineVariant.copy(alpha = 0.50f))
-    }
+    val cardBg by animateColorAsState(
+        targetValue = if (isSelected) cs.secondaryContainer else cs.surfaceContainerHigh,
+        animationSpec = tween(220),
+        label = "presetStaticCardBg"
+    )
+    val cornerRadius by animateDpAsState(
+        targetValue = if (isSelected) 30.dp else 18.dp,
+        animationSpec = spring(dampingRatio = 0.72f, stiffness = 420f),
+        label = "presetStaticCorner"
+    )
+    val shape = SmoothRoundedCornerShape(cornerRadius)
 
     Box(
         modifier = modifier
             .height(224.dp)
             .clip(shape)
-            .border(borderStroke, shape)
             .background(cardBg)
             .clickable(onClick = onSelect)
     ) {
@@ -1018,10 +1073,12 @@ private fun PresetStaticCard(
             preset = preset,
             allPresets = allPresets,
             isSelected = isSelected,
+            hasQuickTrigger = hasQuickTrigger,
             canDelete = canDelete,
             screenWidthPx = screenWidthPx,
             screenHeightPx = screenHeightPx,
             fadeModifier = Modifier,
+            onToggleQuickTrigger = onToggleQuickTrigger,
             onRename = onRename,
             onExportJson = onExportJson,
             onDelete = onDelete
@@ -1035,23 +1092,41 @@ private fun CarouselItemScope.PresetCarouselCard(
     preset: ClickPreset,
     allPresets: List<ClickPreset>,
     isSelected: Boolean,
+    hasQuickTrigger: Boolean,
     isChildSubPreset: Boolean,
     canDelete: Boolean,
     screenWidthPx: Int,
     screenHeightPx: Int,
     onSelect: () -> Unit,
+    onToggleQuickTrigger: () -> Unit,
     onRename: () -> Unit,
     onExportJson: () -> Unit,
     onDelete: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
-    val cardBg = if (isSelected) {
-        lerp(cs.surfaceContainerLow, cs.primaryContainer, 0.36f)
-    } else {
-        cs.surfaceContainerHigh
+    val density = LocalDensity.current
+    val cardBg by animateColorAsState(
+        targetValue = if (isSelected) cs.secondaryContainer else cs.surfaceContainerHigh,
+        animationSpec = tween(220),
+        label = "presetCarouselCardBg"
+    )
+    val cornerRadius by animateDpAsState(
+        targetValue = if (isSelected) 30.dp else 18.dp,
+        animationSpec = spring(dampingRatio = 0.72f, stiffness = 420f),
+        label = "presetCarouselCorner"
+    )
+    // Material3 1.3.1's CarouselItemScope.maskClip forgets to key remember() on `shape`,
+    // freezing corner radius on first composition. Building the masked GenericShape with
+    // `cornerRadius` in the remember keys guarantees live 120fps Bezier corner morphing.
+    val liveMaskShape = remember(carouselItemInfo, density, cornerRadius) {
+        GenericShape { size, direction ->
+            val rect = carouselItemInfo.maskRect.intersect(size.toRect())
+            addOutline(
+                SmoothRoundedCornerShape(cornerRadius).createOutline(rect.size, direction, density)
+            )
+            translate(Offset(rect.left, rect.top))
+        }
     }
-    // Outer radius 24dp with 9dp badge inset and 30dp (r = 15dp) circle badges => concentric 15 + 9 = 24dp.
-    val shape = SmoothRoundedCornerShape(24.dp)
     val fadeModifier = Modifier.graphicsLayer {
         val maxW = carouselItemInfo.maxSize
         val visFrac = if (maxW > 4f) (carouselItemInfo.maskRect.width / maxW).coerceIn(0f, 1f) else 1f
@@ -1061,14 +1136,7 @@ private fun CarouselItemScope.PresetCarouselCard(
     Box(
         modifier = Modifier
             .height(224.dp)
-            .maskClip(shape)
-            .then(
-                if (isSelected) {
-                    Modifier.maskBorder(BorderStroke(1.8.dp, cs.primary), shape)
-                } else {
-                    Modifier.maskBorder(BorderStroke(1.dp, cs.outlineVariant.copy(alpha = 0.50f)), shape)
-                }
-            )
+            .clip(liveMaskShape)
             .background(cardBg)
             .clickable(onClick = onSelect)
     ) {
@@ -1076,10 +1144,12 @@ private fun CarouselItemScope.PresetCarouselCard(
             preset = preset,
             allPresets = allPresets,
             isSelected = isSelected,
+            hasQuickTrigger = hasQuickTrigger,
             canDelete = canDelete,
             screenWidthPx = screenWidthPx,
             screenHeightPx = screenHeightPx,
             fadeModifier = fadeModifier,
+            onToggleQuickTrigger = onToggleQuickTrigger,
             onRename = onRename,
             onExportJson = onExportJson,
             onDelete = onDelete
@@ -1092,15 +1162,18 @@ private fun androidx.compose.foundation.layout.BoxScope.PresetCardOverlayContent
     preset: ClickPreset,
     allPresets: List<ClickPreset>,
     isSelected: Boolean,
+    hasQuickTrigger: Boolean,
     canDelete: Boolean,
     screenWidthPx: Int,
     screenHeightPx: Int,
     fadeModifier: Modifier,
+    onToggleQuickTrigger: () -> Unit,
     onRename: () -> Unit,
     onExportJson: () -> Unit,
     onDelete: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
+    val density = LocalDensity.current
     var cardMenuExpanded by remember { mutableStateOf(false) }
 
     PresetMiniCanvas(
@@ -1112,107 +1185,158 @@ private fun androidx.compose.foundation.layout.BoxScope.PresetCardOverlayContent
         drawOuterFrame = false
     )
 
-    Row(
+    // Top-right Files-by-Google vertical oval pill 3-dot button (rich soft dynamic tint, never white)
+    Box(
         modifier = Modifier
-            .fillMaxWidth()
-            .padding(9.dp)
-            .then(fadeModifier),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
+            .align(Alignment.TopEnd)
+            .padding(top = 9.dp, end = 9.dp)
+            .then(fadeModifier)
     ) {
-        if (isSelected) {
-            Surface(
-                shape = CircleShape,
-                color = cs.primary,
-                contentColor = cs.onPrimary,
-                modifier = Modifier.size(30.dp)
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Rounded.Check,
-                        contentDescription = "使用中",
-                        modifier = Modifier.size(17.dp)
-                    )
-                }
+        val pillBg = lerp(cs.primaryContainer, cs.primary, 0.14f)
+        Surface(
+            shape = CircleShape,
+            color = pillBg,
+            contentColor = cs.onPrimaryContainer,
+            modifier = Modifier
+                .width(24.dp)
+                .height(34.dp)
+                .clip(CircleShape)
+                .clickable { cardMenuExpanded = true }
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    imageVector = Icons.Rounded.MoreVert,
+                    contentDescription = "方案操作",
+                    modifier = Modifier.size(18.dp)
+                )
             }
-        } else {
-            Spacer(Modifier.size(30.dp))
         }
-
-        Box {
-            Surface(
-                shape = CircleShape,
-                color = cs.surfaceContainerLowest.copy(alpha = 0.88f),
-                contentColor = cs.onSurface,
-                modifier = Modifier
-                    .size(30.dp)
-                    .clip(CircleShape)
-                    .clickable { cardMenuExpanded = true }
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Rounded.MoreVert,
-                        contentDescription = "方案操作",
-                        modifier = Modifier.size(17.dp)
+        DropdownMenu(
+            expanded = cardMenuExpanded,
+            onDismissRequest = { cardMenuExpanded = false }
+        ) {
+            DropdownMenuItem(
+                text = {
+                    Text(
+                        text = if (hasQuickTrigger) "关闭悬浮触发键" else "启用悬浮触发键",
+                        color = if (hasQuickTrigger) cs.primary else Color.Unspecified,
+                        fontWeight = if (hasQuickTrigger) FontWeight.SemiBold else FontWeight.Normal
                     )
+                },
+                onClick = {
+                    cardMenuExpanded = false
+                    onToggleQuickTrigger()
                 }
-            }
-            DropdownMenu(
-                expanded = cardMenuExpanded,
-                onDismissRequest = { cardMenuExpanded = false }
-            ) {
+            )
+            DropdownMenuItem(
+                text = { Text("重命名") },
+                onClick = {
+                    cardMenuExpanded = false
+                    onRename()
+                }
+            )
+            DropdownMenuItem(
+                text = { Text("导出为 JSON") },
+                onClick = {
+                    cardMenuExpanded = false
+                    onExportJson()
+                }
+            )
+            if (canDelete) {
                 DropdownMenuItem(
-                    text = { Text("重命名") },
+                    text = { Text("删除方案", color = cs.error) },
                     onClick = {
                         cardMenuExpanded = false
-                        onRename()
+                        onDelete()
                     }
                 )
-                DropdownMenuItem(
-                    text = { Text("导出为 JSON") },
-                    onClick = {
-                        cardMenuExpanded = false
-                        onExportJson()
-                    }
-                )
-                if (canDelete) {
-                    DropdownMenuItem(
-                        text = { Text("删除方案", color = cs.error) },
-                        onClick = {
-                            cardMenuExpanded = false
-                            onDelete()
-                        }
-                    )
-                }
             }
         }
     }
 
-    Surface(
-        shape = CircleShape,
-        color = if (isSelected) {
-            cs.primaryContainer.copy(alpha = 0.92f)
-        } else {
-            cs.surfaceContainerLowest.copy(alpha = 0.88f)
-        },
-        contentColor = if (isSelected) cs.onPrimaryContainer else cs.onSurface,
+    // Bottom-right Gmail-style 3D flip badge: unselected preset name -> flips around bottom-right axis into checkmark circle
+    val flipRotation by animateFloatAsState(
+        targetValue = if (isSelected) 180f else 0f,
+        animationSpec = spring(dampingRatio = 0.76f, stiffness = 360f),
+        label = "presetBadgeFlip"
+    )
+    val cjkUnits = remember(preset.name) {
+        preset.name.sumOf { ch -> if (ch.code > 0x7F) 2 else 1 }
+    }
+    val isLongName = cjkUnits >= 16
+
+    Box(
         modifier = Modifier
             .align(Alignment.BottomEnd)
-            .padding(end = 9.dp, bottom = 9.dp)
-            .heightIn(min = 28.dp)
-            .then(fadeModifier)
+            .padding(start = 9.dp, end = 9.dp, bottom = 9.dp)
+            .then(fadeModifier),
+        contentAlignment = Alignment.BottomEnd
     ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-        ) {
-            Text(
-                text = preset.name,
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+        if (flipRotation <= 90f) {
+            val badgeBg = lerp(cs.primaryContainer, cs.primary, 0.14f)
+            Surface(
+                shape = if (isLongName) RoundedCornerShape(12.dp) else CircleShape,
+                color = badgeBg,
+                contentColor = cs.onPrimaryContainer,
+                modifier = Modifier
+                    .heightIn(min = 28.dp)
+                    .graphicsLayer {
+                        val checkHalfPx = with(density) { 16.dp.toPx() }
+                        val pivotX = if (size.width > 1f) {
+                            (1f - checkHalfPx / size.width).coerceIn(0.5f, 0.94f)
+                        } else {
+                            0.5f
+                        }
+                        transformOrigin = TransformOrigin(pivotX, 0.5f)
+                        rotationY = flipRotation
+                        cameraDistance = 12f * density.density
+                    }
+            ) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier.padding(
+                        horizontal = if (isLongName) 8.dp else 10.dp,
+                        vertical = 4.dp
+                    )
+                ) {
+                    Text(
+                        text = preset.name,
+                        style = if (isLongName) {
+                            MaterialTheme.typography.labelMedium.copy(
+                                fontSize = 6.5.sp,
+                                lineHeight = 8.5.sp
+                            )
+                        } else {
+                            MaterialTheme.typography.labelMedium
+                        },
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center,
+                        maxLines = if (isLongName) 2 else 1,
+                        softWrap = isLongName,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        } else {
+            Surface(
+                shape = CircleShape,
+                color = cs.primary,
+                contentColor = cs.onPrimary,
+                modifier = Modifier
+                    .size(32.dp)
+                    .graphicsLayer {
+                        rotationY = flipRotation - 180f
+                        cameraDistance = 12f * density.density
+                    }
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Rounded.Check,
+                        contentDescription = "已选中",
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
         }
     }
 }
@@ -1221,157 +1345,385 @@ private fun androidx.compose.foundation.layout.BoxScope.PresetCardOverlayContent
 private fun TargetRowCard(
     target: ClickTarget,
     allPresets: List<ClickPreset>,
-    globalIntervalMs: Long,
-    globalPressMs: Long,
     isConcurrent: Boolean,
     hasSeamlessHandoff: Boolean,
+    isFirst: Boolean,
+    isLast: Boolean,
     onToggle: (Boolean) -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
+    val haptic = LocalHapticFeedback.current
+    val density = LocalDensity.current
+    val scope = rememberCoroutineScope()
     val refPreset = if (target.actionType == ActionType.SUB_PRESET) {
         allPresets.firstOrNull { it.id == target.refPresetId }
     } else null
 
-    Surface(
-        shape = RoundedCornerShape(18.dp),
-        color = cs.surfaceContainer,
+    var cardWidthPx by remember { mutableIntStateOf(0) }
+    val offsetX = remember { Animatable(0f) }
+    var isDismissing by remember { mutableStateOf(false) }
+
+    val thresholdPx = (cardWidthPx * 0.40f).coerceAtLeast(1f)
+    val absOffset = abs(offsetX.value)
+    val pastThreshold = cardWidthPx > 0 && absOffset >= thresholdPx
+
+    var wasPastThreshold by remember { mutableStateOf(false) }
+    LaunchedEffect(pastThreshold) {
+        if (pastThreshold && !wasPastThreshold) {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+        } else if (!pastThreshold && wasPastThreshold && absOffset > 8f) {
+            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        }
+        wasPastThreshold = pastThreshold
+    }
+
+    val capsuleBg by animateColorAsState(
+        targetValue = if (pastThreshold) cs.error else cs.errorContainer,
+        animationSpec = tween(160),
+        label = "swipeCapsuleBg"
+    )
+    val capsuleIconTint by animateColorAsState(
+        targetValue = if (pastThreshold) cs.onError else cs.onErrorContainer,
+        animationSpec = tween(160),
+        label = "swipeCapsuleTint"
+    )
+    val swipeProgress = if (cardWidthPx > 0) (absOffset / thresholdPx).coerceIn(0f, 1.3f) else 0f
+    val iconScale by animateFloatAsState(
+        targetValue = if (pastThreshold) 1.24f else (0.72f + 0.28f * swipeProgress.coerceAtMost(1f)),
+        animationSpec = spring(dampingRatio = 0.48f, stiffness = 520f),
+        label = "swipeIconScale"
+    )
+    val capsuleScaleY by animateFloatAsState(
+        targetValue = if (pastThreshold) 1.0f else (0.76f + 0.18f * swipeProgress.coerceAtMost(1f)),
+        animationSpec = spring(dampingRatio = 0.56f, stiffness = 480f),
+        label = "swipeCapsuleScaleY"
+    )
+    val isSwiping = absOffset > 6f
+    val topCorner by animateDpAsState(
+        targetValue = if (isSwiping || isFirst) 20.dp else 4.dp,
+        animationSpec = spring(dampingRatio = 0.78f, stiffness = 480f),
+        label = "swipeTopCorner"
+    )
+    val bottomCorner by animateDpAsState(
+        targetValue = if (isSwiping || isLast) 20.dp else 4.dp,
+        animationSpec = spring(dampingRatio = 0.78f, stiffness = 480f),
+        label = "swipeBottomCorner"
+    )
+    val cardShape = RoundedCornerShape(
+        topStart = topCorner,
+        topEnd = topCorner,
+        bottomStart = bottomCorner,
+        bottomEnd = bottomCorner
+    )
+
+    val draggableState = rememberDraggableState { delta ->
+        if (!isDismissing) {
+            scope.launch {
+                val maxSlide = cardWidthPx.toFloat().coerceAtLeast(1f)
+                offsetX.snapTo((offsetX.value + delta).coerceIn(-maxSlide, maxSlide))
+            }
+        }
+    }
+
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(18.dp))
-            .clickable(onClick = onEdit)
+            .onSizeChanged { cardWidthPx = it.width }
     ) {
-        Row(
+        // Gmail / Material 3 Expressive capsule scaling delete background
+        if (absOffset > 1f) {
+            val swipingRight = offsetX.value > 0f
+            val revealedDp = with(density) { (absOffset - 6.dp.toPx()).coerceAtLeast(0f).toDp() }
+            val capsuleWidth = revealedDp.coerceAtLeast(36.dp)
+            val capsuleAlpha = (swipeProgress * 3.2f).coerceIn(0f, 1f)
+
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .padding(vertical = 2.dp),
+                contentAlignment = if (swipingRight) Alignment.CenterStart else Alignment.CenterEnd
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .width(capsuleWidth)
+                        .graphicsLayer {
+                            scaleY = capsuleScaleY
+                            alpha = capsuleAlpha
+                        }
+                        .clip(CircleShape)
+                        .background(capsuleBg),
+                    contentAlignment = Alignment.Center
+                ) {
+                    AnimatedSwipeTrashIcon(
+                        swipeProgress = swipeProgress,
+                        pastThreshold = pastThreshold,
+                        swipingRight = swipingRight,
+                        tint = capsuleIconTint,
+                        cutoutColor = capsuleBg,
+                        size = 22.dp,
+                        modifier = Modifier.graphicsLayer {
+                            scaleX = iconScale
+                            scaleY = iconScale
+                        }
+                    )
+                }
+            }
+        }
+
+        Surface(
+            shape = cardShape,
+            color = cs.surfaceContainer,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Surface(
-                shape = CircleShape,
-                color = if (target.enabled) cs.primary else cs.surfaceContainerHighest,
-                modifier = Modifier.size(34.dp)
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Text(
-                        text = "#${target.index}",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = if (target.enabled) cs.onPrimary else cs.onSurfaceVariant
-                    )
-                }
-            }
-
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    when (target.actionType) {
-                        ActionType.SWIPE -> Icon(
-                            painter = painterResource(R.drawable.ic_swipe),
-                            contentDescription = null,
-                            modifier = Modifier.size(14.dp),
-                            tint = cs.secondary
-                        )
-                        ActionType.HOLD -> Icon(
-                            painter = painterResource(R.drawable.ic_hold),
-                            contentDescription = null,
-                            modifier = Modifier.size(14.dp),
-                            tint = cs.tertiary
-                        )
-                        ActionType.SUB_PRESET -> Icon(
-                            painter = painterResource(R.drawable.ic_layers),
-                            contentDescription = null,
-                            modifier = Modifier.size(14.dp),
-                            tint = cs.primary
-                        )
-                        ActionType.TAP -> Icon(
-                            painter = painterResource(R.drawable.ic_touch_app),
-                            contentDescription = null,
-                            modifier = Modifier.size(14.dp),
-                            tint = cs.primary
-                        )
-                    }
-                    Text(
-                        text = when (target.actionType) {
-                            ActionType.SWIPE -> "滑动 (${target.x.roundToInt()},${target.y.roundToInt()})→(${target.endX.roundToInt()},${target.endY.roundToInt()})"
-                            ActionType.HOLD -> if (!isConcurrent && target.pressDurationMs <= 120L && target.repeatCount >= 1) {
-                                "按住点击 (${target.x.roundToInt()},${target.y.roundToInt()})"
+                .offset { IntOffset(offsetX.value.roundToInt(), 0) }
+                .clip(cardShape)
+                .draggable(
+                    state = draggableState,
+                    orientation = Orientation.Horizontal,
+                    enabled = !isDismissing,
+                    onDragStopped = { velocity ->
+                        val cur = offsetX.value
+                        val absCur = abs(cur)
+                        val shouldDismiss = cardWidthPx > 0 && (
+                            absCur >= thresholdPx ||
+                                (absCur >= cardWidthPx * 0.28f && sign(velocity) == sign(cur) && abs(velocity) > 1300f)
+                            )
+                        scope.launch {
+                            if (shouldDismiss) {
+                                isDismissing = true
+                                val dir = if (cur >= 0f) 1f else -1f
+                                offsetX.animateTo(
+                                    targetValue = dir * cardWidthPx * 1.05f,
+                                    animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing)
+                                )
+                                onDelete()
                             } else {
-                                "长按 (${target.x.roundToInt()},${target.y.roundToInt()})"
+                                offsetX.animateTo(
+                                    targetValue = 0f,
+                                    animationSpec = spring(dampingRatio = 0.72f, stiffness = 460f)
+                                )
                             }
-                            ActionType.SUB_PRESET -> "并发方案: ${refPreset?.name ?: "未找到方案"}"
-                            ActionType.TAP -> "连点 (${target.x.roundToInt()},${target.y.roundToInt()})"
-                        },
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                val repeatTag = if (target.repeatCount <= 0) "无限" else "${target.repeatCount}次"
-                val gapLabel = if (target.intervalMs <= 0L) "无缝(0ms)" else "停顿 ${target.intervalMs}ms"
-                val detail = when (target.actionType) {
-                    ActionType.SUB_PRESET -> when {
-                        isConcurrent -> "仅在顺序模式中生效"
-                        refPreset == null -> "引用的方案已不存在"
-                        refPreset.executionMode != ExecutionMode.CONCURRENT -> "引用方案当前非并发模式"
-                        target.repeatCount <= 0 -> "${refPreset.targets.count { it.enabled }} 节点 · 无限并发"
-                        else -> "持续 ${formatMsShort(target.subDurationMs)} · $gapLabel · $repeatTag"
+                        }
                     }
-                    ActionType.SWIPE -> "${if (!isConcurrent) gapLabel else "间隔 ${target.intervalMs}ms"} · 耗时 ${target.swipeDurationMs}ms · $repeatTag"
-                    ActionType.HOLD -> if (target.repeatCount <= 0) {
-                        "持续长按驻留 · 无限"
-                    } else {
-                        "按住 ${target.pressDurationMs}ms · ${if (!isConcurrent) gapLabel else "间隔 ${target.intervalMs}ms"} · $repeatTag"
-                    }
-                    ActionType.TAP -> "间隔 ${globalIntervalMs}ms · 按压 ${globalPressMs}ms · $repeatTag"
-                }
-                Text(
-                    text = detail,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = cs.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
                 )
-                if (hasSeamlessHandoff && !isConcurrent) {
-                    Surface(
-                        shape = CircleShape,
-                        color = cs.secondaryContainer,
-                        contentColor = cs.onSecondaryContainer,
-                        modifier = Modifier.padding(top = 2.dp)
-                    ) {
+                .clickable(enabled = !isDismissing && absOffset < 4f, onClick = onEdit)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 9.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = if (target.enabled) cs.primary else cs.surfaceContainerHighest,
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
                         Text(
-                            text = "不断触衔接下步",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                            text = "#${target.index}",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = if (target.enabled) cs.onPrimary else cs.onSurfaceVariant
                         )
                     }
                 }
-            }
 
-            CheckSwitch(
-                checked = target.enabled,
-                onCheckedChange = onToggle
-            )
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        when (target.actionType) {
+                            ActionType.SWIPE -> Icon(
+                                painter = painterResource(R.drawable.ic_swipe),
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp),
+                                tint = cs.secondary
+                            )
+                            ActionType.HOLD -> Icon(
+                                painter = painterResource(R.drawable.ic_hold),
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp),
+                                tint = cs.tertiary
+                            )
+                            ActionType.SUB_PRESET -> Icon(
+                                painter = painterResource(R.drawable.ic_layers),
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp),
+                                tint = cs.primary
+                            )
+                            ActionType.TAP -> Icon(
+                                painter = painterResource(R.drawable.ic_touch_app),
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp),
+                                tint = cs.primary
+                            )
+                        }
+                        Text(
+                            text = when (target.actionType) {
+                                ActionType.SWIPE -> "滑动 (${target.x.roundToInt()},${target.y.roundToInt()})→(${target.endX.roundToInt()},${target.endY.roundToInt()})"
+                                ActionType.HOLD -> if (!isConcurrent && target.pressDurationMs <= 120L && target.repeatCount >= 1) {
+                                    "按住点击 (${target.x.roundToInt()},${target.y.roundToInt()})"
+                                } else {
+                                    "长按 (${target.x.roundToInt()},${target.y.roundToInt()})"
+                                }
+                                ActionType.SUB_PRESET -> "并发方案 · ${refPreset?.name ?: "未找到方案"}"
+                                ActionType.TAP -> "连点 (${target.x.roundToInt()},${target.y.roundToInt()})"
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (hasSeamlessHandoff && !isConcurrent) {
+                        Surface(
+                            shape = CircleShape,
+                            color = cs.secondaryContainer,
+                            contentColor = cs.onSecondaryContainer
+                        ) {
+                            Text(
+                                text = "不断触衔接下步",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
 
-            IconButton(onClick = onDelete, modifier = Modifier.size(30.dp)) {
-                Icon(
-                    imageVector = Icons.Rounded.Delete,
-                    contentDescription = "删除步骤",
-                    modifier = Modifier.size(16.dp),
-                    tint = cs.error
+                CheckSwitch(
+                    checked = target.enabled,
+                    onCheckedChange = onToggle
                 )
             }
         }
     }
+}
+
+@Composable
+private fun QuickTriggerConfigDialog(
+    preset: ClickPreset,
+    initialConfig: PresetQuickTriggerConfig,
+    onDismiss: () -> Unit,
+    onConfirm: (PresetQuickTriggerConfig) -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    val haptic = LocalHapticFeedback.current
+
+    var sizeDp by remember(preset.id) { mutableIntStateOf(initialConfig.sizeDp) }
+    var shapeMode by remember(preset.id) { mutableIntStateOf(initialConfig.shapeMode) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = RoundedCornerShape(26.dp),
+        title = {
+            Text(
+                text = "悬浮触发键 · ${preset.name}",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                // Shape selector
+                ExpressiveConnectedGroup(
+                    options = listOf(
+                        ExpressiveOption(PresetQuickTriggerConfig.SHAPE_PILL, "胶囊"),
+                        ExpressiveOption(PresetQuickTriggerConfig.SHAPE_SQUIRCLE, "圆角"),
+                        ExpressiveOption(PresetQuickTriggerConfig.SHAPE_CIRCLE, "圆形")
+                    ),
+                    selectedValue = shapeMode,
+                    onSelect = { shapeMode = it },
+                    height = 38.dp
+                )
+
+                // Size slider
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "大小",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = cs.onSurface
+                        )
+                        Text(
+                            text = "${sizeDp} dp",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = cs.primary
+                        )
+                    }
+                    ExpressiveSlider(
+                        value = sizeDp.toFloat(),
+                        valueRange = PresetQuickTriggerConfig.MIN_SIZE_DP.toFloat()..
+                            PresetQuickTriggerConfig.MAX_SIZE_DP.toFloat(),
+                        onValueChange = { raw ->
+                            val next = raw.roundToInt().coerceIn(
+                                PresetQuickTriggerConfig.MIN_SIZE_DP,
+                                PresetQuickTriggerConfig.MAX_SIZE_DP
+                            )
+                            if (next != sizeDp) {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                sizeDp = next
+                            }
+                        },
+                        onValueChangeFinished = {},
+                        floatingLabel = "${sizeDp}dp"
+                    )
+                }
+
+                Text(
+                    text = "点按启停 · 拖动调位 · 拖入销毁",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onConfirm(
+                        PresetQuickTriggerConfig(
+                            presetId = preset.id,
+                            sizeDp = sizeDp,
+                            shapeMode = shapeMode,
+                            normX = initialConfig.normX,
+                            normY = initialConfig.normY
+                        )
+                    )
+                },
+                shape = CircleShape
+            ) {
+                Text("确定", fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("取消")
+            }
+        }
+    )
 }
 
 private fun formatMsShort(ms: Long): String {

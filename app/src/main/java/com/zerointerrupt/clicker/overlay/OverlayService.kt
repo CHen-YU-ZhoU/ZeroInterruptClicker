@@ -47,8 +47,10 @@ import com.zerointerrupt.clicker.R
 import com.zerointerrupt.clicker.model.ActionType
 import com.zerointerrupt.clicker.model.ClickConfigStore
 import com.zerointerrupt.clicker.model.ClickGlobalSettings
+import com.zerointerrupt.clicker.model.ClickPreset
 import com.zerointerrupt.clicker.model.ClickTarget
 import com.zerointerrupt.clicker.model.ExecutionMode
+import com.zerointerrupt.clicker.model.PresetQuickTriggerConfig
 import com.zerointerrupt.clicker.shizuku.ShizukuConnectionState
 import com.zerointerrupt.clicker.shizuku.ShizukuController
 import com.zerointerrupt.clicker.shizuku.TouchMuxUserService
@@ -78,6 +80,9 @@ object OverlayStateHub {
     private val _configVersion = MutableStateFlow(0L)
     val configVersion: StateFlow<Long> = _configVersion.asStateFlow()
 
+    private val _activeQuickTriggerPresetIds = MutableStateFlow<Set<String>>(emptySet())
+    val activeQuickTriggerPresetIds: StateFlow<Set<String>> = _activeQuickTriggerPresetIds.asStateFlow()
+
     internal fun setOverlayVisible(context: Context, visible: Boolean) {
         _overlayVisible.value = visible
         requestQuickTileUpdate(context)
@@ -86,6 +91,10 @@ object OverlayStateHub {
     internal fun setClickingRunning(context: Context, running: Boolean) {
         _clickingRunning.value = running
         requestQuickTileUpdate(context)
+    }
+
+    internal fun setActiveQuickTriggerPresetIds(ids: Set<String>) {
+        _activeQuickTriggerPresetIds.value = ids
     }
 
     internal fun bumpConfigVersion() {
@@ -151,6 +160,8 @@ class OverlayService : Service(), ControlBarView.Listener {
     private var tunePanelView: View? = null
     private var tunePanelLp: WindowManager.LayoutParams? = null
     private var macroRecordOverlay: MacroRecordOverlay? = null
+    private var quickTriggerManager: PresetTriggerOverlayManager? = null
+    private var runningQuickTriggerPresetId: String? = null
     private var normalOverlayAttached: Boolean = false
     private var resumeOverlayAfterRecord: Boolean = false
 
@@ -217,6 +228,13 @@ class OverlayService : Service(), ControlBarView.Listener {
         lastAutoLockOnStart = initialSettings.autoLockOnStart
         showMacroTrajectoriesPref = initialSettings.showMacroTrajectories
         ShizukuController.initialize(this)
+        quickTriggerManager = PresetTriggerOverlayManager(
+            context = this,
+            windowManager = windowManager,
+            colors = themeColors,
+            onTapPreset = { presetId -> handleQuickTriggerTap(presetId) },
+            onDestroyedPreset = { presetId -> handleQuickTriggerDestroyed(presetId) }
+        )
         startForegroundWithNotification()
         displayManager.registerDisplayListener(displayListener, null)
         systemShowTouchesEnabled = querySystemShowTouchesEnabled()
@@ -275,6 +293,8 @@ class OverlayService : Service(), ControlBarView.Listener {
         emergencyUngrabJob = serviceScope.launch {
             ShizukuController.emergencyUngrabEvents.collect {
                 isClicking = false
+                runningQuickTriggerPresetId = null
+                quickTriggerManager?.setRunningPreset(null)
                 clickingStartedByTargetHold = false
                 OverlayStateHub.setClickingRunning(this@OverlayService, false)
                 applyLockMode(false)
@@ -292,6 +312,8 @@ class OverlayService : Service(), ControlBarView.Listener {
             ShizukuController.clickingCompletedEvents.collect {
                 if (isClicking) {
                     isClicking = false
+                    runningQuickTriggerPresetId = null
+                    quickTriggerManager?.setRunningPreset(null)
                     clickingStartedByTargetHold = false
                     OverlayStateHub.setClickingRunning(this@OverlayService, false)
                     refreshAnchorVisuals()
@@ -312,9 +334,44 @@ class OverlayService : Service(), ControlBarView.Listener {
             ACTION_STOP_OVERLAY -> {
                 macroRecordOverlay?.dismissAll()
                 macroRecordOverlay = null
-                stopClickingInternal()
-                stopSelf()
+                if (quickTriggerManager?.hasAny() == true) {
+                    if (runningQuickTriggerPresetId == null) {
+                        stopClickingInternal()
+                    }
+                    detachNormalOverlayOnly()
+                } else {
+                    stopClickingInternal()
+                    stopSelf()
+                }
                 return START_NOT_STICKY
+            }
+            ACTION_SHOW_QUICK_TRIGGER -> {
+                val presetId = intent.getStringExtra(EXTRA_PRESET_ID).orEmpty()
+                val preset = ClickConfigStore.loadPresets(this).firstOrNull { it.id == presetId }
+                if (preset != null) {
+                    val fallback = ClickConfigStore.loadQuickTriggerConfig(this, presetId)
+                    val cfg = PresetQuickTriggerConfig(
+                        presetId = presetId,
+                        sizeDp = intent.getIntExtra(EXTRA_TRIGGER_SIZE_DP, fallback.sizeDp),
+                        shapeMode = intent.getIntExtra(EXTRA_TRIGGER_SHAPE, fallback.shapeMode),
+                        normX = intent.getFloatExtra(EXTRA_TRIGGER_NORM_X, fallback.normX),
+                        normY = intent.getFloatExtra(EXTRA_TRIGGER_NORM_Y, fallback.normY)
+                    )
+                    ClickConfigStore.saveQuickTriggerConfig(this, cfg)
+                    quickTriggerManager?.showOrUpdate(preset, cfg)
+                    OverlayStateHub.setActiveQuickTriggerPresetIds(
+                        quickTriggerManager?.activePresetIds().orEmpty()
+                    )
+                } else if (!normalOverlayAttached && macroRecordOverlay == null && quickTriggerManager?.hasAny() != true) {
+                    stopSelf()
+                }
+            }
+            ACTION_HIDE_QUICK_TRIGGER -> {
+                val presetId = intent.getStringExtra(EXTRA_PRESET_ID).orEmpty()
+                if (presetId.isNotBlank()) {
+                    quickTriggerManager?.hide(presetId)
+                    handleQuickTriggerDestroyed(presetId)
+                }
             }
             ACTION_START_RECORDING -> {
                 enterRecordingMode(rawMacroMode = false)
@@ -357,6 +414,11 @@ class OverlayService : Service(), ControlBarView.Listener {
                 themeColors = OverlayThemeColors.resolve(this)
                 controlBarView?.applyThemeColors(themeColors)
                 macroRecordOverlay?.updateTheme(themeColors)
+                quickTriggerManager?.updateTheme(themeColors)
+                quickTriggerManager?.syncPresetsAndGeometry(ClickConfigStore.loadPresets(this))
+                OverlayStateHub.setActiveQuickTriggerPresetIds(
+                    quickTriggerManager?.activePresetIds().orEmpty()
+                )
                 lockedAlpha = settings.lockedAnchorAlpha.coerceIn(
                     ClickGlobalSettings.MIN_LOCKED_ALPHA,
                     ClickGlobalSettings.MAX_LOCKED_ALPHA
@@ -405,6 +467,8 @@ class OverlayService : Service(), ControlBarView.Listener {
         themeColors = OverlayThemeColors.resolve(this)
         controlBarView?.applyThemeColors(themeColors)
         macroRecordOverlay?.updateTheme(themeColors)
+        quickTriggerManager?.updateTheme(themeColors)
+        quickTriggerManager?.syncPresetsAndGeometry(ClickConfigStore.loadPresets(this))
         onScreenGeometryChanged()
         if (tunePanelView != null) {
             showOrUpdateTunePanel(forceShow = true)
@@ -415,6 +479,10 @@ class OverlayService : Service(), ControlBarView.Listener {
         mainHandler.removeCallbacksAndMessages(null)
         macroRecordOverlay?.dismissAll()
         macroRecordOverlay = null
+        quickTriggerManager?.dismissAll()
+        quickTriggerManager = null
+        runningQuickTriggerPresetId = null
+        OverlayStateHub.setActiveQuickTriggerPresetIds(emptySet())
         cancelBarSprings()
         displayManager.unregisterDisplayListener(displayListener)
         try {
@@ -441,7 +509,9 @@ class OverlayService : Service(), ControlBarView.Listener {
         OverlayStateHub.setOverlayVisible(this, false)
         ShizukuController.releaseOverlayEngineAsync(
             shouldReleaseHardware = {
-                !keepEngineAliveForRpc && !OverlayStateHub.overlayVisible.value
+                !keepEngineAliveForRpc &&
+                    !OverlayStateHub.overlayVisible.value &&
+                    OverlayStateHub.activeQuickTriggerPresetIds.value.isEmpty()
             }
         )
         serviceScope.cancel()
@@ -1809,6 +1879,8 @@ class OverlayService : Service(), ControlBarView.Listener {
         pendingAutoLockStartRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingAutoLockStartRunnable = null
         clickingStartedByTargetHold = false
+        runningQuickTriggerPresetId = null
+        quickTriggerManager?.setRunningPreset(null)
         val stopSeq = ++runSessionSeq
         if (!isClicking) return
         cancelAutoCollapse()
@@ -1826,6 +1898,116 @@ class OverlayService : Service(), ControlBarView.Listener {
         }
         if (!isBarCollapsed) {
             scheduleAutoCollapse(IDLE_COLLAPSE_DELAY_MS)
+        }
+    }
+
+    private fun detachNormalOverlayOnly() {
+        cancelAutoCollapse()
+        dismissTunePanel()
+        removeAllAnchorWindows()
+        removeSwipeConnectorLayer()
+        removeControlBar()
+        normalOverlayAttached = false
+        OverlayStateHub.setOverlayVisible(this, false)
+    }
+
+    private fun handleQuickTriggerTap(presetId: String) {
+        if (isClicking && runningQuickTriggerPresetId == presetId) {
+            stopClickingInternal()
+            return
+        }
+        val preset = ClickConfigStore.loadPresets(this).firstOrNull { it.id == presetId }
+        if (preset == null) {
+            quickTriggerManager?.hide(presetId)
+            handleQuickTriggerDestroyed(presetId)
+            return
+        }
+        val metrics = ShizukuController.getDisplayScreenMetrics(this)
+        val hasPayload = if (preset.isRawMacro) {
+            preset.rawMacroJson.isNotBlank()
+        } else {
+            preset.targets.any { it.enabled }
+        }
+        if (!hasPayload) {
+            Toast.makeText(this, "方案「${preset.name}」暂无可执行步骤", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!ShizukuController.isServiceConnected()) {
+            ShizukuController.evaluateShizukuState()
+            Toast.makeText(this, "底层触控服务尚未连接，请先完成初始化", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (isClicking) {
+            stopClickingInternal()
+        }
+        startQuickTriggerPreset(preset, metrics.widthPx, metrics.heightPx)
+    }
+
+    private fun startQuickTriggerPreset(preset: ClickPreset, screenW: Int, screenH: Int) {
+        cancelAutoCollapse()
+        val expectedSeq = ++runSessionSeq
+        val snapshot = preset.targets.map { t -> t.copy().apply { remapToScreen(screenW, screenH) } }
+        val modeSnapshot = preset.executionMode
+        val loopSnapshot = preset.presetLoopCount
+        val isRawSnapshot = preset.isRawMacro
+        val rawJsonSnapshot = preset.rawMacroJson
+
+        runningQuickTriggerPresetId = preset.id
+        isClicking = true
+        quickTriggerManager?.setRunningPreset(preset.id)
+        OverlayStateHub.setClickingRunning(this, true)
+        refreshAnchorVisuals()
+        refreshControlBarState()
+
+        serviceScope.launch(Dispatchers.IO) {
+            val mode = clickEngineMutex.withLock {
+                if (expectedSeq != runSessionSeq) return@withLock RUN_CANCELLED_SENTINEL
+                if (isRawSnapshot) {
+                    ShizukuController.startRawMacro(
+                        rawMacroJson = rawJsonSnapshot,
+                        loopCount = loopSnapshot
+                    )
+                } else {
+                    ShizukuController.startClicking(
+                        targets = snapshot,
+                        executionMode = modeSnapshot,
+                        presetLoopCount = loopSnapshot
+                    )
+                }
+            }
+            if (mode == RUN_CANCELLED_SENTINEL) return@launch
+            withContext(Dispatchers.Main) {
+                if (expectedSeq != runSessionSeq || !isClicking) return@withContext
+                if (mode < 0) {
+                    isClicking = false
+                    runningQuickTriggerPresetId = null
+                    quickTriggerManager?.setRunningPreset(null)
+                    OverlayStateHub.setClickingRunning(this@OverlayService, false)
+                    refreshAnchorVisuals()
+                    refreshControlBarState()
+                    Toast.makeText(
+                        this@OverlayService,
+                        "启动方案失败 (code=$mode)",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    engineMode = mode
+                    syncHybridTouchFeedbackState()
+                    refreshControlBarState()
+                }
+            }
+        }
+    }
+
+    private fun handleQuickTriggerDestroyed(presetId: String) {
+        if (runningQuickTriggerPresetId == presetId) {
+            stopClickingInternal()
+        }
+        OverlayStateHub.setActiveQuickTriggerPresetIds(
+            quickTriggerManager?.activePresetIds().orEmpty()
+        )
+        if (!normalOverlayAttached && macroRecordOverlay == null && quickTriggerManager?.hasAny() != true) {
+            stopSelf()
         }
     }
 
@@ -2233,8 +2415,15 @@ class OverlayService : Service(), ControlBarView.Listener {
         cancelAutoCollapse()
         macroRecordOverlay?.dismissAll()
         macroRecordOverlay = null
-        stopClickingInternal()
-        stopSelf()
+        if (quickTriggerManager?.hasAny() == true) {
+            if (runningQuickTriggerPresetId == null) {
+                stopClickingInternal()
+            }
+            detachNormalOverlayOnly()
+        } else {
+            stopClickingInternal()
+            stopSelf()
+        }
     }
 
     override fun onDragMove(newLpX: Int, newLpY: Int) {
@@ -2781,9 +2970,15 @@ class OverlayService : Service(), ControlBarView.Listener {
         const val ACTION_RPC_START = "com.zerointerrupt.clicker.ACTION_RPC_START"
         const val ACTION_RPC_STOP = "com.zerointerrupt.clicker.ACTION_RPC_STOP"
         const val ACTION_RPC_SWITCH_PRESET = "com.zerointerrupt.clicker.ACTION_RPC_SWITCH_PRESET"
+        const val ACTION_SHOW_QUICK_TRIGGER = "com.zerointerrupt.clicker.ACTION_SHOW_QUICK_TRIGGER"
+        const val ACTION_HIDE_QUICK_TRIGGER = "com.zerointerrupt.clicker.ACTION_HIDE_QUICK_TRIGGER"
 
         const val EXTRA_PRESET_ID = "preset_id"
         const val EXTRA_PRESET_NAME = "preset_name"
+        const val EXTRA_TRIGGER_SIZE_DP = "trigger_size_dp"
+        const val EXTRA_TRIGGER_SHAPE = "trigger_shape"
+        const val EXTRA_TRIGGER_NORM_X = "trigger_norm_x"
+        const val EXTRA_TRIGGER_NORM_Y = "trigger_norm_y"
 
         private const val CHANNEL_ID = "zero_interrupt_overlay_channel"
         private const val NOTIFICATION_ID = 2001

@@ -57,7 +57,7 @@ import com.zerointerrupt.clicker.shizuku.ShizukuConnectionState
 import com.zerointerrupt.clicker.ui.MainScreenCallbacks
 import com.zerointerrupt.clicker.ui.MainUiState
 import com.zerointerrupt.clicker.ui.components.OverflowMenuAction
-import com.zerointerrupt.clicker.ui.components.PageTopHeader
+import com.zerointerrupt.clicker.ui.components.StickyBlurredPageHeader
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
@@ -108,22 +108,11 @@ fun HomeTab(
             else -> minOf(minDim * 0.48f, availableH).coerceIn(212.dp, 360.dp)
         }
 
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 20.dp, vertical = 12.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            PageTopHeader(
-                title = "启动",
-                menuActions = menuActions,
-                showMenuAlertDot = state.needsSetupWizard
-            )
-
+        Box(modifier = Modifier.fillMaxSize()) {
             Box(
                 modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth(),
+                    .fillMaxSize()
+                    .padding(top = 64.dp, start = 20.dp, end = 20.dp, bottom = 12.dp),
                 contentAlignment = Alignment.Center
             ) {
                 HeroWavyRingButton(
@@ -141,6 +130,13 @@ fun HomeTab(
                     }
                 )
             }
+
+            StickyBlurredPageHeader(
+                title = "启动",
+                menuActions = menuActions,
+                showMenuAlertDot = state.needsSetupWizard,
+                modifier = Modifier.align(Alignment.TopCenter)
+            )
         }
     }
 }

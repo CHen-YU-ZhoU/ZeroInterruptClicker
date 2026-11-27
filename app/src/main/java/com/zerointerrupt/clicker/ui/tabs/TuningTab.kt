@@ -1,6 +1,7 @@
 package com.zerointerrupt.clicker.ui.tabs
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,7 +33,7 @@ import com.zerointerrupt.clicker.ui.components.ExpressiveConnectedGroup
 import com.zerointerrupt.clicker.ui.components.ExpressiveOption
 import com.zerointerrupt.clicker.ui.components.ExpressiveSlider
 import com.zerointerrupt.clicker.ui.components.OverflowMenuAction
-import com.zerointerrupt.clicker.ui.components.PageTopHeader
+import com.zerointerrupt.clicker.ui.components.StickyBlurredPageHeader
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
@@ -63,10 +64,6 @@ fun TuningTab(
 
     val menuActions = listOf(
         OverflowMenuAction(
-            label = "应用到全局",
-            onClick = callbacks.onApplyDefaultsToGlobal
-        ),
-        OverflowMenuAction(
             label = "恢复默认参数",
             onClick = callbacks.onResetTuningDefaults
         )
@@ -75,62 +72,62 @@ fun TuningTab(
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         val isTwoColumn = maxWidth >= 600.dp
 
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            PageTopHeader(
-                title = "调校",
-                menuActions = menuActions
-            )
+        Box(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Spacer(Modifier.height(74.dp))
 
-            ExpressiveConnectedGroup(
-                options = tierOptions,
-                selectedValue = state.tuningTier,
-                onSelect = callbacks.onSelectTuningTier,
-                height = 44.dp
-            )
-
-            if (isTwoColumn) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
-                    verticalAlignment = Alignment.Top
-                ) {
+                if (isTwoColumn) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp),
+                        verticalAlignment = Alignment.Top
+                    ) {
+                        ClickTuningCard(
+                            state = state,
+                            callbacks = callbacks,
+                            tierOptions = tierOptions,
+                            isCustomTier = isCustomTier,
+                            cpsLabel = cpsLabel,
+                            onHaptic = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        InteractionTuningCard(
+                            state = state,
+                            callbacks = callbacks,
+                            onHaptic = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                } else {
                     ClickTuningCard(
                         state = state,
                         callbacks = callbacks,
+                        tierOptions = tierOptions,
                         isCustomTier = isCustomTier,
                         cpsLabel = cpsLabel,
-                        onHaptic = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) },
-                        modifier = Modifier.weight(1f)
+                        onHaptic = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) }
                     )
                     InteractionTuningCard(
                         state = state,
                         callbacks = callbacks,
-                        onHaptic = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) },
-                        modifier = Modifier.weight(1f)
+                        onHaptic = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) }
                     )
                 }
-            } else {
-                ClickTuningCard(
-                    state = state,
-                    callbacks = callbacks,
-                    isCustomTier = isCustomTier,
-                    cpsLabel = cpsLabel,
-                    onHaptic = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) }
-                )
-                InteractionTuningCard(
-                    state = state,
-                    callbacks = callbacks,
-                    onHaptic = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) }
-                )
+
+                Spacer(Modifier.height(18.dp))
             }
 
-            Spacer(Modifier.height(6.dp))
+            StickyBlurredPageHeader(
+                title = "调校",
+                menuActions = menuActions,
+                modifier = Modifier.align(Alignment.TopCenter)
+            )
         }
     }
 }
@@ -139,6 +136,7 @@ fun TuningTab(
 private fun ClickTuningCard(
     state: MainUiState,
     callbacks: MainScreenCallbacks,
+    tierOptions: List<ExpressiveOption<Int>>,
     isCustomTier: Boolean,
     cpsLabel: String,
     onHaptic: () -> Unit,
@@ -173,6 +171,13 @@ private fun ClickTuningCard(
                     )
                 }
             }
+
+            ExpressiveConnectedGroup(
+                options = tierOptions,
+                selectedValue = state.tuningTier,
+                onSelect = callbacks.onSelectTuningTier,
+                height = 42.dp
+            )
 
             SliderBlock(
                 label = "点击间隔",
@@ -299,34 +304,38 @@ private fun InteractionTuningCard(
 
             Text(
                 text = "触发方式",
-                style = MaterialTheme.typography.titleSmall,
+                style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.SemiBold,
-                color = cs.primary
+                color = cs.onSurface
             )
 
             SettingSwitchRow(
                 title = "悬浮窗",
                 checked = true,
                 enabled = false,
-                onCheckedChange = {}
+                onCheckedChange = {},
+                modifier = Modifier.padding(start = 12.dp)
             )
 
             SettingSwitchRow(
                 title = "长按目标区域",
                 checked = state.targetLongPressTriggerEnabled,
-                onCheckedChange = callbacks.onTargetLongPressTriggerChange
+                onCheckedChange = callbacks.onTargetLongPressTriggerChange,
+                modifier = Modifier.padding(start = 12.dp)
             )
 
             SettingSwitchRow(
                 title = "点击目标区域",
                 checked = state.targetTapTriggerEnabled,
-                onCheckedChange = callbacks.onTargetTapTriggerChange
+                onCheckedChange = callbacks.onTargetTapTriggerChange,
+                modifier = Modifier.padding(start = 12.dp)
             )
 
             SettingSwitchRow(
                 title = "双敲音量减键",
                 checked = state.volumeKeyToggleEnabled,
-                onCheckedChange = callbacks.onVolumeKeyToggleChange
+                onCheckedChange = callbacks.onVolumeKeyToggleChange,
+                modifier = Modifier.padding(start = 12.dp)
             )
         }
     }
@@ -384,10 +393,11 @@ private fun SettingSwitchRow(
     title: String,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
     enabled: Boolean = true
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -395,6 +405,7 @@ private fun SettingSwitchRow(
             text = title,
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.onSurface,
             modifier = Modifier
                 .weight(1f)
                 .padding(end = 12.dp)

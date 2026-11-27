@@ -36,7 +36,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -160,6 +162,7 @@ class MainActivity : ComponentActivity() {
             val slotStates by ShizukuController.slotStates.collectAsState()
             val overlayVisible by OverlayStateHub.overlayVisible.collectAsState()
             val clickingRunning by OverlayStateHub.clickingRunning.collectAsState()
+            val activeQuickTriggerPresetIds by OverlayStateHub.activeQuickTriggerPresetIds.collectAsState()
             val configVersion by OverlayStateHub.configVersion.collectAsState()
 
             val scope = rememberCoroutineScope()
@@ -201,6 +204,7 @@ class MainActivity : ComponentActivity() {
                 slotStates = slotStates,
                 overlayVisible = overlayVisible,
                 clickingRunning = clickingRunning,
+                activeQuickTriggerPresetIds = activeQuickTriggerPresetIds,
                 rpcServerRunning = LocalRpcServer.isRunning()
             )
 
@@ -238,7 +242,9 @@ class MainActivity : ComponentActivity() {
 
             ZeroInterruptTheme(
                 darkTheme = darkTheme,
-                dynamicColor = mergedState.dynamicColor
+                dynamicColor = mergedState.dynamicColor,
+                colorSaturationBoost = mergedState.colorSaturationBoost,
+                colorLightnessBoost = mergedState.colorLightnessBoost
             ) {
                 MainScreen(
                     state = mergedState,
@@ -416,6 +422,8 @@ class MainActivity : ComponentActivity() {
             screenHeightPx = metrics.heightPx,
             themeMode = settings.themeMode,
             dynamicColor = settings.dynamicColor,
+            colorSaturationBoost = settings.colorSaturationBoost,
+            colorLightnessBoost = settings.colorLightnessBoost,
             launcherIconMode = settings.launcherIconMode,
             volumeKeyToggleEnabled = settings.volumeKeyToggleEnabled,
             targetLongPressTriggerEnabled = settings.targetLongPressTriggerEnabled,
@@ -450,7 +458,7 @@ class MainActivity : ComponentActivity() {
 
     private fun notifyOverlayRefresh() {
         OverlayStateHub.bumpConfigVersion()
-        if (OverlayStateHub.overlayVisible.value) {
+        if (OverlayStateHub.overlayVisible.value || OverlayStateHub.activeQuickTriggerPresetIds.value.isNotEmpty()) {
             startService(
                 Intent(this, OverlayService::class.java).apply {
                     action = OverlayService.ACTION_REFRESH_SETTINGS
@@ -717,13 +725,6 @@ class MainActivity : ComponentActivity() {
             onShowMacroTrajectoriesChange = { enabled ->
                 saveCurrentSettings({ it.copy(showMacroTrajectories = enabled) }, notifyOverlay = true)
             },
-            onApplyDefaultsToGlobal = {
-                val settings = ClickConfigStore.loadSettings(this)
-                ClickConfigStore.applyGlobalTapSettingsToAllPresets(this, settings)
-                notifyOverlayRefresh()
-                syncFromStorageAndSystem()
-                showMessage(scope, "已将连点设置应用到全部方案")
-            },
             onSelectPreset = { presetId ->
                 ClickConfigStore.setActivePresetId(this, presetId)
                 notifyOverlayRefresh()
@@ -970,11 +971,30 @@ class MainActivity : ComponentActivity() {
             },
             onDeletePresetTarget = { targetId ->
                 val metrics = ShizukuController.getDisplayScreenMetrics(this)
+                val presetId = ClickConfigStore.getActivePresetId(this)
                 val current = ClickConfigStore.loadTargetsForScreen(this, metrics.widthPx, metrics.heightPx)
-                if (current.removeAll { it.id == targetId }) {
+                val removedIdx = current.indexOfFirst { it.id == targetId }
+                if (removedIdx >= 0) {
+                    val removedTarget = current.removeAt(removedIdx).copy()
                     ClickConfigStore.saveTargets(this, current)
                     notifyOverlayRefresh()
                     syncFromStorageAndSystem()
+                    if (::snackbarHostState.isInitialized) {
+                        scope.launch {
+                            snackbarHostState.currentSnackbarData?.dismiss()
+                            val res = snackbarHostState.showSnackbar(
+                                message = "已删除一个步骤",
+                                actionLabel = "撤销",
+                                duration = SnackbarDuration.Short
+                            )
+                            if (res == SnackbarResult.ActionPerformed) {
+                                if (ClickConfigStore.restoreTargetAt(this@MainActivity, presetId, removedTarget, removedIdx)) {
+                                    notifyOverlayRefresh()
+                                    syncFromStorageAndSystem()
+                                }
+                            }
+                        }
+                    }
                 }
             },
             onThemeModeChange = { mode ->
@@ -982,6 +1002,63 @@ class MainActivity : ComponentActivity() {
             },
             onDynamicColorChange = { enabled ->
                 saveCurrentSettings({ it.copy(dynamicColor = enabled) }, notifyOverlay = true)
+            },
+            onColorSaturationBoostChange = { boost, commit ->
+                val clamped = boost.coerceIn(
+                    ClickGlobalSettings.MIN_COLOR_SATURATION_BOOST,
+                    ClickGlobalSettings.MAX_COLOR_SATURATION_BOOST
+                )
+                uiModel = uiModel.copy(colorSaturationBoost = clamped)
+                if (commit) {
+                    saveCurrentSettings({ it.copy(colorSaturationBoost = clamped) }, notifyOverlay = true)
+                }
+            },
+            onColorLightnessBoostChange = { boost, commit ->
+                val clamped = boost.coerceIn(
+                    ClickGlobalSettings.MIN_COLOR_LIGHTNESS_BOOST,
+                    ClickGlobalSettings.MAX_COLOR_LIGHTNESS_BOOST
+                )
+                uiModel = uiModel.copy(colorLightnessBoost = clamped)
+                if (commit) {
+                    saveCurrentSettings({ it.copy(colorLightnessBoost = clamped) }, notifyOverlay = true)
+                }
+            },
+            onResetColorTuning = {
+                saveCurrentSettings(
+                    mutate = {
+                        it.copy(
+                            colorSaturationBoost = ClickGlobalSettings.DEFAULT_COLOR_SATURATION_BOOST,
+                            colorLightnessBoost = ClickGlobalSettings.DEFAULT_COLOR_LIGHTNESS_BOOST
+                        )
+                    },
+                    notifyOverlay = true
+                )
+            },
+            onShowPresetQuickTrigger = { config ->
+                if (!Settings.canDrawOverlays(this)) {
+                    openOverlayPermissionSettings()
+                    showMessage(scope, "请先授予悬浮窗权限")
+                } else {
+                    ContextCompat.startForegroundService(
+                        this,
+                        Intent(this, OverlayService::class.java).apply {
+                            action = OverlayService.ACTION_SHOW_QUICK_TRIGGER
+                            putExtra(OverlayService.EXTRA_PRESET_ID, config.presetId)
+                            putExtra(OverlayService.EXTRA_TRIGGER_SIZE_DP, config.sizeDp)
+                            putExtra(OverlayService.EXTRA_TRIGGER_SHAPE, config.shapeMode)
+                            putExtra(OverlayService.EXTRA_TRIGGER_NORM_X, config.normX)
+                            putExtra(OverlayService.EXTRA_TRIGGER_NORM_Y, config.normY)
+                        }
+                    )
+                }
+            },
+            onHidePresetQuickTrigger = { presetId ->
+                startService(
+                    Intent(this, OverlayService::class.java).apply {
+                        action = OverlayService.ACTION_HIDE_QUICK_TRIGGER
+                        putExtra(OverlayService.EXTRA_PRESET_ID, presetId)
+                    }
+                )
             },
             onLauncherIconModeChange = { mode ->
                 switchLauncherIcon(scope, mode)

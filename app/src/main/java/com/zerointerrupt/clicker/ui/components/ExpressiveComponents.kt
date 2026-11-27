@@ -1,5 +1,6 @@
 package com.zerointerrupt.clicker.ui.components
 
+import android.os.Build
 import androidx.annotation.DrawableRes
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -56,10 +57,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.BlurredEdgeTreatment
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -473,6 +477,63 @@ data class OverflowMenuAction(
     val isDestructive: Boolean = false,
     val onClick: () -> Unit
 )
+
+/**
+ * Pinned top page header with soft Gaussian-feathered blur/fade scrim so scrolling content
+ * glides smoothly underneath without colliding with the title.
+ */
+@Composable
+fun StickyBlurredPageHeader(
+    title: String,
+    modifier: Modifier = Modifier,
+    menuActions: List<OverflowMenuAction> = emptyList(),
+    showMenuAlertDot: Boolean = false,
+    trailingAction: (@Composable () -> Unit)? = null
+) {
+    val cs = MaterialTheme.colorScheme
+    Box(modifier = modifier.fillMaxWidth()) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(84.dp)
+                .then(
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        Modifier.blur(12.dp, edgeTreatment = BlurredEdgeTreatment.Unbounded)
+                    } else {
+                        Modifier
+                    }
+                )
+                .background(
+                    Brush.verticalGradient(
+                        0.00f to cs.background.copy(alpha = 0.96f),
+                        0.56f to cs.background.copy(alpha = 0.90f),
+                        0.76f to cs.background.copy(alpha = 0.62f),
+                        0.92f to cs.background.copy(alpha = 0.20f),
+                        1.00f to Color.Transparent
+                    )
+                )
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(68.dp)
+                .background(
+                    Brush.verticalGradient(
+                        0.00f to cs.background.copy(alpha = 0.95f),
+                        0.72f to cs.background.copy(alpha = 0.84f),
+                        1.00f to Color.Transparent
+                    )
+                )
+        )
+        PageTopHeader(
+            title = title,
+            menuActions = menuActions,
+            showMenuAlertDot = showMenuAlertDot,
+            trailingAction = trailingAction,
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)
+        )
+    }
+}
 
 /**
  * Clean Material 3 single-line top bar matching Google Clock style (Image 4):
