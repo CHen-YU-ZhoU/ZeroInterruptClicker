@@ -70,11 +70,13 @@ object RootHelper {
         }
 
         val appProcessBin = resolveAppProcessBinary()
+        val nativeLibDir = context.applicationInfo.nativeLibraryDir.orEmpty()
         val userId = Process.myUid() / 100_000
         val userFlag = if (userId > 0) "--user $userId " else ""
         val niceName = "$pkg:touchmux_root"
         val qPkg = shellQuote(pkg)
         val qApk = shellQuote(apkPath)
+        val qNativeLib = shellQuote(nativeLibDir)
         val qAppProc = shellQuote(appProcessBin)
         val qNice = shellQuote(niceName)
         val qAuth = shellQuote(authority)
@@ -106,6 +108,9 @@ object RootHelper {
             // Reclaim any lingering old root mux process before starting fresh instance
             appendLine("pkill -TERM -f $qNice 2>/dev/null || true")
             appendLine("export CLASSPATH=$qApk")
+            if (nativeLibDir.isNotBlank()) {
+                appendLine("export LD_LIBRARY_PATH=$qNativeLib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}")
+            }
             appendLine("if [ -z \"\$ANDROID_DATA\" ]; then export ANDROID_DATA=/data; fi")
             appendLine("if [ -z \"\$ANDROID_ROOT\" ]; then export ANDROID_ROOT=/system; fi")
             appendLine("if command -v setsid >/dev/null 2>&1; then")

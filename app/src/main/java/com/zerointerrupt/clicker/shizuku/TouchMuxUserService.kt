@@ -303,6 +303,15 @@ class TouchMuxUserService() : ITouchMuxService.Stub() {
                 return false
             }
             try {
+                // Preload libc++_shared.so so standalone app_process (Root daemon) resolves DT_NEEDED reliably
+                val cppShared = File(nativeLibDir, "libc++_shared.so")
+                if (cppShared.exists()) {
+                    try {
+                        System.load(cppShared.absolutePath)
+                    } catch (preloadErr: Throwable) {
+                        Log.w(TAG, "Preload libc++_shared.so notice: ${preloadErr.message}")
+                    }
+                }
                 System.load(soFile.absolutePath)
                 nativeLoaded.set(true)
                 nativeLoadError = null

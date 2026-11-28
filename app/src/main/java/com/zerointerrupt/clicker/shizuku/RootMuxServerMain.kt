@@ -226,31 +226,52 @@ object RootMuxServerMain {
         extras: Bundle
     ): Bundle? {
         val callMethods = provider.javaClass.methods.filter { it.name == "call" }
-        for (m in callMethods) {
-            val types = m.parameterTypes
-            // API 31+: call(AttributionSource, String authority, String method, String arg, Bundle extras)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+
+        // Priority 1 (API 31+): call(AttributionSource, String authority, String method, String arg, Bundle extras)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            callMethods.firstOrNull { m ->
+                val types = m.parameterTypes
                 types.size == 5 &&
-                types[0].name == "android.content.AttributionSource"
-            ) {
+                    types[0].name == "android.content.AttributionSource" &&
+                    types[4] == Bundle::class.java
+            }?.let { m ->
                 val attr = AttributionSource.Builder(0)
                     .setPackageName("android")
                     .build()
                 return m.invoke(provider, attr, authority, method, arg, extras) as? Bundle
             }
-            // API 30: call(String callingPkg, String attributionTag, String authority, String method, String arg, Bundle extras)
-            if (types.size == 6 && types[0] == String::class.java) {
-                return m.invoke(provider, "android", null, authority, method, arg, extras) as? Bundle
-            }
-            // API 29: call(String callingPkg, String authority, String method, String arg, Bundle extras)
-            if (types.size == 5 && types[0] == String::class.java) {
-                return m.invoke(provider, "android", authority, method, arg, extras) as? Bundle
-            }
-            // API 26-28: call(String callingPkg, String method, String arg, Bundle extras)
-            if (types.size == 4 && types[0] == String::class.java) {
-                return m.invoke(provider, "android", method, arg, extras) as? Bundle
-            }
         }
+
+        // Priority 2 (API 30): call(String callingPkg, String attributionTag, String authority, String method, String arg, Bundle extras)
+        callMethods.firstOrNull { m ->
+            val types = m.parameterTypes
+            types.size == 6 &&
+                types[0] == String::class.java &&
+                types[5] == Bundle::class.java
+        }?.let { m ->
+            return m.invoke(provider, "android", null, authority, method, arg, extras) as? Bundle
+        }
+
+        // Priority 3 (API 29): call(String callingPkg, String authority, String method, String arg, Bundle extras)
+        callMethods.firstOrNull { m ->
+            val types = m.parameterTypes
+            types.size == 5 &&
+                types[0] == String::class.java &&
+                types[4] == Bundle::class.java
+        }?.let { m ->
+            return m.invoke(provider, "android", authority, method, arg, extras) as? Bundle
+        }
+
+        // Priority 4 (API 26-28): call(String callingPkg, String method, String arg, Bundle extras)
+        callMethods.firstOrNull { m ->
+            val types = m.parameterTypes
+            types.size == 4 &&
+                types[0] == String::class.java &&
+                types[3] == Bundle::class.java
+        }?.let { m ->
+            return m.invoke(provider, "android", method, arg, extras) as? Bundle
+        }
+
         return null
     }
 
